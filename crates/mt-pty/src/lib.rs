@@ -700,7 +700,16 @@ mod tests {
             .expect("退出回调未在 30s 内触发");
         assert_eq!(exit_code, Some(0));
 
-        let output = String::from_utf8_lossy(&collected.lock()).into_owned();
+        // on_exit 与 on_output 并发(见 `PtyOptions::on_exit` 的契约):退出回调
+        // 先到时 reader 可能还没交出最后一批,Linux 上实测约三成概率;给它几秒
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let output = String::from_utf8_lossy(&collected.lock()).into_owned();
+            if output.contains("mt-pty-smoke") || std::time::Instant::now() >= deadline {
+                break output;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(
             output.contains("mt-pty-smoke"),
             "reader 线程未把子进程输出交出来: {output:?}"
