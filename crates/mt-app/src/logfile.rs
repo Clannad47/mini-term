@@ -185,9 +185,12 @@ mod tests {
 
     #[test]
     fn 轮转文件名只是在原名后追加_1() {
-        let p = rotated_path(Path::new(r"D:\data\mini-term.log"));
+        // 用 join 拼路径而不是写死 `D:\...` 字面量:Linux 上反斜杠不是分隔符,
+        // `file_name()` 会把整串当文件名(CI 只跑 ubuntu,曾在 PR #76 上红过)
+        let original = Path::new("data").join("mini-term.log");
+        let p = rotated_path(&original);
         assert_eq!(p.file_name().unwrap(), "mini-term.log.1");
-        assert_eq!(p.parent(), Path::new(r"D:\data\mini-term.log").parent());
+        assert_eq!(p.parent(), original.parent());
     }
 
     #[test]
