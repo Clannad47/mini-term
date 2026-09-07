@@ -12,7 +12,6 @@ use super::{
 const OMP_OTHER_OPTION: &str = "Other (type your own)";
 
 /// OMP 会话文件头。文件名含 session id,仍需校验头部以防旧路径或碰撞绑定错误会话。
-///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmpSessionMeta {
     pub id: String,
@@ -220,7 +219,7 @@ pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<Pat
     )
 }
 
-/// 无 Hook 时的启发式绑定：先按 mtime 限量，再读取 header 校验 cwd。
+/// 无 Hook 时的启发式绑定:先按 mtime 限量,再读取 header 校验 cwd。
 pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     const MAX_SCAN: usize = 30;
     let mut newest: Option<(PathBuf, SystemTime)> = None;
@@ -257,7 +256,7 @@ pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTim
     newest
 }
 
-/// OMP 18.x 的普通消息：外层 `type=message`，角色与正文位于 `message.*`。
+/// OMP 18.x 的普通消息:外层 `type=message`,角色与正文位于 `message.*`。
 pub fn omp_message_from_line(line: &str) -> Option<AiSessionMessage> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
     if obj.get("type").and_then(|v| v.as_str()) != Some("message") {
@@ -383,7 +382,7 @@ fn labels_with_custom(details: &serde_json::Value) -> Vec<String> {
     labels
 }
 
-/// `toolResult(toolName=ask)` → 提问已处理标记，按 toolCallId 与挂起卡片对账。
+/// `toolResult(toolName=ask)` → 提问已处理标记,按 toolCallId 与挂起卡片对账。
 pub fn omp_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
     if obj.get("type").and_then(|v| v.as_str()) != Some("message")

@@ -409,8 +409,8 @@ impl MirrorParser {
         {
             keys.push('\r');
         }
-        // 已知限制：最后一题选 Other 后，OMP 会切到 Submit 页；手机端自定义文本
-        // 发完后无法通过底部输入框发送裸回车（sendMobileCommand 会 trim 空文本），
+        // 已知限制:最后一题选 Other 后,OMP 会切到 Submit 页;手机端自定义文本
+        // 发完后无法通过底部输入框发送裸回车(sendMobileCommand 会 trim 空文本),
         // 因此用户需要回到桌面再按一次 Enter 完成提交。
         Some(AnswerKeys {
             keys,
@@ -1203,7 +1203,7 @@ mod tests {
         assert_eq!(msgs[2].kind.as_deref(), Some("question"));
         assert_eq!(parser.answer_keys(2, "ask-1", 0, 1).unwrap().keys, "\r");
 
-        // recommended=1，选 B 直接回车；选 A 先向上一次。
+        // recommended=1,选 B 直接回车;选 A 先向上一次。
         assert_eq!(
             parser.answer_keys(2, "ask-1", 0, 0).unwrap().keys,
             "\x1b[A\r"
