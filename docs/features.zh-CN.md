@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.7-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -181,7 +181,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **中英双语界面** — 「设置 → 外观 → 主题与语言」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
 - **设置中心** — 统一的设置面板，侧栏为「分组 + 分页」两级菜单：终端（Shell / 复制粘贴）、外观（主题与语言 / 字体）、AI（通知提醒 / Hook 事件）、系统（常规 / 外部编辑器），快捷键与关于留在顶级。按主题归组后每页只剩一屏左右，不再出现「一页塞九组控件、找个开关要滚半页」的老问题
 - **满屏图标体系** — 文件树文件类型 / 文件夹图标（含目录展开态），项目行 AI 品牌图标与技术栈图标——官方品牌 SVG 形状，原生自绘渲染
-- **启动性能** — 原生渲染无 Web 资源，启动路径零网络请求、离线首帧不受影响（价格表按天拉取，拉不到用缓存）；统一时间轴启动埋点写 stderr，便于回归定位
+- **启动性能** — 原生渲染无 Web 资源，启动路径零网络请求、离线首帧不受影响（价格表按天拉取，拉不到用缓存）；上次退出留下的终端在首帧呈现之后才补建，开窗不被 PTY 拖慢；PTY 写入走独立线程，键入不占主线程；统一时间轴启动埋点写 stderr，便于回归定位
+- **装机版日志落盘** — 没有控制台时 stderr / stdout 接到数据目录的 `mini-term.log`（启动埋点、panic 现场与所有报错都在里面），启动时超 2 MB 轮转成 `.log.1`；有控制台时照常打到终端，设 `MT_LOG_FILE=1` 可强制落文件
 - **界面动效** — 弹窗 / 右键菜单 / 侧拉抽屉共用一套进出场动画：遮罩淡入、面板落下并放大到位，关闭时反向播完再卸载（期间冻结内容，不会在淡出中变空或仍吃 Esc）；右键菜单从光标位置展开，切换终端与新建分屏各有过渡。系统关掉窗口动画时这套转场照常保留，用量统计面板的数字滚动与图表补间同样豁免，只停掉状态点闪烁一类的循环动画
 
 ## 技术栈
@@ -197,7 +198,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1757 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1772 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -338,7 +339,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（29 个测试目标、1757 例）
+# 全工作区 Rust 测试（29 个测试目标、1772 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）

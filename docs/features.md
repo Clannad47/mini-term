@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.7-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -181,7 +181,8 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Bilingual UI (English / 中文)** — A one-click language toggle under "Settings → Appearance → Theme & language" instantly re-renders the entire interface; the language is auto-detected from the system on first launch and remembered across restarts. Every page and feature is fully translated, with a lightweight built-in i18n layer (no extra runtime dependency).
 - **Settings center** — A unified settings panel whose sidebar is a two-level "group + page" menu: Terminal (Shell / Copy & paste), Appearance (Theme & language / Font), AI (Notifications / Hook events), System (General / Editors), with Shortcuts and About kept at the top level. Grouping by topic keeps every page to roughly one screen, ending the old "nine control groups on one page, scroll half a page to find a toggle" problem.
 - **Icons everywhere** — File-type / folder icons in the file tree (including open-folder states), AI brand icons and tech-stack icons on project rows — official brand SVG shapes, natively drawn.
-- **Startup performance** — Native rendering with no web assets: the startup path makes zero network requests, so the offline first frame is unaffected (the price table refreshes daily and falls back to its cache when unreachable); a unified startup-timeline trace is written to stderr for regression hunting.
+- **Startup performance** — Native rendering with no web assets: the startup path makes zero network requests, so the offline first frame is unaffected (the price table refreshes daily and falls back to its cache when unreachable); terminals left over from the last session are re-created only after the first frame is presented, so the window is never held back by PTY spawning; PTY writes run on a dedicated thread so typing never blocks the main thread; a unified startup-timeline trace is written to stderr for regression hunting.
+- **Installed-build log file** — When there is no console, stderr / stdout go to `mini-term.log` in the data directory (startup trace, panic reports and every error message end up there), rotated to `.log.1` at startup once it exceeds 2 MB; with a console attached output still goes to the terminal, and `MT_LOG_FILE=1` forces the file anyway.
 - **Interface motion** — Dialogs, context menus, and the side drawer share one enter/exit animation: the backdrop fades in while the panel drops and scales into place; on close it plays the reverse before unmounting (content is frozen meanwhile, so it never goes blank mid-fade or keeps swallowing Esc). Context menus expand from the cursor, and switching terminals or creating a split each get their own transition. When the system turns window animations off these transitions still play — the usage panel's number tweens and chart animations are exempted likewise — only looping animations such as the blinking status dot are stopped.
 
 ## Tech Stack
@@ -197,7 +198,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,757 Rust tests** (29 test targets) + relay-server protocol boundary tests |
+| Tests | **1,772 Rust tests** (29 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -338,7 +339,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (29 test targets, 1,757 cases)
+# Workspace-wide Rust tests (29 test targets, 1,772 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
