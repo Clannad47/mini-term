@@ -8,16 +8,17 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
-    px,
+    App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
 
 use crate::file_viewer::{DocumentSource, FileViewer};
-use crate::i18n::t;
+use crate::i18n::{t, tr};
+use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_alert};
 use crate::store::AppStore;
 use crate::terminal_area::TerminalArea;
@@ -141,6 +142,34 @@ fn next_document_after_close(
                 .and_then(|index| remaining.get(index))
         })
         .cloned()
+}
+
+/// 页签右键菜单里的批量关闭范围，锚点是被右键的那一页。
+///
+/// 三档都**只覆盖文档页签**：常驻的终端页不是文档，既不在 `tabs` 里，也就
+/// 永远不会被「关闭其他」带走 —— 它是关不掉的（见 [`WorkbenchPage`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseScope {
+    Others,
+    ToRight,
+    ToLeft,
+}
+
+/// 按范围挑出要关的页签（不含锚点自己）。顺序与页签条一致，便于逐个 `close`。
+fn documents_in_scope(
+    keys: &[DocumentKey],
+    anchor_index: usize,
+    scope: CloseScope,
+) -> Vec<DocumentKey> {
+    keys.iter()
+        .enumerate()
+        .filter(|(index, _)| match scope {
+            CloseScope::Others => *index != anchor_index,
+            CloseScope::ToRight => *index > anchor_index,
+            CloseScope::ToLeft => *index < anchor_index,
+        })
+        .map(|(_, key)| key.clone())
+        .collect()
 }
 
 struct GlobalWorkbench(Entity<WorkbenchArea>);
@@ -311,6 +340,10 @@ pub struct WorkbenchArea {
     projects: HashMap<String, ProjectDocuments>,
     last_rendered_project: Option<String>,
     last_rendered_page: Option<WorkbenchPage>,
+    /// 页签条的横向滚动位置。**全项目共用一份**：切项目时页签整条重建，
+    /// 上一个项目的偏移留着也无意义，切完那一帧的 `scroll_to_item` 会把活动页
+    /// 拉回视野。
+    tab_scroll: ScrollHandle,
 }
 
 impl WorkbenchArea {
@@ -346,6 +379,7 @@ impl WorkbenchArea {
             projects: HashMap::new(),
             last_rendered_project: None,
             last_rendered_page: None,
+            tab_scroll: ScrollHandle::new(),
         }
     }
 
@@ -526,14 +560,44 @@ impl WorkbenchArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_documents(project_id, std::slice::from_ref(key), None, window, cx);
+    }
+
+    /// 一次关掉一批页签。`fallback` 是右键的那一页（批量关闭时必然留下），
+    /// 活动页被这一批带走时直接落到它上面 —— 逐个 `close` 的左右邻居收敛
+    /// 在批量语境下会把活动页停在一个马上又要被关掉的页签上。
+    fn close_documents(
+        &mut self,
+        project_id: &str,
+        keys: &[DocumentKey],
+        fallback: Option<&DocumentKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.projects.get_mut(project_id) else {
             return;
         };
-        let was_active = project.active == WorkbenchPage::Document(key.clone());
-        let _ = project.close(key);
+        let mut closed_active = false;
+        for key in keys {
+            closed_active |= project.active == WorkbenchPage::Document(key.clone());
+            let _ = project.close(key);
+        }
+        if closed_active
+            && let Some(anchor) = fallback
+            && project.index_of(anchor).is_some()
+        {
+            project.active = WorkbenchPage::Document(anchor.clone());
+        }
+        // 批量关闭后剩下的页签会左移，滚动偏移原地不动就会停在一段空白上；
+        // 把留下的锚点重新拉进视野（活动页没被动过时也一样成立）
+        if let Some(anchor) = fallback
+            && let Some(index) = project.index_of(anchor)
+        {
+            self.tab_scroll.scroll_to_item(index + 1);
+        }
         let project_is_visible =
             self.store.read(cx).active_project_id.as_deref() == Some(project_id);
-        if !was_active || !project_is_visible {
+        if !closed_active || !project_is_visible {
             cx.notify();
             return;
         }
@@ -542,6 +606,127 @@ impl WorkbenchArea {
             WorkbenchPage::Document(next) => self.activate_document(project_id, &next, window, cx),
         }
         cx.notify();
+    }
+
+    /// 右键菜单的三档批量关闭要关掉哪些页签。菜单同时用它判断该不该置灰。
+    fn scope_targets(
+        &self,
+        project_id: &str,
+        anchor: &DocumentKey,
+        scope: CloseScope,
+    ) -> Vec<DocumentKey> {
+        let Some(project) = self.projects.get(project_id) else {
+            return Vec::new();
+        };
+        let Some(anchor_index) = project.index_of(anchor) else {
+            return Vec::new();
+        };
+        let keys = project
+            .tabs
+            .iter()
+            .map(|tab| tab.key.clone())
+            .collect::<Vec<_>>();
+        documents_in_scope(&keys, anchor_index, scope)
+    }
+
+    /// 批量关闭入口。脏页签只弹**一次**确认（列出文件名），取消则一个都不关。
+    fn request_close_scope(
+        &mut self,
+        project_id: String,
+        anchor: DocumentKey,
+        scope: CloseScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.scope_targets(&project_id, &anchor, scope);
+        if targets.is_empty() {
+            return;
+        }
+        let dirty = self
+            .projects
+            .get(&project_id)
+            .map(|project| {
+                project
+                    .tabs
+                    .iter()
+                    .filter(|tab| targets.contains(&tab.key) && tab.document.read(cx).is_dirty())
+                    .map(|tab| tab.title.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if dirty.is_empty() {
+            self.close_documents(&project_id, &targets, Some(&anchor), window, cx);
+            return;
+        }
+
+        let this = cx.entity();
+        Confirm::new(
+            t("fileViewer", "unsavedTitle"),
+            tr!("fileViewer", "unsavedBatchMessage", count = dirty.len()),
+        )
+        .detail(dirty_preview(&dirty))
+        .open(
+            move |window, cx| {
+                let this = this.clone();
+                let project_id = project_id.clone();
+                let anchor = anchor.clone();
+                let targets = targets.clone();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |area, cx| {
+                        area.close_documents(&project_id, &targets, Some(&anchor), window, cx)
+                    });
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 文档页签的右键菜单。
+    ///
+    /// 终端页**没有**这份菜单，也不出现在任何一档的关闭范围里 —— 它是常驻页，
+    /// 关不掉（[`CloseScope`]）。
+    fn document_tab_menu(
+        &self,
+        project_id: &str,
+        key: &DocumentKey,
+        cx: &Context<Self>,
+    ) -> Vec<MenuEntry> {
+        let area = cx.entity();
+        let close = {
+            let (area, project_id, key) = (area.clone(), project_id.to_string(), key.clone());
+            MenuItem::new(t("fileViewer", "closeTab"))
+                // 键位见 file_viewer.rs 的 on_key_down(Ctrl/Cmd+W)
+                .shortcut(menu::hotkey_label(true, false, false, "W"))
+                .on_click(move |window, cx| {
+                    let (project_id, key) = (project_id.clone(), key.clone());
+                    area.update(cx, |area, cx| {
+                        area.request_close_document(project_id, key, window, cx)
+                    });
+                })
+        };
+        let mut entries = vec![close.into(), menu::separator()];
+        for (scope, label) in [
+            (CloseScope::Others, t("fileViewer", "closeOthers")),
+            (CloseScope::ToRight, t("fileViewer", "closeToRight")),
+            (CloseScope::ToLeft, t("fileViewer", "closeToLeft")),
+        ] {
+            // 没得可关就置灰(而不是抽掉那一项):菜单条目固定,肌肉记忆才稳
+            let empty = self.scope_targets(project_id, key, scope).is_empty();
+            let (area, project_id, key) = (area.clone(), project_id.to_string(), key.clone());
+            entries.push(
+                MenuItem::new(label)
+                    .disabled(empty)
+                    .on_click(move |window, cx| {
+                        let (project_id, key) = (project_id.clone(), key.clone());
+                        area.update(cx, |area, cx| {
+                            area.request_close_scope(project_id, key, scope, window, cx)
+                        });
+                    })
+                    .into(),
+            );
+        }
+        entries
     }
 
     fn active_snapshot(&self, cx: &App) -> Option<ActiveWorkbenchSnapshot> {
@@ -609,6 +794,15 @@ impl Render for WorkbenchArea {
                     }
                 }
             }
+            // 页签多到溢出时，刚激活的那一页可能整个在视野之外(尤其是新打开的
+            // 文件排在最右)。终端页固定是第 0 个子元素，文档页顺次排在它后面。
+            self.tab_scroll.scroll_to_item(match &active {
+                WorkbenchPage::Terminal => 0,
+                WorkbenchPage::Document(key) => tabs
+                    .iter()
+                    .position(|(candidate, _, _)| candidate == key)
+                    .map_or(0, |index| index + 1),
+            });
         }
 
         // 尚未打开文件时保持原终端区的尺寸与结构，一旦有文档才出现工作区页签条。
@@ -617,6 +811,12 @@ impl Render for WorkbenchArea {
         }
 
         let terminal_active = active == WorkbenchPage::Terminal;
+        // 页签条横向滚动(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
+        //
+        // 垂直滚轮不必自己映射 —— gpui 只在 `overflow.x == Scroll && overflow.y
+        // != Scroll` 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y`
+        // 记到 x 上(gpui-0.2.2 `elements/div.rs`)。`track_scroll` 是为了能主动
+        // 把活动页拉进视野。
         let mut tab_bar = div()
             .id("workbench-tabs")
             .h(px(34.0))
@@ -624,6 +824,7 @@ impl Render for WorkbenchArea {
             .flex()
             .items_center()
             .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
             .bg(ui::bg_elevated())
             .border_b_1()
             .border_color(ui::border_subtle())
@@ -631,6 +832,7 @@ impl Render for WorkbenchArea {
                 div()
                     .id("workbench-tab-terminal")
                     .h_full()
+                    .flex_none()
                     .min_w(px(110.0))
                     .px(px(12.0))
                     .flex()
@@ -663,8 +865,10 @@ impl Render for WorkbenchArea {
             let dirty = document.read(cx).is_dirty();
             let tab_key = key.clone();
             let close_key = key.clone();
+            let menu_key = key.clone();
             let click_project = project_id.clone();
             let close_project = project_id.clone();
+            let menu_project = project_id.clone();
             tab_bar = tab_bar.child(
                 div()
                     .id(SharedString::from(format!(
@@ -672,6 +876,7 @@ impl Render for WorkbenchArea {
                         stable_hash(key)
                     )))
                     .h_full()
+                    .flex_none()
                     .min_w(px(120.0))
                     .max_w(px(220.0))
                     .px(px(10.0))
@@ -749,7 +954,17 @@ impl Render for WorkbenchArea {
                     )
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.activate_document(&click_project, &tab_key, window, cx)
-                    })),
+                    }))
+                    // 页签右键菜单:关闭 / 关闭其他 / 关闭右边 / 关闭左边。
+                    // 常驻的终端页没有这份菜单 —— 它关不掉
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let entries = this.document_tab_menu(&menu_project, &menu_key, cx);
+                            menu::show(event.position, entries, window, cx);
+                        }),
+                    ),
             );
         }
 
@@ -770,6 +985,23 @@ impl Render for WorkbenchArea {
             .child(tab_bar)
             .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
     }
+}
+
+/// 批量关闭确认框里列出的未保存文件名。与关窗确认同一套口径：只列前几条，
+/// 其余折成一行「另有 N 项」，免得一次关几十个页签时确认框长到出屏。
+const DIRTY_PREVIEW_LIMIT: usize = 5;
+
+fn dirty_preview(names: &[String]) -> Vec<String> {
+    let mut lines = names
+        .iter()
+        .take(DIRTY_PREVIEW_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = names.len().saturating_sub(lines.len());
+    if remaining > 0 {
+        lines.push(tr!("app", "closeConfirm.remaining", count = remaining));
+    }
+    lines
 }
 
 fn stable_hash(key: &DocumentKey) -> u64 {
@@ -834,6 +1066,53 @@ mod tests {
             normalize_remote_document_path(Path::new("/work/a\\b.rs")),
             normalize_remote_document_path(Path::new("/work/a/b.rs"))
         );
+    }
+
+    #[test]
+    fn close_scope_never_includes_the_anchor_itself() {
+        let keys = [key("a"), key("b"), key("c")];
+        for scope in [CloseScope::Others, CloseScope::ToRight, CloseScope::ToLeft] {
+            assert!(
+                !documents_in_scope(&keys, 1, scope).contains(&key("b")),
+                "{scope:?} 不该关掉被右键的那一页"
+            );
+        }
+    }
+
+    #[test]
+    fn close_scope_splits_by_position() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            documents_in_scope(&keys, 1, CloseScope::Others),
+            vec![key("a"), key("c")]
+        );
+        assert_eq!(
+            documents_in_scope(&keys, 1, CloseScope::ToRight),
+            vec![key("c")]
+        );
+        assert_eq!(
+            documents_in_scope(&keys, 1, CloseScope::ToLeft),
+            vec![key("a")]
+        );
+    }
+
+    /// 两端的页签各有一档「没得可关」——菜单据此置灰，而不是抽掉那一项。
+    #[test]
+    fn close_scope_is_empty_at_the_edges() {
+        let keys = [key("a"), key("b")];
+        assert!(documents_in_scope(&keys, 0, CloseScope::ToLeft).is_empty());
+        assert!(documents_in_scope(&keys, 1, CloseScope::ToRight).is_empty());
+        assert!(documents_in_scope(&[key("a")], 0, CloseScope::Others).is_empty());
+    }
+
+    #[test]
+    fn dirty_preview_folds_the_long_tail() {
+        let names = (0..8).map(|i| format!("f{i}.rs")).collect::<Vec<_>>();
+        let lines = dirty_preview(&names);
+        assert_eq!(lines.len(), DIRTY_PREVIEW_LIMIT + 1);
+        assert_eq!(lines[..DIRTY_PREVIEW_LIMIT], names[..DIRTY_PREVIEW_LIMIT]);
+        assert!(lines[DIRTY_PREVIEW_LIMIT].contains('3'), "剩余 3 项要算准");
+        assert_eq!(dirty_preview(&names[..2]), names[..2].to_vec());
     }
 
     #[test]

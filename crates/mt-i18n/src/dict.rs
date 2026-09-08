@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 854;
+pub const ZH_ENTRY_COUNT: usize = 859;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 854;
+pub const EN_ENTRY_COUNT: usize = 859;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -408,6 +408,10 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
 static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("back", "返回"),
     ("binaryNotSupported", "二进制文件，不支持预览"),
+    ("closeOthers", "关闭其他"),
+    ("closeTab", "关闭"),
+    ("closeToLeft", "关闭左边"),
+    ("closeToRight", "关闭右边"),
     ("externallyChanged", "文件已被外部修改"),
     ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
@@ -431,6 +435,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("source", "源码"),
     ("tooLarge", "文件过大（>1MB），不支持预览"),
     ("unsaved", "未保存"),
+    ("unsavedBatchMessage", "将要关闭的页签中有 {count} 个文件包含未保存的修改，继续将丢弃这些修改。"),
     ("unsavedMessage", "当前文件有未保存的修改，继续将丢弃这些修改。"),
     ("unsavedTitle", "未保存的修改"),
 ];
@@ -438,6 +443,10 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
 static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("back", "Back"),
     ("binaryNotSupported", "Binary file, preview not supported"),
+    ("closeOthers", "Close Others"),
+    ("closeTab", "Close"),
+    ("closeToLeft", "Close to the Left"),
+    ("closeToRight", "Close to the Right"),
     ("externallyChanged", "File was modified externally"),
     ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
@@ -461,6 +470,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("source", "Source"),
     ("tooLarge", "File too large (>1MB), preview not supported"),
     ("unsaved", "Unsaved"),
+    ("unsavedBatchMessage", "{count} of the tabs about to close have unsaved changes. Continuing will discard them."),
     ("unsavedMessage", "This file has unsaved changes. Continuing will discard them."),
     ("unsavedTitle", "Unsaved changes"),
 ];
