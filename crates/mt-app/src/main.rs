@@ -1530,12 +1530,16 @@ impl Render for Workspace {
                     this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
                 })),
             )
+            // ⚠️ **除「折叠中间栏」外全条都不给激活态**(恒传 `active = false`):
+            // 抽屉、竖条、用量页开着没开着本身就贴在屏幕上一眼可见,边条再点亮一次
+            // 是重复反馈,几颗方块各亮各的反而把第一颗真正需要读的状态淹了。
+            // 第一颗是唯一例外 —— 中间栏收起后没有任何其他线索能看出它的开合。
             .child(
                 activity_bar::strip_button(
                     "toggle-sessions",
                     activity_bar::SESSIONS,
                     t("app", "activityBar.sessions"),
-                    self.right_drawer == Some(DrawerPanel::Sessions),
+                    false,
                     self.activity_bar_hover.is_visible("toggle-sessions"),
                     Self::activity_bar_item_hover_listener("toggle-sessions", cx),
                 )
@@ -1550,7 +1554,7 @@ impl Render for Workspace {
                     "toggle-git",
                     activity_bar::GIT,
                     t("app", "activityBar.git"),
-                    self.right_drawer == Some(DrawerPanel::Git),
+                    false,
                     self.activity_bar_hover.is_visible("toggle-git"),
                     Self::activity_bar_item_hover_listener("toggle-git", cx),
                 )
@@ -1559,13 +1563,13 @@ impl Render for Workspace {
                 })),
             )
             // 终端列表竖条(GPUI 版新增,原版边条没有这颗)。开关的是终端区
-            // 右缘的**停靠竖条**而不是右抽屉,所以激活态跟 store 的持久化显隐走
+            // 右缘的**停靠竖条**而不是右抽屉,同样不给激活态(理由见上)。
             .child(
                 activity_bar::strip_button(
                     "toggle-terminals",
                     activity_bar::TERMINALS,
                     t("app", "activityBar.terminals"),
-                    terminals_visible && terminal_page_active,
+                    false,
                     self.activity_bar_hover.is_visible("toggle-terminals"),
                     Self::activity_bar_item_hover_listener("toggle-terminals", cx),
                 )
@@ -1586,7 +1590,7 @@ impl Render for Workspace {
                     "toggle-usage",
                     activity_bar::STATS,
                     t("app", "activityBar.stats"),
-                    self.usage_open,
+                    false,
                     self.activity_bar_hover.is_visible("toggle-usage"),
                     Self::activity_bar_item_hover_listener("toggle-usage", cx),
                 )
