@@ -1717,6 +1717,7 @@ mod tests {
             is_head: false,
             is_remote: remote,
             commit_hash: "x".into(),
+            upstream: None,
         }
     }
 

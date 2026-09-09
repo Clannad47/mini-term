@@ -40,6 +40,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 use mt_project::git::{BranchInfo, GitRepoInfo};
+use mt_ui::TruncatedText;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
@@ -348,10 +349,17 @@ impl GitPanel {
     fn push_repo_down(&mut self, cx: &mut Context<Self>) {
         let repo = self.selected_repo.clone();
         let branches = self.branches.clone();
+        let head_branch = self.current_branch().map(str::to_string);
         let view_branch = self.view_branch.clone();
         self.changes.update(cx, |c, cx| c.set_repo(&repo, cx));
         self.history.update(cx, |h, cx| {
-            h.sync(&repo, &branches, view_branch.as_deref(), cx)
+            h.sync(
+                &repo,
+                &branches,
+                head_branch.as_deref(),
+                view_branch.as_deref(),
+                cx,
+            )
         });
     }
 
@@ -474,6 +482,12 @@ fn centered_hint(text: &'static str) -> AnyElement {
 /// 任意 flex-grow(gpui 的 `flex_grow()` 只会设成 1)。
 fn grow<E: Styled>(mut el: E, value: f32) -> E {
     el.style().flex_grow = Some(value);
+    el
+}
+
+/// 任意 flex-shrink(gpui 只有 `flex_shrink()` = 1 与 `flex_shrink_0()`)。
+fn shrink<E: Styled>(mut el: E, value: f32) -> E {
+    el.style().flex_shrink = Some(value);
     el
 }
 
@@ -744,18 +758,18 @@ impl GitPanel {
                 .when_some(detail, |el, detail| {
                     el.child(
                         div()
+                            .min_w(px(0.0))
                             .max_w(px(90.0))
-                            .truncate()
                             .text_size(ui::font_px(12.0))
                             .text_color(ui::text_muted())
-                            .child(SharedString::from(format!("{detail}/"))),
+                            .child(TruncatedText::new(format!("{detail}/"))),
                     )
                 })
                 .child(
                     div()
-                        .truncate()
+                        .min_w(px(0.0))
                         .text_size(ui::font_px(13.0))
-                        .child(SharedString::from(repo_name)),
+                        .child(TruncatedText::new(repo_name)),
                 )
                 .when(is_worktree, |el| {
                     el.child(div().text_size(ui::font_px(13.0)).text_color(ui::text_muted()).child("⎇"))
@@ -777,7 +791,11 @@ impl GitPanel {
                 ),
         );
 
-        // 分支徽章
+        // 分支徽章。宽度**随分支名自适应**:不设上限,栏子挤不下时才与仓库名
+        // 一起收缩(两边都 `min_w(0)` + 省略截断),右侧三个按钮永不让位。
+        // 徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,分支名
+        // 通常比仓库名长得多,等权会把仓库名先挤成「re…」。截断时全名挂 tooltip。
+        // 截断不能用 `truncate()`,理由见 `mt_ui::truncated_text` 模块注释。
         if let Some(branch) = display_branch {
             let (bg, fg) = if viewing_other {
                 (
@@ -787,6 +805,7 @@ impl GitPanel {
             } else {
                 (ui::border_subtle(), ui::text_muted())
             };
+            let branch_tip: SharedString = branch.clone().into();
             bar = bar.child(
                 div()
                     .id("git-branch-badge")
@@ -797,11 +816,22 @@ impl GitPanel {
                     .px(px(6.0))
                     .rounded(px(3.0))
                     .cursor_pointer()
+                    .min_w(px(0.0))
+                    .map(|el| shrink(el, 3.0))
                     .bg(bg)
                     .text_color(fg)
                     .text_size(ui::font_px(13.0))
-                    .child(div().max_w(px(140.0)).truncate().child(branch))
-                    .child(div().text_size(ui::font_px(11.0)).opacity(0.7).child("▾"))
+                    .child(TruncatedText::new(branch))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::font_px(11.0))
+                            .opacity(0.7)
+                            .child("▾"),
+                    )
+                    .tooltip(move |window, cx| {
+                        mt_ui::tooltip::Tooltip::new(branch_tip.clone()).build(window, cx)
+                    })
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
                         if this.branches.is_empty() {
@@ -1240,12 +1270,14 @@ mod tests {
                 is_head: false,
                 is_remote: false,
                 commit_hash: "abc".into(),
+                upstream: Some("origin/main".into()),
             },
             BranchInfo {
                 name: "origin/main".into(),
                 is_head: false,
                 is_remote: true,
                 commit_hash: "abc".into(),
+                upstream: None,
             },
         ];
         let detached = "(1a2b3c4)";
