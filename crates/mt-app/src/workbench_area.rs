@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Window, div, prelude::FluentBuilder, px,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
@@ -342,8 +342,14 @@ pub struct WorkbenchArea {
     last_rendered_page: Option<WorkbenchPage>,
     /// 页签条的横向滚动位置。**全项目共用一份**：切项目时页签整条重建，
     /// 上一个项目的偏移留着也无意义，切完那一帧的 `scroll_to_item` 会把活动页
-    /// 拉回视野。
+    /// 拉回视野。只跟**文档页签**那段滚动区走，常驻终端页在滚动区之外。
     tab_scroll: ScrollHandle,
+    /// 鼠标是否落在文档页签那段滚动区里。横向滚动条只在「溢出 + 悬停」时现身，
+    /// 判据见 [`Self::render`]。
+    tabs_hovered: bool,
+    /// 正在拖页签滚动条：按下那一刻的 (鼠标 x, 滚动偏移 x)。换算见
+    /// [`tab_drag_offset`]；拖动期间即使鼠标滑出页签条也保持滚动条可见。
+    tab_drag: Option<(gpui::Pixels, gpui::Pixels)>,
 }
 
 impl WorkbenchArea {
@@ -380,7 +386,39 @@ impl WorkbenchArea {
             last_rendered_project: None,
             last_rendered_page: None,
             tab_scroll: ScrollHandle::new(),
+            tabs_hovered: false,
+            tab_drag: None,
         }
+    }
+
+    /// 拖页签滚动条时把鼠标位移换成新的滚动偏移。
+    ///
+    /// 挂在**工作区根容器**上而不是 thumb 自己:gpui 的 `on_mouse_move` 只在
+    /// 元素 hover 时触发,挂在那条 4px 的 thumb 上,鼠标一垂直抖出去拖动就断了。
+    fn on_tab_scroll_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((anchor_x, anchor_offset)) = self.tab_drag else {
+            return;
+        };
+        // 在页签条外松开的左键收不到 mouse_up,靠这一步收尾
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.tab_drag = None;
+            cx.notify();
+            return;
+        }
+        let offset = tab_drag_offset(
+            f32::from(self.tab_scroll.bounds().size.width),
+            f32::from(self.tab_scroll.max_offset().width),
+            f32::from(anchor_offset),
+            f32::from(event.position.x - anchor_x),
+        );
+        self.tab_scroll
+            .set_offset(point(px(offset), self.tab_scroll.offset().y));
+        cx.notify();
     }
 
     pub fn is_terminal_active(&self, cx: &App) -> bool {
@@ -589,11 +627,12 @@ impl WorkbenchArea {
             project.active = WorkbenchPage::Document(anchor.clone());
         }
         // 批量关闭后剩下的页签会左移，滚动偏移原地不动就会停在一段空白上；
-        // 把留下的锚点重新拉进视野（活动页没被动过时也一样成立）
+        // 把留下的锚点重新拉进视野（活动页没被动过时也一样成立）。
+        // 滚动区里**只有文档页签**，序号即 tabs 下标（终端页固定在滚动区外）
         if let Some(anchor) = fallback
             && let Some(index) = project.index_of(anchor)
         {
-            self.tab_scroll.scroll_to_item(index + 1);
+            self.tab_scroll.scroll_to_item(index);
         }
         let project_is_visible =
             self.store.read(cx).active_project_id.as_deref() == Some(project_id);
@@ -795,14 +834,13 @@ impl Render for WorkbenchArea {
                 }
             }
             // 页签多到溢出时，刚激活的那一页可能整个在视野之外(尤其是新打开的
-            // 文件排在最右)。终端页固定是第 0 个子元素，文档页顺次排在它后面。
-            self.tab_scroll.scroll_to_item(match &active {
-                WorkbenchPage::Terminal => 0,
-                WorkbenchPage::Document(key) => tabs
-                    .iter()
-                    .position(|(candidate, _, _)| candidate == key)
-                    .map_or(0, |index| index + 1),
-            });
+            // 文件排在最右)。滚动区里只有文档页签，序号即 tabs 下标；切回终端页
+            // 不必动偏移 —— 那一颗常驻在滚动区左侧、任何偏移下都在视野里。
+            if let WorkbenchPage::Document(key) = &active
+                && let Some(index) = tabs.iter().position(|(candidate, _, _)| candidate == key)
+            {
+                self.tab_scroll.scroll_to_item(index);
+            }
         }
 
         // 尚未打开文件时保持原终端区的尺寸与结构，一旦有文档才出现工作区页签条。
@@ -811,54 +849,57 @@ impl Render for WorkbenchArea {
         }
 
         let terminal_active = active == WorkbenchPage::Terminal;
-        // 页签条横向滚动(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
+        // 常驻终端页**钉在最左**,不进滚动区 —— 它是回终端的唯一入口,被文件页签
+        // 挤出视野后要先横向滚回去才点得到。
+        let terminal_tab = div()
+            .id("workbench-tab-terminal")
+            .h_full()
+            .flex_none()
+            .min_w(px(110.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_size(ui::font_px(12.0))
+            .when(terminal_active, |el| {
+                el.bg(ui::bg_terminal())
+                    .text_color(ui::text_primary())
+                    .border_t_2()
+                    .border_color(ui::accent())
+            })
+            .when(!terminal_active, |el| {
+                el.text_color(ui::text_muted())
+                    .border_t_2()
+                    .border_color(gpui::Hsla {
+                        a: 0.0,
+                        ..ui::accent()
+                    })
+            })
+            .child(t("terminalArea", "terminal"))
+            .on_click(cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)));
+
+        // 文档页签横向滚动区(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
         //
         // 垂直滚轮不必自己映射 —— gpui 只在 `overflow.x == Scroll && overflow.y
         // != Scroll` 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y`
         // 记到 x 上(gpui-0.2.2 `elements/div.rs`)。`track_scroll` 是为了能主动
         // 把活动页拉进视野。
-        let mut tab_bar = div()
+        let mut doc_tabs = div()
             .id("workbench-tabs")
-            .h(px(34.0))
-            .flex_none()
+            .size_full()
             .flex()
             .items_center()
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
-            .bg(ui::bg_elevated())
-            .border_b_1()
-            .border_color(ui::border_subtle())
-            .child(
-                div()
-                    .id("workbench-tab-terminal")
-                    .h_full()
-                    .flex_none()
-                    .min_w(px(110.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .text_size(ui::font_px(12.0))
-                    .when(terminal_active, |el| {
-                        el.bg(ui::bg_terminal())
-                            .text_color(ui::text_primary())
-                            .border_t_2()
-                            .border_color(ui::accent())
-                    })
-                    .when(!terminal_active, |el| {
-                        el.text_color(ui::text_muted())
-                            .border_t_2()
-                            .border_color(gpui::Hsla {
-                                a: 0.0,
-                                ..ui::accent()
-                            })
-                    })
-                    .child(t("terminalArea", "terminal"))
-                    .on_click(
-                        cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)),
-                    ),
-            );
+            // 悬停即出滚动条(下面那道 `tabs_hovered` 判据)。只记一个 bool、
+            // 不回读实体,不碰 cx.listener 内禁止再 update 自身那条铁律。
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if this.tabs_hovered != *hovered {
+                    this.tabs_hovered = *hovered;
+                    cx.notify();
+                }
+            }));
 
         for (key, title, document) in &tabs {
             let selected = active == WorkbenchPage::Document(key.clone());
@@ -869,7 +910,7 @@ impl Render for WorkbenchArea {
             let click_project = project_id.clone();
             let close_project = project_id.clone();
             let menu_project = project_id.clone();
-            tab_bar = tab_bar.child(
+            doc_tabs = doc_tabs.child(
                 div()
                     .id(SharedString::from(format!(
                         "workbench-tab-{:016x}",
@@ -968,6 +1009,79 @@ impl Render for WorkbenchArea {
             );
         }
 
+        // 横向滚动条:悬停(或正在拖)且**真溢出**时才画。几何全部来自上一帧量的
+        // `bounds`/`max_offset`(首帧为零 → 不画,下一帧补上)。
+        //
+        // 自绘而不用 `gpui_component::scroll::Scrollbar`:那颗的 thumb 粗细与内衬
+        // 是 crate 内部常量(8px thumb + 上下各 4px = 16px 高的一整条带,还自带
+        // 轨道底色),压在 34px 高的页签条上占掉半层。这里只要一根细 thumb。
+        let dragging = self.tab_drag.is_some();
+        let thumb = (self.tabs_hovered || dragging)
+            .then(|| {
+                tab_thumb_geometry(
+                    f32::from(self.tab_scroll.bounds().size.width),
+                    f32::from(self.tab_scroll.max_offset().width),
+                    f32::from(self.tab_scroll.offset().x),
+                )
+            })
+            .flatten();
+        let tab_bar = div()
+            .h(px(34.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .bg(ui::bg_elevated())
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(terminal_tab)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(doc_tabs)
+                    .children(thumb.map(|(width, left)| {
+                        // 外层是拖拽热区(10px),可见的那根只有 4px —— 直接给
+                        // thumb 4px 高会难以按中。热区透明,不挡页签的点击:
+                        // 它只贴在底缘,页签的文字与关闭按钮都在其上方。
+                        div()
+                            .id("workbench-tabs-thumb")
+                            .absolute()
+                            .bottom_0()
+                            .left(px(left))
+                            .w(px(width))
+                            .h(px(TAB_THUMB_HIT_HEIGHT))
+                            .flex()
+                            .items_end()
+                            .pb(px(2.0))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(TAB_THUMB_HEIGHT))
+                                    .rounded(px(TAB_THUMB_HEIGHT / 2.0))
+                                    .bg(ui::with_alpha(
+                                        ui::text_muted(),
+                                        if dragging {
+                                            TAB_THUMB_ALPHA_DRAG
+                                        } else {
+                                            TAB_THUMB_ALPHA
+                                        },
+                                    )),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.tab_drag =
+                                        Some((event.position.x, this.tab_scroll.offset().x));
+                                    cx.notify();
+                                }),
+                            )
+                    })),
+            );
+
         let body = match &active {
             WorkbenchPage::Terminal => self.terminal_area.clone().into_any_element(),
             WorkbenchPage::Document(key) => tabs
@@ -982,9 +1096,65 @@ impl Render for WorkbenchArea {
             .flex()
             .flex_col()
             .overflow_hidden()
+            // 页签滚动条的拖拽在**根容器**上收尾:thumb 只有几像素高,鼠标一抖
+            // 就滑出去了,监听挂在它身上会拖两下断一次(理由见 on_tab_scroll_drag)
+            .on_mouse_move(cx.listener(Self::on_tab_scroll_drag))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.tab_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(tab_bar)
             .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
     }
+}
+
+/// 「页签横向溢出了没有」的判据阈值。取 0.5px 而不是 0：taffy 的宽度是浮点，
+/// 内容刚好填满时 `max_offset` 常残一丝亚像素，按 0 判会让滚动条无谓地闪出来。
+const SCROLLBAR_EPSILON: f32 = 0.5;
+/// 可见 thumb 的粗细。页签条统共 34px 高，再粗就压掉一层。
+const TAB_THUMB_HEIGHT: f32 = 4.0;
+/// thumb 的拖拽热区高度（外层透明壳）。4px 的可见条太难按中。
+const TAB_THUMB_HIT_HEIGHT: f32 = 10.0;
+/// thumb 再短也要够得着。
+const TAB_THUMB_MIN_WIDTH: f32 = 24.0;
+/// thumb 平时/拖动中的不透明度。它压在页签文字底下，安静一点。
+const TAB_THUMB_ALPHA: f32 = 0.28;
+const TAB_THUMB_ALPHA_DRAG: f32 = 0.5;
+
+/// 页签滚动条 thumb 的 **(长度, 左偏)**，单位 px。
+///
+/// `container` 是滚动区可视宽度，`max_offset` 是还能往左滚多少，`offset` 是 gpui
+/// 记的当前偏移（**向左滚为负**）。不溢出（或首帧还没量到尺寸）时返回 `None`，
+/// 调用方据此整条不画。
+fn tab_thumb_geometry(container: f32, max_offset: f32, offset: f32) -> Option<(f32, f32)> {
+    if container <= 0.0 || max_offset <= SCROLLBAR_EPSILON {
+        return None;
+    }
+    let content = container + max_offset;
+    let thumb =
+        (container * container / content).clamp(TAB_THUMB_MIN_WIDTH.min(container), container);
+    let track = container - thumb;
+    let progress = ((-offset) / max_offset).clamp(0.0, 1.0);
+    Some((thumb, track * progress))
+}
+
+/// 拖 thumb 时把鼠标位移 `delta` 换算成新的滚动偏移（向左为负，已夹在可滚范围内）。
+///
+/// 换算比例是**轨道剩余长度**对 `max_offset`，不是容器宽对内容宽 —— thumb 走完
+/// 轨道正好等于内容滚到底，用后者会让指针跑在 thumb 前面。
+fn tab_drag_offset(container: f32, max_offset: f32, anchor_offset: f32, delta: f32) -> f32 {
+    let Some((thumb, _)) = tab_thumb_geometry(container, max_offset, anchor_offset) else {
+        return anchor_offset;
+    };
+    let track = container - thumb;
+    if track <= 0.0 {
+        return anchor_offset;
+    }
+    (anchor_offset - delta * max_offset / track).clamp(-max_offset, 0.0)
 }
 
 /// 批量关闭确认框里列出的未保存文件名。与关窗确认同一套口径：只列前几条，
@@ -1103,6 +1273,54 @@ mod tests {
         assert!(documents_in_scope(&keys, 0, CloseScope::ToLeft).is_empty());
         assert!(documents_in_scope(&keys, 1, CloseScope::ToRight).is_empty());
         assert!(documents_in_scope(&[key("a")], 0, CloseScope::Others).is_empty());
+    }
+
+    /// 不溢出（含首帧还没量到尺寸）就整条不画 —— 空轨道比没有更碍眼。
+    #[test]
+    fn 页签滚动条只在真溢出时出现() {
+        assert_eq!(tab_thumb_geometry(0.0, 0.0, 0.0), None, "首帧没尺寸");
+        assert_eq!(tab_thumb_geometry(400.0, 0.0, 0.0), None, "没溢出");
+        assert_eq!(
+            tab_thumb_geometry(400.0, SCROLLBAR_EPSILON, 0.0),
+            None,
+            "亚像素残差不算溢出"
+        );
+        assert!(tab_thumb_geometry(400.0, 200.0, 0.0).is_some());
+    }
+
+    /// thumb 长度 = 可视占内容的比例，两端分别贴住轨道两头。
+    #[test]
+    fn 页签滚动条按比例取长并走满轨道() {
+        // 可视 400 / 内容 600 → thumb 占 2/3
+        let (width, left) = tab_thumb_geometry(400.0, 200.0, 0.0).expect("该有 thumb");
+        assert!((width - 400.0 * 400.0 / 600.0).abs() < 1e-3);
+        assert_eq!(left, 0.0, "没滚时贴左");
+
+        // 滚到底（偏移为负的 max）时 thumb 右缘正好压住轨道右端
+        let (width_end, left_end) = tab_thumb_geometry(400.0, 200.0, -200.0).expect("该有 thumb");
+        assert!((width_end - width).abs() < 1e-3, "长度不随偏移变");
+        assert!((left_end + width_end - 400.0).abs() < 1e-3);
+
+        // 内容长到 thumb 会缩成一条线时，用最短长度兜底
+        let (tiny, _) = tab_thumb_geometry(400.0, 40_000.0, 0.0).expect("该有 thumb");
+        assert!((tiny - TAB_THUMB_MIN_WIDTH).abs() < 1e-3);
+    }
+
+    /// 拖动换算的比例基准是**轨道剩余长度**：thumb 拖到轨道尽头 = 内容滚到底。
+    /// 按「容器宽 : 内容宽」换算的话指针会跑在 thumb 前面。
+    #[test]
+    fn 页签滚动条拖动与轨道等长并夹在可滚范围内() {
+        let (width, _) = tab_thumb_geometry(400.0, 200.0, 0.0).expect("该有 thumb");
+        let track = 400.0 - width;
+        // 从最左把 thumb 拖满整条轨道
+        assert!((tab_drag_offset(400.0, 200.0, 0.0, track) + 200.0).abs() < 1e-3);
+        // 半程即一半偏移
+        assert!((tab_drag_offset(400.0, 200.0, 0.0, track / 2.0) + 100.0).abs() < 1e-3);
+        // 两端都夹住：往左拖过头停在 0，往右拖过头停在 -max
+        assert_eq!(tab_drag_offset(400.0, 200.0, 0.0, -999.0), 0.0);
+        assert_eq!(tab_drag_offset(400.0, 200.0, -200.0, 999.0), -200.0);
+        // 没溢出时拖不动
+        assert_eq!(tab_drag_offset(400.0, 0.0, 0.0, 50.0), 0.0);
     }
 
     #[test]
