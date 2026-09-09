@@ -47,6 +47,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
+use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -202,7 +203,7 @@ pub(crate) fn bucket_header(
                 .text_size(ui::font_px(10.0))
                 .child(if collapsed { "▸" } else { "▾" }),
         )
-        .child(div().truncate().child(label.into()))
+        .child(div().min_w(px(0.0)).child(TruncatedText::new(label)))
         .child(div().flex_none().child(format!("({count})")))
 }
 
@@ -334,7 +335,7 @@ pub(crate) fn conn_card(
 pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
     conn_text_with_name(
         name_line()
-            .child(SharedString::from(conn.name.clone()))
+            .child(TruncatedText::new(conn.name.clone()))
             .into_any_element(),
         conn,
         suffix,
@@ -345,7 +346,7 @@ pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
 /// 抽出来是为了「点得动的名字」与「纯文本名字」看上去一模一样。
 fn name_line() -> gpui::Div {
     div()
-        .truncate()
+        .min_w(px(0.0))
         .text_size(ui::font_px(13.0))
         .text_color(ui::text_primary())
 }
@@ -1456,7 +1457,7 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
                 .cursor_pointer()
                 .when(just_copied, |el| el.text_color(ui::accent()))
                 .hover(|el| el.text_color(ui::accent()))
-                .child(SharedString::from(conn.name.clone()))
+                .child(TruncatedText::new(conn.name.clone()))
                 .on_click({
                     let state = state.clone();
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {

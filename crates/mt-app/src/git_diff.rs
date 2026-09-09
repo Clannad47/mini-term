@@ -49,6 +49,7 @@ use gpui::{
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
 use mt_ui::tooltip::Tooltip;
+use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{kind, open_guarded};
@@ -1136,11 +1137,11 @@ pub fn open_file_diff(
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .max_w(px(300.0))
-                            .truncate()
                             .text_size(ui::font_px(13.0))
                             .text_color(ui::text_muted())
-                            .child(file_path.clone()),
+                            .child(TruncatedText::new(file_path.clone())),
                     )
                     .child(
                         div()
@@ -1304,7 +1305,7 @@ pub fn open_commit_diff(
                                 .text_color(color)
                                 .child(letter),
                         )
-                        .child(div().truncate().child(name))
+                        .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
                         .on_click(move |_: &ClickEvent, _window, cx| {
                             if pick.read(cx).selected == path {
                                 return;
@@ -1396,11 +1397,11 @@ pub fn open_commit_diff(
                         .border_color(ui::border_subtle())
                         .child(
                             div()
+                                .min_w(px(0.0))
                                 .max_w(px(400.0))
-                                .truncate()
                                 .text_size(ui::font_px(13.0))
                                 .text_color(ui::text_primary())
-                                .child(selected.clone()),
+                                .child(TruncatedText::new(selected.clone())),
                         )
                         .child(view_toggle(
                             &state,

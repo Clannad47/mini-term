@@ -76,6 +76,7 @@ use mt_project::fs::FileContentResult;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
+use mt_ui::TruncatedText;
 
 use crate::i18n::t;
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
@@ -1908,7 +1909,7 @@ fn md_image_placeholder(
         .bg(ui::bg_elevated())
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_muted())
-        .child(div().min_w_0().truncate().child(label))
+        .child(div().min_w_0().child(TruncatedText::new(label)))
         .when_some(hint, |el, hint| {
             el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
         })
@@ -2865,8 +2866,7 @@ impl FileViewer {
                             .min_w(px(0.0))
                             .text_size(ui::font_px(12.0))
                             .text_color(ui::text_muted())
-                            .truncate()
-                            .child(path),
+                            .child(TruncatedText::new(path)),
                     ),
             )
             .child(
