@@ -1264,7 +1264,7 @@ mod tests {
     /// 也就永远不会被当分支名传给 `get_git_log`(那会 `bail!`)。
     #[test]
     fn detached_head_不当分支名查询() {
-        let branches = vec![
+        let branches = [
             BranchInfo {
                 name: "main".into(),
                 is_head: false,
