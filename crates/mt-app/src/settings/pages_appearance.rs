@@ -9,8 +9,8 @@ use gpui::{
     PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
-use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 use mt_ui::TruncatedText;
+use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 
 use crate::i18n::{Locale, t, tr};
 use crate::prompt::Confirm;

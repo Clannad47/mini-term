@@ -59,8 +59,8 @@ use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, ImageAssetLoader,
-    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement,
-    Pixels, Render, Resource, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage as _,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Pixels,
+    Render, Resource, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage as _,
     Subscription, Task, Window, div, img, list, prelude::FluentBuilder as _, px,
 };
 use gpui::http_client::{
@@ -74,9 +74,9 @@ use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::FsWatcher;
+use mt_ui::TruncatedText;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
-use mt_ui::TruncatedText;
 
 use crate::i18n::t;
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};

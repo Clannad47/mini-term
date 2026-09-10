@@ -102,8 +102,7 @@ impl GitHistoryContent {
         view_branch: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let tags_changed =
-            self.branches != branches || self.head_branch.as_deref() != head_branch;
+        let tags_changed = self.branches != branches || self.head_branch.as_deref() != head_branch;
         let reload = self.repo_path != repo_path || self.view_branch.as_deref() != view_branch;
         self.repo_path = repo_path.to_string();
         self.view_branch = view_branch.map(str::to_string);
@@ -278,9 +277,7 @@ fn pick_shown_branches<'a>(
     branches
         .iter()
         .filter(|b| {
-            b.is_head
-                || Some(b.name.as_str()) == view_branch
-                || Some(b.name.as_str()) == upstream
+            b.is_head || Some(b.name.as_str()) == view_branch || Some(b.name.as_str()) == upstream
         })
         .filter(|b| b.commit_hash == hash)
         .collect()
@@ -857,17 +854,30 @@ mod tests {
         ];
         // 查看 dev:dev 与 origin/dev 同行,origin/main 不再挂
         assert_eq!(
-            names(&pick_shown_branches(&branches, Some("main"), Some("dev"), "c0")),
+            names(&pick_shown_branches(
+                &branches,
+                Some("main"),
+                Some("dev"),
+                "c0"
+            )),
             vec!["dev", "origin/dev"]
         );
         assert!(pick_shown_branches(&branches, Some("main"), Some("dev"), "c1").is_empty());
         // 查看远程分支 origin/dev:只挂它自己(与 HEAD)
         assert_eq!(
-            names(&pick_shown_branches(&branches, Some("main"), Some("origin/dev"), "c0")),
+            names(&pick_shown_branches(
+                &branches,
+                Some("main"),
+                Some("origin/dev"),
+                "c0"
+            )),
             vec!["origin/dev"]
         );
         // 没配上游的本地分支:只有它自己
-        assert_eq!(tracked_upstream(&branches, Some("main"), Some("lonely")), None);
+        assert_eq!(
+            tracked_upstream(&branches, Some("main"), Some("lonely")),
+            None
+        );
         // detached HEAD:head_branch 是短 hash,查不到 → 没有上游
         assert_eq!(tracked_upstream(&branches, Some("(1a2b3c4)"), None), None);
         assert_eq!(tracked_upstream(&branches, None, None), None);

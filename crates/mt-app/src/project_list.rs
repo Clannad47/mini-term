@@ -49,11 +49,11 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
+use mt_ui::TruncatedText;
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
     ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
 };
-use mt_ui::TruncatedText;
 
 use crate::dnd::{
     self, DragProjectItem, DropPosition, ExternalDropKind, PreviewIcon,

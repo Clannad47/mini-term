@@ -1872,16 +1872,9 @@ mod tests {
             repo.remote("origin", "https://example.invalid/repo.git")
                 .unwrap();
             let head = repo.head().unwrap().target().unwrap();
-            repo.reference(
-                &format!("refs/remotes/origin/{name}"),
-                head,
-                true,
-                "test",
-            )
-            .unwrap();
-            let mut branch = repo
-                .find_branch(&name, git2::BranchType::Local)
+            repo.reference(&format!("refs/remotes/origin/{name}"), head, true, "test")
                 .unwrap();
+            let mut branch = repo.find_branch(&name, git2::BranchType::Local).unwrap();
             branch
                 .set_upstream(Some(&format!("origin/{name}")))
                 .unwrap();
@@ -1892,7 +1885,10 @@ mod tests {
             .iter()
             .find(|b| !b.is_remote && b.name == name)
             .expect("本地分支还在");
-        assert_eq!(local.upstream.as_deref(), Some(format!("origin/{name}").as_str()));
+        assert_eq!(
+            local.upstream.as_deref(),
+            Some(format!("origin/{name}").as_str())
+        );
         let remote = after
             .iter()
             .find(|b| b.is_remote)

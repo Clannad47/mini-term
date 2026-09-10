@@ -35,11 +35,11 @@ use gpui::{
     Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use mt_ui::tooltip::Tooltip;
-use mt_ui::TruncatedText;
 use mt_project::search::{
     SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
 };
+use mt_ui::TruncatedText;
+use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
 use crate::menu;

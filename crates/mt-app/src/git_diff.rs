@@ -48,8 +48,8 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
-use mt_ui::tooltip::Tooltip;
 use mt_ui::TruncatedText;
+use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{kind, open_guarded};
