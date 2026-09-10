@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -97,7 +97,7 @@ Right-click a project → "Link SSH", tick the connections, and it's enabled for
 
 ### 🌿 Git integration + batch worktree management
 
-A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views (horizontal scrolling for long lines, vertically synced columns, `@@` hunk separators and prev / next-change jumps, plus word-level highlighting on paired delete / add lines), cursor-paginated commit history, and a **hand-drawn SVG branch topology graph**. The Git panel stacks two collapsible sections — Changes on top, commit history below — visible at the same time with a draggable divider; a repo bar at the top switches repos (a run of identically named `api` repos in a monorepo each carry their parent path to tell them apart), the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
+A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views (horizontal scrolling for long lines, vertically synced columns, `@@` hunk separators and prev / next-change jumps, plus word-level highlighting on paired delete / add lines), cursor-paginated commit history, and a **hand-drawn SVG branch topology graph**. The Git panel stacks two collapsible sections — Changes on top, commit history below — visible at the same time with a draggable divider; a repo bar at the top switches repos (a run of identically named `api` repos in a monorepo each carry their parent path to tell them apart), the branch badge switches which branch's history is shown (no checkout) and now sizes itself to the branch name — truncating with the full name on a tooltip only when it really can't fit — and refresh / Pull / Push live on the same bar. Beyond local branches, the history pins an **`origin/xxx` upstream pill** on the commit it actually points at, so you can see at a glance whether your latest work has been pushed.
 
 **Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers so you can **create one worktree per checked repo in a single action**. Any worktree can be turned into a project in one click — mounted under its parent — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries.
 
@@ -113,7 +113,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
 | **Move within the file tree** | Drag, or right-click "Move to ▸", to move files / directories into another directory — local and remote alike; a confirmation appears on drop, and Esc cancels an in-progress drag at any time |
 | **File workbench** | Local and remote files opened from the tree live in main-area tabs alongside the terminal, where you view, edit, and save them: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection; tab indentation is expanded to tab stops for display (so Go and friends no longer sit flush left) and the original bytes are restored line by line on save; remote files are read and written over SFTP, every save is checked against the loaded baseline, conflicts offer reload or force-overwrite, and any remote file can be downloaded; right-click a tab to close it, the others, everything to its right, or everything to its left (the pinned terminal tab can never be closed), and once tabs overflow the bar scrolls horizontally with a draggable scrollbar that appears on hover, always pulling the target tab back into view after a switch or a bulk close |
-| **Document preview** | Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images are fetched for real (10s timeout, 32MB cap, every other scheme refused). Markdown from remote files is sanitized before rendering: raw HTML shows as source, external images load only on click, and `file://`-style links degrade to plain text; remote HTML is source-view only. HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association |
+| **Document preview** | The Markdown preview is **virtualized block by block**, laying out only what's near the viewport — a document of tens of KB with a dozen-plus tables scrolls smoothly (measured 152ms → 23ms of main-thread time per frame). Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images are fetched for real (10s timeout, 32MB cap, every other scheme refused). Markdown from remote files is sanitized before rendering: raw HTML shows as source, external images load only on click, and `file://`-style links degrade to plain text; remote HTML is source-view only. HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association |
 | **Global search** | `Ctrl+Shift+F` for filename or content search (a `/` in the query matches against the path), substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
@@ -141,7 +141,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,779 Rust tests** (29 test targets) |
+| Tests | **1,782 Rust tests** (29 test targets) |
 
 ---
 
