@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.10-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -48,11 +48,11 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **滚动缓冲行数可调** — 主缓冲区保留行数可在设置里调整（默认 1 万行，改小当场生效并释放内存；历史版本曾因硬编码 10 万行在多项目多分屏叠加时把内存推向 OOM，教训记入了默认值），同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史。Windows 版内置并预载固定版本的官方 ConPTY 兼容运行时（资源校验失败时自动回退系统 ConPTY），让不同 Windows 版本下的 Codex 滚动与 transcript 折叠行为保持一致
 - **终端缓存** — 切换项目 / 标签 / 分屏不重建终端实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
 - **项目切换缓存** — 文件树 / Git 历史数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行
-- **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；可在设置中开启「智能 `Ctrl+C/V`」（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴；macOS 上 `⌘` 系组合不受该开关约束）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
+- **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；「智能 `Ctrl+C/V`」默认开启、可在设置中关闭（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴；macOS 上 `⌘` 系组合不受该开关约束）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
 - **拖选停留自动复制** — 拖选文本后按住鼠标静止超过设定时长（默认 1s，可调 0.2–60s，0 = 关闭）自动复制选区并在光标旁弹「已复制」气泡；松手时选区已继续增长则补复制一次，剪贴板始终是最终看到的完整选区
 - **Alt / ⌥+单击定位光标** — 按住 Alt（macOS ⌥）单击终端里的某个格子，按与当前光标的列差合成左右方向键把光标挪过去（跟随 DECCKM 应用光标键模式，零位移不发、超过 512 步放弃、滚动回看时不生效）；**只在同一行内生效**，跨行一律不动——行编辑器里的上下方向键往往是召回历史而不是移动光标，宁可不动也不能毁掉正在输入的内容。bash / zsh / pwsh 提示符下逐格准确；Claude CLI 这类 Ink TUI 把硬件光标停在行末、起点对不上，不保证
 - **长文本粘贴** — 剪贴板文本 ≥10 行或 ≥2000 字符时自动转存为临时 `.txt` 并粘贴带引号的文件路径，避免 AI 工具直接处理超长内容引发性能与 paste bracket 问题
-- **图片粘贴** — 剪贴板含截图时自动检测，Windows 经 Win32 剪贴板 API（`CF_DIB` / `CF_BITMAP`）保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式；其余平台读系统剪贴板里的 PNG/JPEG 等原始字节直接落盘；图片确实在场却解不出来（如 `BI_BITFIELDS` 压缩位图）时发送 `Alt+V`，交给终端里的 AI 工具自行读取剪贴板
+- **图片粘贴** — 剪贴板含截图时自动检测，Windows 经 Win32 剪贴板 API（`CF_DIB` / `CF_BITMAP`）保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式；其余平台读系统剪贴板里的 PNG/JPEG 等原始字节直接落盘；图片确实在场却解不出来（如 `BI_BITFIELDS` 压缩位图）时发送 `Alt+V`，交给终端里的 AI 工具自行读取剪贴板。**终端里正跑着 Claude Code（本地 / WSL）时不落盘，直接发 `Alt+V`**——它会插入 `[Image #N]` 芯片，模型直接看到图而不是一条路径；Claude 退出后、或在 SSH 远程项目里（远端读的是远端剪贴板）仍走落盘 / 上传路线
 - **远程 / WSL 粘贴自动落地** — 上面两种「转存成文件再粘路径」的能力在远程终端里会自动换算落点：SSH 远程项目经 SFTP 把文件上传到远端目录后粘贴**远端**路径（默认 `<项目根>/.mini-term/pasted`，落在项目内 agent 无需额外授权即可读，目录可在设置中改成 `/tmp/mini-term`、`~/uploads` 等，并自动写入自忽略的 `.gitignore` 以免弄脏 `git status`）；WSL 项目则把 `C:\...` 换算为 `/mnt/c/...`（无需上传）。上传失败会明确弹提示，而不是粘一个远端读不到的本机路径
 - **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径；拖拽途中按 `Esc` 就地取消，路径不写入 PTY（Esc 被拖拽层吞掉，不会当成 `\x1b` 送进终端），松手也不会退化成一次普通点击把文件打开，悬停指示同步撤掉；只有真正进入拖拽后才吞 Esc，别处的 Esc 照常生效
 - **多 Shell 配置** — Windows（cmd / powershell / pwsh）、macOS（zsh / bash）、Linux（bash / sh）等，可自由增删
@@ -201,7 +201,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1782 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1789 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -342,7 +342,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（29 个测试目标、1782 例）
+# 全工作区 Rust 测试（29 个测试目标、1789 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
