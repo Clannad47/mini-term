@@ -177,7 +177,10 @@ pub struct AppConfig {
     pub last_active_project_id: Option<String>,
     #[serde(default)]
     pub hook_enabled: bool,
-    #[serde(default)]
+    /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
+    /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
+    /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
+    #[serde(default = "default_true")]
     pub smart_copy_paste: bool,
     /// 拖选按住不动自动复制的静止时长(秒)。`None` = UI 层默认 1s。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,7 +614,7 @@ impl Default for AppConfig {
             right_drawer_width: None,
             last_active_project_id: None,
             hook_enabled: false,
-            smart_copy_paste: false,
+            smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
             tray_max_projects: None,
@@ -1359,6 +1362,23 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.available_shells.len(), config.available_shells.len());
+    }
+
+    /// 智能 Ctrl+C/V 默认开:`Default` 与「库里没这个键」两条路都得是 true,
+    /// 存量用户显式存的 `false` 要原样保留。
+    #[test]
+    fn smart_copy_paste_defaults_on_but_keeps_explicit_off() {
+        assert!(AppConfig::default().smart_copy_paste);
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(missing.smart_copy_paste, "没这个键 = 新装用户,按新默认开");
+        let off: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": [], "smartCopyPaste": false}"#,
+        )
+        .unwrap();
+        assert!(!off.smart_copy_paste, "显式 false 不许被新默认盖掉");
     }
 
     #[test]
