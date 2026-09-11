@@ -136,7 +136,11 @@ pub const ALT_V: &str = "\x1bv";
 /// - **agent 正活着**(`ai-working` / `ai-idle`,口径同 [`is_ai_alive`]):退出后的
 ///   pane 仍留着会话身份备查(供续接),此时 shell 收到 `ESC v` 只是个 readline
 ///   动作,图就静默丢了 —— 那种 pane 照旧落盘粘路径;
-/// - agent 是 `claude`:codex / grok / omp 没有对应的键,照旧粘路径;
+/// - agent 是 Claude 系:codex / grok / omp 没有对应的键,照旧粘路径。⚠️ 同一家有
+///   **两种写法**:hook 上报的是 `claude-code`(sidecar `detect_agent`),输入检测
+///   认出的是 `claude` —— 只认全等 `"claude"` 会让开了 hook 的用户(绝大多数)
+///   永远走不进来,真机就是这么栽的。口径照抄 `mt_ai::sessions::agent_has_session_log`:
+///   小写后 `contains("claude")`;
 /// - 不是 SSH pane:远端的 Claude 读的是**远端**剪贴板,仍走 SFTP 上传那条路。
 ///
 /// **不看「智能 Ctrl+C/V」开关**:开关关着时 Ctrl+V 压根到不了粘贴钩子
@@ -148,7 +152,8 @@ pub fn agent_takes_clipboard_image(
     agent: Option<&str>,
     target: PasteTarget,
 ) -> bool {
-    is_ai_alive(status) && agent == Some("claude") && target != PasteTarget::Ssh
+    let is_claude = agent.is_some_and(|a| a.to_ascii_lowercase().contains("claude"));
+    is_ai_alive(status) && is_claude && target != PasteTarget::Ssh
 }
 
 /// 剪贴板里有没有图 —— **只探测不落盘**。
@@ -1042,6 +1047,12 @@ mod tests {
         let takes = agent_takes_clipboard_image;
 
         assert!(takes(S::AiIdle, Some("claude"), T::Local));
+        // hook 上报的是 `claude-code`,不是 `claude` —— 真机第一轮就栽在这里
+        assert!(takes(S::AiIdle, Some("claude-code"), T::Local));
+        assert!(
+            takes(S::AiIdle, Some("Claude-Code"), T::Local),
+            "大小写不敏感"
+        );
         assert!(
             takes(S::AiWorking, Some("claude"), T::Local),
             "思考中也能排队贴图"
