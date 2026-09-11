@@ -829,7 +829,9 @@ fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
     }
     let mut conn = conn;
     if conn.id.is_empty() {
-        conn.id = crate::tree::gen_id("ssh");
+        // 对既有连接去重:`upsert_ssh_connection` 按 id 覆盖,撞上就是顶掉一条老连接
+        let existing = state.read(cx).store.read(cx).ssh_connections();
+        conn.id = crate::tree::gen_unique_id("ssh", |id| existing.iter().any(|c| c.id == id));
     }
     state.update(cx, |panel, cx| {
         panel.form = None;

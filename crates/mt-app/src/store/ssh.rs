@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use gpui::{Context, Task};
 use mt_config::{ProjectConfig, SshConnection};
 
-use crate::tree::{gen_id, PaneState, PaneStatus};
+use crate::tree::{PaneState, PaneStatus};
 
 use super::{AppStore, ProjectState, SshAssocOutcome};
 
@@ -241,7 +241,7 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> String {
         let final_name = crate::ssh_conn::remote_project_name(name, remote_path);
-        let id = gen_id("proj");
+        let id = self.fresh_project_id();
         self.config.projects.push(ProjectConfig {
             id: id.clone(),
             name: final_name,

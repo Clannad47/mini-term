@@ -513,7 +513,10 @@ pub fn upsert_launcher(
 ) -> Vec<AiLauncher> {
     let entry = AiLauncher {
         id: if id.is_empty() {
-            crate::tree::gen_id("launcher")
+            // 对名单去重:移动端按 id 引用启动器,撞上会指到另一条
+            crate::tree::gen_unique_id("launcher", |candidate| {
+                list.iter().any(|l| l.id == candidate)
+            })
         } else {
             id.to_string()
         },

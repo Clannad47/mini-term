@@ -753,6 +753,26 @@ fn normalize_split_node(node: &mut SavedSplitNode) {
     }
 }
 
+/// 把树里重复出现的项目 id 只留**深度优先的第一处**。
+///
+/// 这是给存量数据擦屁股的:GPUI 版一度用「进程内计数器」生成项目 id,跨启动会撞号,
+/// 「分组右键 → 添加项目」在撞号那次会把新 id 先追加到根层、再把树里**第一处**同 id
+/// 挪进目标组 —— 根层那条就此成了残留。渲染按 id 去重看不见它,但父组一折叠它就
+/// 在根层冒出来,分组行尾的计数也把它算在内。id 生成已改成带时间戳,这里只清旧账。
+/// 分组 id 不动:撞了分组号的树另有一套坏法,没有实证前不猜着修。
+pub fn dedupe_project_ids_in_tree(tree: &mut Vec<ProjectTreeItem>) {
+    fn walk(items: &mut Vec<ProjectTreeItem>, seen: &mut std::collections::HashSet<String>) {
+        items.retain_mut(|item| match item {
+            ProjectTreeItem::ProjectId(id) => seen.insert(id.clone()),
+            ProjectTreeItem::Group(group) => {
+                walk(&mut group.children, seen);
+                true
+            }
+        });
+    }
+    walk(tree, &mut std::collections::HashSet::new());
+}
+
 /// 逐代累积的 config 迁移。每次从磁盘读出来都要过一遍(含 `AppConfig::default()`,
 /// 首启用户也得拿到预置的移动端启动器)。
 pub fn migrate_config(mut config: AppConfig) -> AppConfig {
@@ -785,7 +805,8 @@ pub fn migrate_config(mut config: AppConfig) -> AppConfig {
         }
     }
 
-    if config.project_tree.is_some() {
+    if let Some(tree) = config.project_tree.as_mut() {
+        dedupe_project_ids_in_tree(tree);
         config.project_groups = None;
         config.project_ordering = None;
         return config;
@@ -1804,6 +1825,34 @@ mod tests {
         assert!(config.project_ordering.is_none());
         let tree = config.project_tree.unwrap();
         assert_eq!(tree.len(), 2);
+    }
+
+    /// 撞号事故留下的树:`[G[proj-1], proj-1]`(旧项目在组里那条被挪进目标组、
+    /// 根层追加的那条成了残留)。读盘时只留深度优先第一处,分组本身与其它项目不动。
+    #[test]
+    fn migrate_config_去掉树里重复的项目id只留第一处() {
+        let json = r#"{
+            "projects": [
+                {"id": "proj-1", "name": "b", "path": "/tmp/b"},
+                {"id": "p2", "name": "p2", "path": "/tmp/2"}
+            ],
+            "projectTree": [
+                "p2",
+                {"id": "g1", "name": "G", "collapsed": false, "children": ["proj-1", "p2"]},
+                "proj-1"
+            ],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config = migrate_config(serde_json::from_str(json).unwrap());
+        let tree = config.project_tree.unwrap();
+        let dump = serde_json::to_string(&tree).unwrap();
+        assert_eq!(
+            dump,
+            r#"["p2",{"id":"g1","name":"G","collapsed":false,"children":["proj-1"]}]"#
+        );
     }
 
     fn unique_test_root(label: &str) -> PathBuf {
