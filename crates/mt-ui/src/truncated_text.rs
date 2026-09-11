@@ -27,6 +27,19 @@
 //!
 //! 字号 / 字体 / 颜色一律继承 `window.text_style()`,与普通文本子节点一致,
 //! 所以照旧在外层 div 上 `text_size` / `text_color`。
+//!
+//! # 设备像素取整的坑(125% / 150% 缩放下末字变「…」)
+//!
+//! gpui 给 taffy 开了整像素取整(`taffy.enable_rounding()`),最终尺寸在**设备像素**
+//! 上按 `round(x+w) − round(x)` 算。自然宽度 69 逻辑 px 在 125% 下是 86.25 设备 px,
+//! 取整成 86 → 除回来 68.8 逻辑 px,盒子比文字短了 0.2px;`prepaint` 若精确比较就会
+//! 走进截断分支,而 DirectWrite 给的字宽全是整数,`truncate_line` 里
+//! `width.floor() > truncate_width` 的亚像素容忍一点用没有 → 明明放得下,末字却被
+//! 换成「…」。100% 缩放下所有宽度都是整数、取整不缩水,所以只在高 DPI 屏上看得到。
+//!
+//! 对策两道:测量宽度先**向上取整到设备像素**再上报(整数设备宽经 `round(x+w) − round(x)`
+//! 恒等于自身,盒子绝不比文字短),`prepaint` 比较时再留 1 个设备像素容差兜 f32
+//! 一来一回的噪声。
 
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
@@ -93,7 +106,11 @@ impl Element for TruncatedText {
         let full = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
-        let natural: Size<Pixels> = size(full.width, line_height);
+        // 宽度向上取整到设备像素,否则 taffy 取整后盒子可能比文字短(见模块注释)
+        let natural: Size<Pixels> = size(
+            snap_up_to_device_px(full.width, window.scale_factor()),
+            line_height,
+        );
 
         let mut style = Style::default();
         // 能在 flex 里收缩到 0:截断的前提就是允许被压
@@ -129,7 +146,7 @@ impl Element for TruncatedText {
         _cx: &mut App,
     ) -> Option<ShapedLine> {
         let width = bounds.size.width;
-        if measured.full.width <= width {
+        if fits(measured.full.width, width, window.scale_factor()) {
             return None;
         }
         let font = window.text_style().font();
@@ -156,5 +173,84 @@ impl Element for TruncatedText {
         let line = truncated.as_ref().unwrap_or(&measured.full);
         // 整形失败只会少画一行字,不值得 panic
         let _ = line.paint(bounds.origin, measured.line_height, window, cx);
+    }
+}
+
+/// 逻辑像素宽度向上取整到整数个设备像素(结果仍以逻辑像素表示)。
+///
+/// taffy 的 `round(x+w) − round(x)` 对整数 `w` 恒等于 `w`,取整后的盒子才不会比
+/// 文字窄;最多多出不到 1 个设备像素的右侧留白,文字左对齐画,看不出来。
+fn snap_up_to_device_px(width: Pixels, scale_factor: f32) -> Pixels {
+    px((f32::from(width) * scale_factor).ceil() / scale_factor)
+}
+
+/// 「放得下」的判定:留 1 个设备像素容差,吞掉测量值 ×scale → taffy → ÷scale
+/// 一来一回的 f32 噪声。真被 flex 压窄不到 1 个设备像素时也按放得下处理 ——
+/// 溢出量肉眼不可见,却省掉一个只剩「…」的假截断。
+fn fits(full_width: Pixels, box_width: Pixels, scale_factor: f32) -> bool {
+    f32::from(full_width) <= f32::from(box_width) + 1.0 / scale_factor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// taffy `round_layout` 对单个节点的宽度取整(`compute/mod.rs`),`x` 为该节点
+    /// 在设备像素上的累计横坐标。
+    fn taffy_rounded_width(x: f32, w: f32) -> f32 {
+        (x + w).round() - x.round()
+    }
+
+    /// 探针实测:Fira Code 13px 下「gitlab-旧」自然宽 69 逻辑 px,125% 缩放时
+    /// 86.25 设备 px 被取整成 86 → 68.8 逻辑 px,精确比较就会误判放不下。
+    #[test]
+    fn 取整后的盒子不再比文字窄() {
+        for &scale in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for natural in [42.0f32, 63.0, 64.0, 69.0, 103.0, 112.0, 113.0, 139.0, 147.0] {
+                let reported = f32::from(snap_up_to_device_px(px(natural), scale)) * scale;
+                // 上报给 taffy 的是整数个设备像素
+                assert!(
+                    (reported - reported.round()).abs() < 1e-3,
+                    "scale={scale} natural={natural} reported={reported}"
+                );
+                // 不论节点落在哪个亚像素位置,取整后的盒子都放得下整段文字
+                for i in 0..20 {
+                    let x = 37.0 + i as f32 * 0.05;
+                    let boxed = taffy_rounded_width(x, reported) / scale;
+                    assert!(
+                        fits(px(natural), px(boxed), scale),
+                        "scale={scale} natural={natural} x={x} boxed={boxed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 不取整的旧口径在_125_缩放下确实会缩水() {
+        // 复现修前的病灶:69 × 1.25 = 86.25,x 落在整数上时盒子只剩 86 设备 px
+        let boxed = taffy_rounded_width(40.0, 69.0 * 1.25) / 1.25;
+        assert!(boxed < 69.0, "boxed={boxed}");
+        // 精确比较会判放不下;带容差的判定则不会
+        assert!(!(69.0 <= boxed));
+        assert!(fits(px(69.0), px(boxed), 1.25));
+    }
+
+    #[test]
+    fn 整数设备宽不被抬高() {
+        // 64 × 1.25 = 80 已是整数,不该被 ceil 多推 1 像素
+        assert_eq!(f32::from(snap_up_to_device_px(px(64.0), 1.25)), 64.0);
+        assert_eq!(f32::from(snap_up_to_device_px(px(112.0), 1.5)), 112.0);
+        assert_eq!(f32::from(snap_up_to_device_px(px(69.0), 1.0)), 69.0);
+    }
+
+    #[test]
+    fn 真放不下时仍判放不下() {
+        // 差 1 个逻辑像素以上(超过 1 设备像素容差)必须截断
+        assert!(!fits(px(69.0), px(67.5), 1.25));
+        assert!(!fits(px(69.0), px(40.0), 1.5));
+        // 差不到 1 个设备像素:按放得下(溢出肉眼不可见)
+        assert!(fits(px(69.0), px(68.4), 1.25));
+        assert!(!fits(px(69.0), px(68.1), 1.25));
     }
 }
