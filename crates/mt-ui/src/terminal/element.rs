@@ -16,7 +16,9 @@
 //!   自然步进就等于列宽,shaping 出来的位置天生落在列格上,不需要任何事后校正。
 //! - **不可合并**:宽字符(CJK / emoji)、主字体缺字要回退、带组合符号的格子。
 //!   这些**单独 shape、单独画在 `col × cell_width` 上** —— 位置由我们指定,
-//!   字形宽度对不上也只是它自己糊出边界,绝不会把后面的列顶歪。
+//!   绝不会把后面的列顶歪;字形比分到的格子(1 或 2 列)宽时按比例缩字号塞进去
+//!   (`shrink_to_fit`),也不压右边的字。窄格片段另换单色符号字体优先的回退表
+//!   (`TerminalStyle::narrow_font`),文本呈现符号不走彩色 emoji 字体。
 //!
 //! 这条分界是整个渲染器的地基:中英混排的对齐不依赖「CJK 恰好是两倍宽」这种
 //! 字体侧的巧合,而是由「每个非等宽格子都自己定位」保证的。
@@ -451,7 +453,7 @@ pub struct PreparedFrame {
     flash: Option<(Bounds<Pixels>, Hsla)>,
 }
 
-/// 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
+/// 「这个字符在主字体里有字形、且步进正好是一列宽吗」的缓存。
 ///
 /// 每帧对每个格子问一次,不缓存就是每帧几千次 DirectWrite 往返。挂在
 /// [`TerminalElementState`] 上(跨帧存活),prepaint 开头借一次、整帧共用 ——
@@ -466,12 +468,29 @@ pub struct PreparedFrame {
 /// - **非 ASCII 走 HashMap**,键里带 font_id 与字号 —— 粗体 / 斜体是不同的
 ///   font_id,各自算各自的。列宽不进键:它本来就是 (font_id, 字号) 算出来的
 ///   ('M' 的 advance),同一个键对应的答案不会变。
+///
+/// # 为什么是真 shape 一次,而不是问 `TextSystem::advance`
+///
+/// `advance()` 走 `glyph_for_char`,而 DirectWrite 的 `GetGlyphIndices` 对**缺字**
+/// 返回的是 glyph 0(`.notdef`)而不是「没有」——等宽字体的 `.notdef` 步进恰好
+/// 一列宽,于是 ⚠ ✔ ⏺ ☑ 这些主字体没有的符号被判成「可合并」、并进段里,
+/// shape 时却回退到 Segoe UI Emoji 拿到两列宽的彩色字形,**段内其后每个字符都被
+/// 顶歪一列**(2026-09-14 真机:`|⚠abc|✔abc|⏺abc|` 一行三个符号,行尾偏出三列)。
+/// 模块注释写的「主字体缺字要回退 → 不可合并」这条地基,在 Windows 上就此漏了。
+///
+/// 所以这里按真实路径 shape 这一个字符,看落下的 run **是不是主字体族**、总宽
+/// **是不是一列**;两条都成立才算可合并。回退到别的字族一律不合并 —— 单独定位,
+/// 字形宽窄只糊它自己那一格。
 struct AdvanceCache {
     /// ASCII 快表的有效性判据:四档变体的 FontId + 字号 + 列宽。
     key: Option<([FontId; 4], u32, u32)>,
     /// 下标 = [`VariantFonts::slot`] 的四档(正 / 粗 / 斜 / 粗斜)。
     ascii: [[Option<bool>; 128]; 4],
     wide: HashMap<(FontId, u32, char), bool>,
+    /// 全角符号该用的 Font(主字族换成字族栈里第一个有汉字的),见
+    /// [`Self::wide_symbol_font`]。外层 `None` = 这一帧还没算;内层 `None` = 栈里
+    /// 没有 CJK 字体,全角符号只能用主字体的窄字形。随 `key` 一起作废。
+    wide_symbol: Option<Option<gpui::Font>>,
 }
 
 impl Default for AdvanceCache {
@@ -480,6 +499,7 @@ impl Default for AdvanceCache {
             key: None,
             ascii: [[None; 128]; 4],
             wide: HashMap::new(),
+            wide_symbol: None,
         }
     }
 }
@@ -491,12 +511,76 @@ impl AdvanceCache {
         if self.key != Some(key) {
             self.key = Some(key);
             self.ascii = [[None; 128]; 4];
+            self.wide_symbol = None;
         }
     }
 
+    /// 按 2 列落格的 ambiguous 符号(※ ★ ● ■ ① …,见 `mt_terminal::width::forced_wide`)
+    /// 该用的 Font。
+    ///
+    /// 这些码位主字体多半**有**字形,但那是西文排版的窄字形;既然 grid 已经按中文
+    /// 排版给了两列,就该画中文字体里的全角字形 —— 否则 `● ■ ◆` 是个小点靠左待着,
+    /// 右边空一列,比不改还难看。所以把主字族换成字族栈(主字体 + 回退表)里**第一个
+    /// 有汉字的**(用「中」探一次,落下的 run 是它自己才算),回退表照旧。主字体本身
+    /// 就是 CJK 字体(Sarasa / 更纱)时探到的就是它,等于没换。
+    fn wide_symbol_font(&mut self, window: &Window, base: &gpui::Font) -> Option<gpui::Font> {
+        if let Some(cached) = &self.wide_symbol {
+            return cached.clone();
+        }
+        let mut candidates = std::iter::once(base.family.clone()).chain(
+            base.fallbacks
+                .as_ref()
+                .map(|fb| fb.fallback_list().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .map(SharedString::from),
+        );
+        let found = candidates
+            .find(|family| family_has_glyph(window, family, '中'))
+            .map(|family| gpui::Font {
+                family,
+                ..base.clone()
+            });
+        self.wide_symbol = Some(found.clone());
+        found
+    }
+}
+
+/// `family` 这个字族自己(不靠回退)有没有 `ch` 的字形:按它 shape 一次,落下的
+/// run 必须全是它。字族不存在时 gpui 会落到平台 UI 字体,族名对不上,自然判负。
+fn family_has_glyph(window: &Window, family: &SharedString, ch: char) -> bool {
+    let text = SharedString::from(ch.to_string());
+    let run = TextRun {
+        len: text.len(),
+        font: gpui::Font {
+            family: family.clone(),
+            features: gpui::FontFeatures::disable_ligatures(),
+            fallbacks: None,
+            weight: gpui::FontWeight::NORMAL,
+            style: gpui::FontStyle::Normal,
+        },
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text_system = window.text_system();
+    let shaped = text_system.shape_line(text, px(14.0), std::slice::from_ref(&run), None);
+    !shaped.runs.is_empty()
+        && shaped.runs.iter().all(|r| {
+            text_system
+                .get_font_for_id(r.font_id)
+                .is_some_and(|font| font.family == *family)
+        })
+}
+
+impl AdvanceCache {
+    /// `base` 是主字体(含回退表),`slot` 选粗 / 斜变体;`font_id` 只当缓存键用。
+    #[allow(clippy::too_many_arguments)]
     fn fits(
         &mut self,
         window: &Window,
+        base: &gpui::Font,
         slot: usize,
         font_id: FontId,
         font_size: Pixels,
@@ -508,16 +592,19 @@ impl AdvanceCache {
             if let Some(hit) = self.ascii[slot][code] {
                 return hit;
             }
-            let fits = self.measure(window, font_id, font_size, ch, cell_width);
+            let fits = self.measure(window, base, slot, font_id, font_size, ch, cell_width);
             self.ascii[slot][code] = Some(fits);
             return fits;
         }
-        self.measure(window, font_id, font_size, ch, cell_width)
+        self.measure(window, base, slot, font_id, font_size, ch, cell_width)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn measure(
         &mut self,
         window: &Window,
+        base: &gpui::Font,
+        slot: usize,
         font_id: FontId,
         font_size: Pixels,
         ch: char,
@@ -527,14 +614,40 @@ impl AdvanceCache {
         if let Some(hit) = self.wide.get(&key).copied() {
             return hit;
         }
-        let fits = window
-            .text_system()
-            .advance(font_id, font_size, ch)
-            .map(|adv| (f(adv.width) - f(cell_width)).abs() < 0.01)
-            .unwrap_or(false);
+        let fits = shaped_by_primary_at_one_column(window, base, slot, font_size, ch, cell_width);
         self.wide.insert(key, fits);
         fits
     }
+}
+
+/// 按真实路径 shape 单个字符:落下的每个 run 都是主字体族、且总宽恰好一列,才算
+/// 「可合并」。回退字族按**族名**比,不比 `FontId` —— 同一张字面在 gpui 里会因
+/// features / fallbacks 不同注册成多个 id,而 `font_id_by_identifier` 只记最后一个。
+fn shaped_by_primary_at_one_column(
+    window: &Window,
+    base: &gpui::Font,
+    slot: usize,
+    font_size: Pixels,
+    ch: char,
+    cell_width: Pixels,
+) -> bool {
+    let text = SharedString::from(ch.to_string());
+    let run = TextRun {
+        len: text.len(),
+        font: VariantFonts::variant(base, slot),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text_system = window.text_system();
+    let shaped = text_system.shape_line(text, font_size, std::slice::from_ref(&run), None);
+    let primary_only = shaped.runs.iter().all(|r| {
+        text_system
+            .get_font_for_id(r.font_id)
+            .is_some_and(|font| font.family == base.family)
+    });
+    primary_only && (f(shaped.width) - f(cell_width)).abs() < 0.01
 }
 
 /// 参与「能否与相邻格子合并成一个 ShapedLine」判定的款式。
@@ -1249,6 +1362,7 @@ impl Element for TerminalElement {
             });
 
         let font = self.style.font();
+        let narrow_font = self.style.narrow_font();
         let font_size = self.style.font_size;
         let variant_fonts = VariantFonts::resolve(window, &font);
         let font_id = variant_fonts.id(false, false);
@@ -1502,6 +1616,7 @@ impl Element for TerminalElement {
                     window,
                     &arena[row.cells],
                     &font,
+                    &narrow_font,
                     font_size,
                     &variant_fonts,
                     &mut advance,
@@ -1809,6 +1924,9 @@ struct PendingPiece {
     /// `None` = 单格片段(宽字符 / 缺字回退 / 带组合符号)。它本来就允许糊出格子
     /// 边界(模块注释的第二类),没有「该占几列」可言,不参与总宽校验。
     cols: Option<usize>,
+    /// 单格片段是不是宽格(WIDE_CHAR)。窄格片段 shape 时换用
+    /// [`TerminalStyle::narrow_font`] —— 单色符号字体优先于彩色 emoji 字体。
+    wide: bool,
     text: String,
     style: RunStyle,
 }
@@ -1825,6 +1943,30 @@ const LIGATURE_WIDTH_SLACK: f32 = 0.5;
 /// 这是段内后续字符仍对得上列的唯一前提。见 [`super::theme::TerminalStyle::font`]。
 fn width_fits_columns(shaped: Pixels, cell_width: Pixels, cols: usize) -> bool {
     (f(shaped) - f(cell_width) * cols as f32).abs() <= LIGATURE_WIDTH_SLACK
+}
+
+/// 单格片段允许糊出格子的量(px)。超过它才缩字号 —— 半个像素以内肉眼看不出,
+/// 且回退字体的字面经常就是「两列差一点」,为那点差值把整个 CJK 缩一圈不值。
+const OVERFLOW_SLACK: f32 = 0.5;
+
+/// 单格片段比它分到的 `alloc` 列宽:返回该乘到字号上的缩放比;放得下就 `None`。
+///
+/// 步进随字号线性缩(DirectWrite / CoreText 的自然度量都不做像素对齐),所以按
+/// 「分到的宽 / 实际宽」缩一次就落在格内;比值再乘 0.98 留一根发丝的余量,
+/// 免得浮点舍入让它还压着格线。
+fn shrink_to_fit(shaped: Pixels, cell_width: Pixels, alloc: usize) -> Option<f32> {
+    let budget = f(cell_width) * alloc as f32;
+    let width = f(shaped);
+    if width <= budget + OVERFLOW_SLACK || width <= 0.0 {
+        return None;
+    }
+    Some(budget / width * 0.98)
+}
+
+/// 单格片段在 `alloc` 列里居中要往右挪多少。比格子宽(还没缩)或等宽时为 0。
+fn center_offset(shaped: Pixels, cell_width: Pixels, alloc: usize) -> Pixels {
+    let budget = f(cell_width) * alloc as f32;
+    px(((budget - f(shaped)) / 2.0).max(0.0))
 }
 
 /// 「⌥+点击定位光标」一次最多合成多少个方向键。
@@ -1883,6 +2025,7 @@ fn build_row(
     window: &Window,
     cells: &[CellSignature],
     font: &gpui::Font,
+    narrow_font: &gpui::Font,
     font_size: Pixels,
     variant_fonts: &VariantFonts,
     advance: &mut AdvanceCache,
@@ -1990,12 +2133,13 @@ fn build_row(
         let has_zerowidth = cell.zerowidth[0] != '\0';
         let slot = VariantFonts::slot(style_key.bold, style_key.italic);
         let run_font_id = variant_fonts.id_at(slot);
+        let wide = cell.flags.contains(Flags::WIDE_CHAR);
         // 可合并的条件:窄字符、无组合符号、不是光标格(光标格颜色单独)、
-        // 且主字体里这个字形的步进恰好一列宽。
-        let mergeable = !cell.flags.contains(Flags::WIDE_CHAR)
+        // 且主字体里有这个字形、步进恰好一列宽。
+        let mergeable = !wide
             && !has_zerowidth
             && cell.cursor == 0
-            && advance.fits(window, slot, run_font_id, font_size, cell.ch, cell_width);
+            && advance.fits(window, font, slot, run_font_id, font_size, cell.ch, cell_width);
 
         if mergeable {
             match text_run.as_mut() {
@@ -2025,6 +2169,7 @@ fn build_row(
             pieces.push(PendingPiece {
                 start: col,
                 cols: None,
+                wide,
                 text,
                 style: style_key,
             });
@@ -2043,7 +2188,25 @@ fn build_row(
         {
             continue; // 纯空白且无下划线/删除线:没有任何像素,不必 shape
         }
-        let mut run_font = font.clone();
+        // 窄格的单格片段 = 主字体缺字、要回退的**文本呈现**符号(⚠ ✔ ⏺ ☑ …):
+        // 回退表换成单色符号字体优先的那份,别让系统回退送去彩色 emoji 字体。
+        // 按 2 列落格的 ambiguous 符号(※ ★ ● ■ ① …)则要中文字体里的全角字形,
+        // 主字族换成栈里第一个 CJK 字体。其余宽格(emoji / CJK)与合并段照旧。
+        let mut run_font = match (piece.cols, piece.wide) {
+            (Some(_), _) => font.clone(),
+            (None, false) => narrow_font.clone(),
+            (None, true) => {
+                let symbol = piece
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(mt_terminal::width::forced_wide);
+                symbol
+                    .then(|| advance.wide_symbol_font(window, font))
+                    .flatten()
+                    .unwrap_or_else(|| font.clone())
+            }
+        };
         if piece.style.bold {
             run_font.weight = gpui::FontWeight::BOLD;
         }
@@ -2083,14 +2246,43 @@ fn build_row(
                 font: plain_font,
                 ..run
             };
-            shaped =
-                window
-                    .text_system()
-                    .shape_line(text, font_size, std::slice::from_ref(&plain), None);
+            shaped = window.text_system().shape_line(
+                text.clone(),
+                font_size,
+                std::slice::from_ref(&plain),
+                None,
+            );
         }
 
+        // ── 单格片段缩到格内:回退字形比它分到的格子宽,就按比例缩小字号重 shape。
+        //
+        //  grid 给每个格子的列数(1 或 2)是与上游程序、ConPTY 对齐的**协议**,字形
+        //  宽窄是字体自己的事 —— ⚠ ⏺ 这类 N 类符号在 Segoe UI Symbol 里比一列宽两三
+        //  个像素,CJK 回退字体的字面也未必恰好两列。以前允许它糊出去(模块注释的
+        //  第二类),代价是压住右边那个字符;现在缩进来:字号 × (分到的宽 / 实际宽),
+        //  步进随字号线性缩,一次重 shape 就落在格内。竖向由 `paint_line` 按各自的
+        //  ascent/descent 居中,不必管。合并段不缩(那是连字守恒问题,上面那段管)。
+        let alloc = piece.cols.is_none().then(|| if piece.wide { 2 } else { 1 });
+        if let Some(alloc) = alloc
+            && let Some(scale) = shrink_to_fit(shaped.width, cell_width, alloc)
+        {
+            shaped = window.text_system().shape_line(
+                text,
+                px(f(font_size) * scale),
+                std::slice::from_ref(&run),
+                None,
+            );
+        }
+
+        // ── 单格片段在格内居中:字形比分到的格子窄(缩过的、或 CJK 字体里步进不足两列
+        //    的 ● ■ ◆ 这类符号)就往中间挪。全角符号本来就是「字面居中的方块」,靠左
+        //    待着右边空一截,看着像窄字符。合并段不动:它靠自然步进逐列落格。
+        let dx = alloc
+            .map(|alloc| center_offset(shaped.width, cell_width, alloc))
+            .unwrap_or(px(0.0));
+
         texts.push(TextPiece {
-            origin: point(cell_width * piece.start as f32, px(0.0)),
+            origin: point(cell_width * piece.start as f32 + dx, px(0.0)),
             line: shaped,
         });
     }
@@ -2113,6 +2305,7 @@ fn flush_text(run: &mut Option<PendingRun>, out: &mut Vec<PendingPiece>) {
         out.push(PendingPiece {
             start: r.start,
             cols: Some(r.len),
+            wide: false,
             text: r.text,
             style: r.style,
         });
@@ -2227,14 +2420,9 @@ struct VariantFonts {
 impl VariantFonts {
     fn resolve(window: &Window, base: &gpui::Font) -> Self {
         let make = |bold: bool, italic: bool| {
-            let mut font = base.clone();
-            if bold {
-                font.weight = gpui::FontWeight::BOLD;
-            }
-            if italic {
-                font.style = gpui::FontStyle::Italic;
-            }
-            window.text_system().resolve_font(&font)
+            window
+                .text_system()
+                .resolve_font(&Self::variant(base, Self::slot(bold, italic)))
         };
         Self {
             ids: [
@@ -2244,6 +2432,18 @@ impl VariantFonts {
                 make(true, true),
             ],
         }
+    }
+
+    /// 按档位给 `base` 套上粗 / 斜。
+    fn variant(base: &gpui::Font, slot: usize) -> gpui::Font {
+        let mut font = base.clone();
+        if slot & 1 != 0 {
+            font.weight = gpui::FontWeight::BOLD;
+        }
+        if slot & 2 != 0 {
+            font.style = gpui::FontStyle::Italic;
+        }
+        font
     }
 
     /// 四档变体的下标。[`AsciiAdvance`] 的表也按它分层。
@@ -2396,6 +2596,38 @@ mod tests {
         // 长段里塌掉一列也判负(80 列的整行是常态)
         assert!(width_fits_columns(px(640.0), cell, 80));
         assert!(!width_fits_columns(px(632.0), cell, 80));
+    }
+
+    /// 单格片段的回退字形比格子宽就缩字号;差半个像素以内不动。
+    /// ⚠ ⏺ 在 Segoe UI Symbol 里约 1.3 列、❤ ☎ 近两列,以前都压住右边那个字。
+    #[test]
+    fn 单格片段超宽才缩() {
+        let cell = px(8.0);
+        // 恰好一列 / 半像素以内:不缩
+        assert_eq!(shrink_to_fit(px(8.0), cell, 1), None);
+        assert_eq!(shrink_to_fit(px(8.4), cell, 1), None);
+        // 窄格里塞了 1.3 列宽的符号:缩到 8 / 10.4 再留 2% 余量
+        let scale = shrink_to_fit(px(10.4), cell, 1).expect("要缩");
+        assert!((scale - 8.0 / 10.4 * 0.98).abs() < 1e-6);
+        assert!(10.4 * scale <= 8.0, "缩完必须落在一列内");
+        // 宽格(CJK / emoji)按两列算预算:两列以内不缩,超了才缩
+        assert_eq!(shrink_to_fit(px(16.3), cell, 2), None);
+        let scale = shrink_to_fit(px(20.0), cell, 2).expect("要缩");
+        assert!(20.0 * scale <= 16.0);
+        // 比格子窄的不放大(交给居中)
+        assert_eq!(shrink_to_fit(px(6.0), cell, 1), None);
+        assert_eq!(shrink_to_fit(px(0.0), cell, 1), None);
+    }
+
+    /// 单格片段比格子窄就居中:宽格里 8px 的 ● 要挪到两列(16px)的正中。
+    #[test]
+    fn 单格片段在格内居中() {
+        let cell = px(8.0);
+        assert_eq!(center_offset(px(8.0), cell, 2), px(4.0));
+        assert_eq!(center_offset(px(16.0), cell, 2), px(0.0));
+        assert_eq!(center_offset(px(6.0), cell, 1), px(1.0));
+        // 比格子还宽(缩之前)不往左挪:原点仍钉在列格上
+        assert_eq!(center_offset(px(20.0), cell, 2), px(0.0));
     }
 
     /// 滚出视口的光标钳到最近边缘,而不是没有 —— 往回翻历史时光标在视口下方,

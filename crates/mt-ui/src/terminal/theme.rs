@@ -158,6 +158,46 @@ fn default_font_stack() -> (&'static str, &'static [&'static str]) {
     }
 }
 
+/// 文本呈现符号该用的**单色**符号字体,按平台。
+///
+/// ⚠ ✔ ⏺ ☑ ❤ ✈ ☎ 这些码位按 Unicode 默认是**文本呈现**(没跟 VS16 就是单色、
+/// 1 列),终端 grid 也按 1 列给格。可系统回退(Windows 的 DirectWrite 对 U+26A0
+/// 这类默认就挑 Segoe UI Emoji)会送去彩色 emoji 字体:一是 2 列宽的彩色字形塞进
+/// 1 列压住后一个字符,二是彩色位图**吃掉 SGR 前景色** —— Claude Code 拿 ⏺ 的颜色
+/// 表示工具调用状态,全成了蓝色圆点。所以窄格片段的回退表把这些单色符号字体排在
+/// 彩色 emoji 字体**前面**(见 [`TerminalStyle::narrow_font`]);宽格(带 VS16 的
+/// emoji 呈现序列、本来就是 W 类的 emoji)不受影响,照旧彩色。
+///
+/// 名字不存在时 gpui 的回退表构造直接跳过(`generate_font_fallbacks` 找不到字族就
+/// `continue`),不会报错。
+fn text_presentation_fonts() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["Apple Symbols"]
+    } else if cfg!(target_os = "linux") {
+        &["Noto Sans Symbols2", "Noto Sans Symbols", "DejaVu Sans"]
+    } else {
+        &["Segoe UI Symbol"]
+    }
+}
+
+/// 窄格片段的回退表:把 [`text_presentation_fonts`] 插到**第一个彩色 emoji 字族**
+/// 之前(族名含 emoji,不分大小写);表里没有 emoji 字族就接在末尾 —— 系统回退在
+/// 表之后才轮到,单色字体总在它前面。已经在表里的名字不重复插。
+fn narrow_fallback_list(fallbacks: &[SharedString]) -> Vec<String> {
+    let mut out: Vec<String> = fallbacks.iter().map(|f| f.to_string()).collect();
+    let at = out
+        .iter()
+        .position(|f| f.to_ascii_lowercase().contains("emoji"))
+        .unwrap_or(out.len());
+    let extra: Vec<String> = text_presentation_fonts()
+        .iter()
+        .map(|f| f.to_string())
+        .filter(|f| !out.iter().any(|have| have.eq_ignore_ascii_case(f)))
+        .collect();
+    out.splice(at..at, extra);
+    out
+}
+
 impl Default for TerminalStyle {
     fn default() -> Self {
         let (family, fallbacks) = default_font_stack();
@@ -291,6 +331,44 @@ mod tests {
             "缺本平台 emoji 回退 {emoji}"
         );
     }
+
+    /// 窄格回退表:单色符号字体必须排在彩色 emoji 字体**前面**,否则 ⚠ ✔ ⏺ 照旧
+    /// 被送去彩色字体 —— 两列宽的字形塞进一列、前景色被位图吃掉。
+    #[test]
+    fn 窄格回退表把单色符号字体插在_emoji_之前() {
+        let list = narrow_fallback_list(&["Consolas".into(), "Segoe UI Emoji".into()]);
+        let mono = text_presentation_fonts()[0];
+        let mono_at = list.iter().position(|f| f == mono).expect("单色字体在表里");
+        let emoji_at = list.iter().position(|f| f == "Segoe UI Emoji").unwrap();
+        assert!(mono_at < emoji_at, "{list:?}");
+        assert_eq!(list[0], "Consolas", "用户排在前面的回退不动");
+
+        // 表里没有 emoji 字族:接在末尾,仍然在系统回退之前
+        let list = narrow_fallback_list(&["Consolas".into()]);
+        assert_eq!(list.first().map(String::as_str), Some("Consolas"));
+        assert!(list.iter().any(|f| f == mono));
+
+        // 用户已经自己写了(大小写不同也算):不重复插
+        let list = narrow_fallback_list(&[mono.to_ascii_uppercase().into(), "Noto Color Emoji".into()]);
+        assert_eq!(list.iter().filter(|f| f.eq_ignore_ascii_case(mono)).count(), 1);
+    }
+
+    /// `narrow_font` 与 `font` 只差回退表,其余(字族 / 连字 / 字重)一字不差。
+    #[test]
+    fn 窄格字体只换回退表() {
+        let style = TerminalStyle::default();
+        let (font, narrow) = (style.font(), style.narrow_font());
+        assert_eq!(font.family, narrow.family);
+        assert_eq!(font.features, narrow.features);
+        assert_eq!(font.weight, narrow.weight);
+        assert_ne!(font.fallbacks, narrow.fallbacks);
+        assert_eq!(
+            narrow.fallbacks.expect("有回退表").fallback_list(),
+            narrow_fallback_list(&style.font_fallbacks)
+        );
+        // 缓存命中那条路也要给到同一份
+        assert_eq!(style.narrow_font(), style.narrow_font());
+    }
 }
 
 impl TerminalStyle {
@@ -339,28 +417,40 @@ impl TerminalStyle {
     /// 字段 —— 改完任何一个立刻算另一份,不存在陈值。表按线性扫描:同时在用的样式
     /// 最多两三份(主终端 + 预览),比哈希一串字符串还便宜。
     pub fn font(&self) -> gpui::Font {
+        self.memo_fonts().0
+    }
+
+    /// 给**窄格单格片段**用的 Font:与 [`Self::font`] 只差回退表 —— 单色符号字体
+    /// 排在彩色 emoji 字体前面(见 [`text_presentation_fonts`])。同一张 memo 表缓存。
+    pub fn narrow_font(&self) -> gpui::Font {
+        self.memo_fonts().1
+    }
+
+    /// `(主 Font, 窄格 Font)`,按 [`FontKey`] 缓存。
+    fn memo_fonts(&self) -> (gpui::Font, gpui::Font) {
         thread_local! {
-            static MEMO: RefCell<Vec<(FontKey, gpui::Font)>> = const { RefCell::new(Vec::new()) };
+            static MEMO: RefCell<Vec<(FontKey, gpui::Font, gpui::Font)>> = const { RefCell::new(Vec::new()) };
         }
         MEMO.with(|memo| {
             let mut memo = memo.borrow_mut();
-            if let Some((_, font)) = memo.iter().find(|(key, _)| key.matches(self)) {
+            if let Some((_, font, narrow)) = memo.iter().find(|(key, _, _)| key.matches(self)) {
                 // Font 的 clone 只是引用计数:family 是 SharedString,
                 // features / fallbacks 各是一个 Arc(gpui 0.2.2),不碰堆
-                return font.clone();
+                return (font.clone(), narrow.clone());
             }
-            let font = self.build_font();
+            let font = self.build_font(self.font_fallbacks.iter().map(|f| f.to_string()).collect());
+            let narrow = self.build_font(narrow_fallback_list(&self.font_fallbacks));
             // 涨过头就整表丢掉重来 —— 设置页里逐字符改字族名时不该把每个中间值都留着
             if memo.len() >= 8 {
                 memo.clear();
             }
-            memo.push((FontKey::of(self), font.clone()));
-            font
+            memo.push((FontKey::of(self), font.clone(), narrow.clone()));
+            (font, narrow)
         })
     }
 
     /// 真正组装一份 [`gpui::Font`]。缓存未命中时才走。
-    fn build_font(&self) -> gpui::Font {
+    fn build_font(&self, fallbacks: Vec<String>) -> gpui::Font {
         gpui::Font {
             family: self.font_family.clone(),
             features: if self.ligatures {
@@ -368,15 +458,10 @@ impl TerminalStyle {
             } else {
                 gpui::FontFeatures::disable_ligatures()
             },
-            fallbacks: if self.font_fallbacks.is_empty() {
+            fallbacks: if fallbacks.is_empty() {
                 None
             } else {
-                Some(gpui::FontFallbacks::from_fonts(
-                    self.font_fallbacks
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect::<Vec<_>>(),
-                ))
+                Some(gpui::FontFallbacks::from_fonts(fallbacks))
             },
             weight: gpui::FontWeight::NORMAL,
             style: gpui::FontStyle::Normal,
