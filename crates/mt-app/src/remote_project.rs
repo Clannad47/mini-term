@@ -7,7 +7,7 @@
 //! ```text
 //! 「添加」→ [后台] validate_dir(conn, path)
 //!            ├─ Err(msg) → 弹窗留着,红字显示 msg(busy 复位)
-//!            └─ Ok(canonical) → add_remote_project + 展开目标分组 + 切过去 + 关窗
+//!            └─ Ok(canonical) → add_remote_project + 展开目标分组 + 切过去并开首个终端 + 关窗
 //! ```
 //!
 //! ⚠️ `validate_dir` 是**阻塞**函数(TCP + KEX + SFTP 往返),雷打不动丢
@@ -277,9 +277,11 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
                             }
                             id
                         });
+                        // 切过去 + 开首个终端(与本地「添加项目」同口径)。目录刚用
+                        // 同一条连接验证过,这一步等于用户自己点「新建终端」
                         panel
                             .store
-                            .update(cx, |store, cx| store.set_active_project(&id, cx));
+                            .update(cx, |store, cx| store.open_added_project(&id, window, cx));
                         panel.busy = false;
                         cx.notify();
                     });

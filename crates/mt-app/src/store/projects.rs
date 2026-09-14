@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use gpui::Context;
+use gpui::{Context, Window};
 use mt_config::ProjectConfig;
 use mt_ui::icons::ProjectKind;
 
@@ -104,6 +104,25 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 添加项目之后的「打开」:切过去,并且**一个终端都没有**时用默认 shell
+    /// 开一个并聚焦 —— 省掉「切过去 → 面对空态页 → 再点一次新建终端」那一步。
+    ///
+    /// 只给「添加」这条路用,**别塞进 [`set_active_project`]**:用户手动关光某个
+    /// 项目的终端再切回去,空态是他自己要的,不该被自动补一个。路径撞上既有项目
+    /// 时(`add_project*` 返回旧 id)也走这里 —— 旧项目要是有终端就只切不开。
+    ///
+    /// [`set_active_project`]: Self::set_active_project
+    pub fn open_added_project(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_active_project(id, cx);
+        let has_terminal = self
+            .project_states
+            .get(id)
+            .is_some_and(|s| !s.panels.is_empty());
+        if !has_terminal {
+            self.new_terminal(id, None, None, window, cx);
+        }
+    }
+
     /// 按路径找项目(`store.ts::findProjectByPath`)。
     ///
     /// 比对走 [`normalize_path`](crate::git_worktree::normalize_path)(分隔符统一 +
@@ -123,8 +142,10 @@ impl AppStore {
     /// - **子项目不进 `projectTree`**(移动出去时才转成普通树节点);
     /// - 路径已经是项目 → 返回既有 id,不重复添加(`GitWorktreeModal.tsx:341-351`)。
     ///
-    /// 与 [`add_project`](Self::add_project) 的差别只有「带父项目 + 返回 id +
-    /// 不自动切过去」三条 —— worktree「设为项目」要自己决定切不切。
+    /// **只添加、不切过去**:调用方拿到 id 后自己决定 —— 用户主动添加的各入口
+    /// 接 [`open_added_project`](Self::open_added_project)(切过去 + 开首个终端)。
+    /// 这是全部本地项目的唯一添加口(原先另有一个不带父项目、自动切过去的
+    /// `add_project`,查重还是逐字比对路径,已并入这里)。
     pub fn add_project_at(
         &mut self,
         path: &Path,
@@ -183,54 +204,6 @@ impl AppStore {
         for pty_id in pty_ids {
             self.dispose_terminal(pty_id, cx);
         }
-        cx.notify();
-    }
-
-    /// 添加项目(目录路径)。名字取目录名。
-    pub fn add_project(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let path_str = path.to_string_lossy().to_string();
-        if let Some(existing) = self
-            .config
-            .projects
-            .iter()
-            .find(|p| p.path == path_str)
-            .map(|p| p.id.clone())
-        {
-            self.set_active_project(&existing, cx);
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path_str.clone());
-        let id = self.fresh_project_id();
-
-        self.config.projects.push(ProjectConfig {
-            id: id.clone(),
-            name,
-            path: path_str,
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        });
-        // projectTree 是「分组 + 排序」那一层;这里只保证新项目出现在树里,
-        // 分组编辑是后续批次的事。
-        let tree = self.config.project_tree.get_or_insert_with(Vec::new);
-        tree.push(mt_config::ProjectTreeItem::ProjectId(id.clone()));
-
-        self.project_states.insert(id.clone(), ProjectState::new());
-        self.expanded_dirs.insert(id.clone(), HashSet::new());
-        self.active_project_id = Some(id.clone());
-        self.config.last_active_project_id = Some(id);
-        self.save_config_soon(cx);
         cx.notify();
     }
 

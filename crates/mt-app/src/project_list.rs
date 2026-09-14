@@ -1762,12 +1762,20 @@ impl ProjectList {
         .detach();
     }
 
-    /// 外部文件落地。语义照抄 `ProjectList.tsx:295-319`:
-    /// 逐个加,**新增过任何一个就只落盘不切换**;一个没新增但撞上已有项目 → 切过去。
-    fn on_external_drop(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// 外部文件落地。逐个加;**新增过就打开第一个新增的**(切过去 + 开首个终端,
+    /// 与「添加项目」弹窗同口径),一个没新增但撞上已有项目 → 只切过去。
+    ///
+    /// 原版 `ProjectList.tsx:295-319` 是「新增过任何一个就只落盘不切换」,
+    /// 「添加完还得自己找过去」这一步被用户点名要掉,这里跟着弹窗一起改。
+    fn on_external_drop(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.external = None;
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let dirs = cx
                 .background_executor()
                 .spawn(async move { mt_project::fs::filter_directories(paths) })
@@ -1775,9 +1783,9 @@ impl ProjectList {
             if dirs.is_empty() {
                 return;
             }
-            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+            let _ = this.update_in(cx, |this: &mut ProjectList, window, cx| {
                 this.store.update(cx, |store, cx| {
-                    let mut added_any = false;
+                    let mut first_added: Option<String> = None;
                     let mut existing_id: Option<String> = None;
                     for dir in &dirs {
                         let path_str = dir.to_string_lossy().to_string();
@@ -1785,11 +1793,13 @@ impl ProjectList {
                             existing_id = Some(existing.id.clone());
                             continue;
                         }
-                        store.add_project_at(dir, None, cx);
-                        added_any = true;
+                        let id = store.add_project_at(dir, None, cx);
+                        first_added.get_or_insert(id);
                     }
-                    if !added_any && let Some(id) = existing_id {
-                        store.set_active_project(&id, cx);
+                    match (first_added, existing_id) {
+                        (Some(id), _) => store.open_added_project(&id, window, cx),
+                        (None, Some(id)) => store.set_active_project(&id, cx),
+                        (None, None) => {}
                     }
                 });
             });
@@ -1870,8 +1880,8 @@ impl Render for ProjectList {
                     this.on_external_move(event, cx);
                 },
             ))
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.on_external_drop(paths.paths().to_vec(), cx);
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.on_external_drop(paths.paths().to_vec(), window, cx);
             }))
             .child(header)
             .child(list)

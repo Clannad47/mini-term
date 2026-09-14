@@ -830,7 +830,9 @@ fn render_worktree_row(
                             )
                         }
                     };
-                    store.set_active_project(&id, cx);
+                    // 「切到项目」与「添加为项目」同一颗钮:前者是既有项目,有终端就
+                    // 只切;后者是新项目,顺手开首个终端
+                    store.open_added_project(&id, window, cx);
                 });
                 crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
             }),
@@ -1379,7 +1381,7 @@ fn create(
                 match first_new {
                     Some(id) if add_as_project => {
                         let store = state.read(cx).store.clone();
-                        store.update(cx, |store, cx| store.set_active_project(&id, cx));
+                        store.update(cx, |store, cx| store.open_added_project(&id, window, cx));
                         crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
                     }
                     _ => {
