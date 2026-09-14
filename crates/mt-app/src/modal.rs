@@ -208,103 +208,110 @@ pub fn open_add_project_into(
     // 聚焦排在 `open_guarded` 之后,见 `prompt::autofocus`
     let input_for_focus = input.clone();
 
-    open_guarded(kind::ADD_PROJECT, window, cx, move |dialog, _window, _cx| {
-        let store = store.clone();
-        let target_group = target_group.clone();
-        let input_for_ok = input.clone();
-        let input_for_browse = input.clone();
-        dialog
-            .title(t("projectList", "menu.addProject"))
-            .w(px(460.0))
-            .confirm()
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(t("settings", "common.add"))
-                    .cancel_text(t("settings", "common.cancel")),
-            )
-            .child(
-                div()
-                    .px(px(20.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(6.0))
-                            .child(div().flex_1().child(Input::new(&input)))
-                            .child(ui::ghost_button("browse-dir", t("worktree", "browse")).on_click(
-                                move |_, window, cx| {
-                                    let paths = cx.prompt_for_paths(PathPromptOptions {
-                                        files: false,
-                                        directories: true,
-                                        multiple: false,
-                                        // 系统目录选择框的标题。原版用的是 Tauri
-                                        // 的默认标题,这条 key 是 M 批新补的
-                                        prompt: Some(
-                                            t("projectList", "chooseDirDialogTitle").into(),
-                                        ),
-                                    });
-                                    let input = input_for_browse.clone();
-                                    window
-                                        .spawn(cx, async move |cx| {
-                                            let Ok(Ok(Some(paths))) = paths.await else {
-                                                return;
-                                            };
-                                            let Some(path) = paths.into_iter().next() else {
-                                                return;
-                                            };
-                                            let text = path.to_string_lossy().to_string();
-                                            let _ = cx.update(|window, cx| {
-                                                input.update(cx, |state, cx| {
-                                                    state.set_value(text, window, cx)
-                                                });
+    open_guarded(
+        kind::ADD_PROJECT,
+        window,
+        cx,
+        move |dialog, _window, _cx| {
+            let store = store.clone();
+            let target_group = target_group.clone();
+            let input_for_ok = input.clone();
+            let input_for_browse = input.clone();
+            dialog
+                .title(t("projectList", "menu.addProject"))
+                .w(px(460.0))
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t("settings", "common.add"))
+                        .cancel_text(t("settings", "common.cancel")),
+                )
+                .child(
+                    div()
+                        .px(px(20.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.0))
+                                .child(div().flex_1().child(Input::new(&input)))
+                                .child(
+                                    ui::ghost_button("browse-dir", t("worktree", "browse"))
+                                        .on_click(move |_, window, cx| {
+                                            let paths = cx.prompt_for_paths(PathPromptOptions {
+                                                files: false,
+                                                directories: true,
+                                                multiple: false,
+                                                // 系统目录选择框的标题。原版用的是 Tauri
+                                                // 的默认标题,这条 key 是 M 批新补的
+                                                prompt: Some(
+                                                    t("projectList", "chooseDirDialogTitle").into(),
+                                                ),
                                             });
-                                        })
-                                        .detach();
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            // 见上面手输框的说明,原版没有这条提示。
-                            .child(t("projectList", "pathHint")),
-                    ),
-            )
-            .on_ok(move |_: &ClickEvent, window, cx| {
-                let raw = input_for_ok.read(cx).value().trim().to_string();
-                let path = std::path::PathBuf::from(&raw);
-                // 目录不存在就把对话框留着 —— 关掉的话用户刚打的路径就没了
-                if raw.is_empty() || !path.is_dir() {
-                    return false;
-                }
-                // 顶层与分组两条路都走 `add_project_at`(拿 id),最后统一
-                // `open_added_project`:切过去 + 开首个终端。原版分组版
-                // `handleAddProject(groupId)` 是不切的,但「添加完还得自己找过去」
-                // 被用户点名要改,两条路收成同一口径。
-                store.update(cx, |store, cx| {
-                    let id = store.add_project_at(&path, None, cx);
-                    if let Some(group_id) = target_group.as_deref() {
-                        store.move_item(&id, Some(group_id), None, cx);
-                        if store
-                            .config()
-                            .project_tree
-                            .as_ref()
-                            .and_then(|tree| {
-                                crate::project_tree::find_group_in_tree(tree, group_id)
-                            })
-                            .is_some_and(|g| g.collapsed)
-                        {
-                            store.toggle_group_collapse(group_id, cx);
-                        }
+                                            let input = input_for_browse.clone();
+                                            window
+                                                .spawn(cx, async move |cx| {
+                                                    let Ok(Ok(Some(paths))) = paths.await else {
+                                                        return;
+                                                    };
+                                                    let Some(path) = paths.into_iter().next()
+                                                    else {
+                                                        return;
+                                                    };
+                                                    let text = path.to_string_lossy().to_string();
+                                                    let _ = cx.update(|window, cx| {
+                                                        input.update(cx, |state, cx| {
+                                                            state.set_value(text, window, cx)
+                                                        });
+                                                    });
+                                                })
+                                                .detach();
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui::font_px(11.0))
+                                .text_color(ui::text_muted())
+                                // 见上面手输框的说明,原版没有这条提示。
+                                .child(t("projectList", "pathHint")),
+                        ),
+                )
+                .on_ok(move |_: &ClickEvent, window, cx| {
+                    let raw = input_for_ok.read(cx).value().trim().to_string();
+                    let path = std::path::PathBuf::from(&raw);
+                    // 目录不存在就把对话框留着 —— 关掉的话用户刚打的路径就没了
+                    if raw.is_empty() || !path.is_dir() {
+                        return false;
                     }
-                    store.open_added_project(&id, window, cx);
-                });
-                true
-            })
-    });
+                    // 顶层与分组两条路都走 `add_project_at`(拿 id),最后统一
+                    // `open_added_project`:切过去 + 开首个终端。原版分组版
+                    // `handleAddProject(groupId)` 是不切的,但「添加完还得自己找过去」
+                    // 被用户点名要改,两条路收成同一口径。
+                    store.update(cx, |store, cx| {
+                        let id = store.add_project_at(&path, None, cx);
+                        if let Some(group_id) = target_group.as_deref() {
+                            store.move_item(&id, Some(group_id), None, cx);
+                            if store
+                                .config()
+                                .project_tree
+                                .as_ref()
+                                .and_then(|tree| {
+                                    crate::project_tree::find_group_in_tree(tree, group_id)
+                                })
+                                .is_some_and(|g| g.collapsed)
+                            {
+                                store.toggle_group_collapse(group_id, cx);
+                            }
+                        }
+                        store.open_added_project(&id, window, cx);
+                    });
+                    true
+                })
+        },
+    );
 
     autofocus(&input_for_focus, window, cx);
 }

@@ -349,8 +349,12 @@ mod tests {
         assert!(list.iter().any(|f| f == mono));
 
         // 用户已经自己写了(大小写不同也算):不重复插
-        let list = narrow_fallback_list(&[mono.to_ascii_uppercase().into(), "Noto Color Emoji".into()]);
-        assert_eq!(list.iter().filter(|f| f.eq_ignore_ascii_case(mono)).count(), 1);
+        let list =
+            narrow_fallback_list(&[mono.to_ascii_uppercase().into(), "Noto Color Emoji".into()]);
+        assert_eq!(
+            list.iter().filter(|f| f.eq_ignore_ascii_case(mono)).count(),
+            1
+        );
     }
 
     /// `narrow_font` 与 `font` 只差回退表,其余(字族 / 连字 / 字重)一字不差。

@@ -2139,7 +2139,15 @@ fn build_row(
         let mergeable = !wide
             && !has_zerowidth
             && cell.cursor == 0
-            && advance.fits(window, font, slot, run_font_id, font_size, cell.ch, cell_width);
+            && advance.fits(
+                window,
+                font,
+                slot,
+                run_font_id,
+                font_size,
+                cell.ch,
+                cell_width,
+            );
 
         if mergeable {
             match text_run.as_mut() {

@@ -414,9 +414,7 @@ mod tests {
     #[test]
     fn 每个区间都至少命中一个字符() {
         for &(lo, hi) in FORCED_WIDE_RANGES {
-            let hit = (lo..=hi)
-                .filter_map(char::from_u32)
-                .any(forced_wide);
+            let hit = (lo..=hi).filter_map(char::from_u32).any(forced_wide);
             assert!(hit, "U+{lo:04X}..=U+{hi:04X} 一个字符都没命中");
         }
     }
@@ -424,7 +422,9 @@ mod tests {
     /// 用户点名的那一类:带圈数字、括号数字、带圈字母、罗马数字。
     #[test]
     fn 枚举符号按宽算() {
-        for c in ['①', '⑳', '⑴', '⒈', 'ⓐ', 'Ⓩ', '⓪', '⓿', 'Ⅰ', 'Ⅻ', 'ⅹ', '🄐', '🅐'] {
+        for c in [
+            '①', '⑳', '⑴', '⒈', 'ⓐ', 'Ⓩ', '⓪', '⓿', 'Ⅰ', 'Ⅻ', 'ⅹ', '🄐', '🅐',
+        ] {
             assert!(forced_wide(c), "{c} (U+{:04X}) 应按 2 列", c as u32);
         }
         // 区间只是门禁:Number Forms 里 Ⅼ Ⅽ Ⅾ Ⅿ / ⅻ 这些是 N 类,不动
@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn 中文全角符号按宽算() {
         for c in [
-            '※', '℃', '℉', '№', '‰', '★', '☆', '●', '○', '◎', '■', '□', '◆', '◇', '▲', '△',
-            '▼', '▽', '◢', '◣', '◤', '◥',
+            '※', '℃', '℉', '№', '‰', '★', '☆', '●', '○', '◎', '■', '□', '◆', '◇', '▲', '△', '▼',
+            '▽', '◢', '◣', '◤', '◥',
         ] {
             assert!(forced_wide(c), "{c} (U+{:04X}) 应按 2 列", c as u32);
         }
@@ -453,8 +453,8 @@ mod tests {
     #[test]
     fn 其它字符原样放行() {
         for c in [
-            '─', '│', '╭', '█', '▁', '→', '←', '▶', '◀', 'α', 'Я', '±', '×', '÷', '°', '·',
-            '“', '”', '…', '—', '•', 'a', ' ',
+            '─', '│', '╭', '█', '▁', '→', '←', '▶', '◀', 'α', 'Я', '±', '×', '÷', '°', '·', '“',
+            '”', '…', '—', '•', 'a', ' ',
         ] {
             assert!(!forced_wide(c), "{c} (U+{:04X}) 不该被改宽", c as u32);
         }
@@ -507,7 +507,11 @@ mod tests {
         assert_eq!(cols(&e, 1), vec![(0, '①'), (2, 'd')]);
         e.with_term(|t| {
             let row0 = &t.grid()[Line(0)];
-            assert!(row0[Column(3)].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+            assert!(
+                row0[Column(3)]
+                    .flags
+                    .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            );
         });
     }
 
@@ -587,7 +591,11 @@ mod tests {
         assert_eq!(cols(&e, 0), vec![(0, '❤'), (2, 'x')]);
         assert_eq!(cell_at(&e, 0, 0), ("❤\u{FE0F}".into(), true));
         e.with_term(|t| {
-            assert!(t.grid()[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert!(
+                t.grid()[Line(0)][Column(1)]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER)
+            );
         });
     }
 
@@ -668,7 +676,10 @@ mod tests {
         e.with_term(|t| {
             let tail = &t.grid()[Line(0)][Column(3)];
             assert!(tail.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
-            assert!(tail.zerowidth().is_none_or(<[char]>::is_empty), "旧格的 0 宽字符要清干净");
+            assert!(
+                tail.zerowidth().is_none_or(<[char]>::is_empty),
+                "旧格的 0 宽字符要清干净"
+            );
         });
     }
 
@@ -716,7 +727,10 @@ mod tests {
         e.with_term(|t| {
             let row = &t.grid()[Line(0)];
             assert!(row[Column(2)].flags.contains(Flags::WIDE_CHAR_SPACER));
-            assert!(!row[Column(3)].flags.contains(Flags::WIDE_CHAR_SPACER), "「中」的旧 spacer 已清");
+            assert!(
+                !row[Column(3)].flags.contains(Flags::WIDE_CHAR_SPACER),
+                "「中」的旧 spacer 已清"
+            );
         });
     }
 
@@ -754,7 +768,16 @@ mod tests {
         e.advance("中❤\u{FE0F}文👍🏽字🇨🇳①x".as_bytes());
         assert_eq!(
             cols(&e, 0),
-            vec![(0, '中'), (2, '❤'), (4, '文'), (6, '👍'), (8, '字'), (10, '🇨'), (12, '①'), (14, 'x')]
+            vec![
+                (0, '中'),
+                (2, '❤'),
+                (4, '文'),
+                (6, '👍'),
+                (8, '字'),
+                (10, '🇨'),
+                (12, '①'),
+                (14, 'x')
+            ]
         );
     }
 }
