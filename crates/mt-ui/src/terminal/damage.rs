@@ -50,8 +50,12 @@ use std::hash::{Hash, Hasher};
 use alacritty_terminal::term::cell::Flags;
 use gpui::Hsla;
 
-/// 一个格子最多带几个组合符号。与 alacritty 内部上限一致。
-pub const MAX_ZEROWIDTH_CHARS: usize = 5;
+/// 一个格子最多带几个 0 宽字符(组合符号 / VS16 / ZWJ 及其后的 emoji / 肤色修饰符……)。
+///
+/// `mt-terminal::width` 把整个 emoji 字位簇塞进一格(见其模块注释),RGI 序列最长
+/// 在 10 个码位上下(带肤色的家庭 / 亲吻序列、tag 序列旗帜),多出来的截断——
+/// 截断只影响字形(shaper 拿不到完整序列),不影响列宽。
+pub const MAX_ZEROWIDTH_CHARS: usize = 10;
 
 /// 参与行签名的、**一个格子的全部可见属性**。
 ///
@@ -124,7 +128,7 @@ impl CellSignature {
     /// 把这个格子摊成若干个 64 位字，逐个喂给 `push`。
     ///
     /// 逐字段 `Hash::hash` 一趟是 19 次零碎 write（char / usize / bool / u8
-    /// 各自一次），这里手工打包成 **6 个字**（带组合符号的格子再加 3 个），
+    /// 各自一次），这里手工打包成 **6 个字**（带组合符号的格子再加 5 个），
     /// 写入次数掉到三分之一，且每个字都已经是对齐好的 u64 —— 哈希器不用再走
     /// 小写入的缓冲逻辑。[`Hash`] 与 [`row_signature`] 共用这一份口径，
     /// 免得两条路各写一遍迟早写漂。

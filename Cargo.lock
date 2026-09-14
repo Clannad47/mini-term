@@ -4417,6 +4417,8 @@ dependencies = [
  "anyhow",
  "mt-pty",
  "parking_lot",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
