@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.11-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.12-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -66,6 +66,8 @@
 | **Alt+click to place the cursor** | Hold Alt (⌥ on macOS) and click anywhere on the command line to move the cursor there — arrow keys are synthesized from the column delta, same line only; cross-line clicks are ignored so the line editor's history recall never fires. Cell-accurate at shell prompts; Ink-style TUIs such as Claude CLI are best-effort |
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache) |
 | **Flood-proof UI** | PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so `cat`-ing a huge file can't drag the interface down |
+| **Wide glyphs stay in their cells** | Circled numerals like ①②③, emoji sequences (skin tones / ZWJ), and fullwidth CJK punctuation are placed by real grapheme cluster, so AI checklists and status lines no longer overlap or shove the rest of the row; fallback glyphs for missing characters are matched by family too, so `⚠ ✔ ⏺` don't push out an extra column |
+| **Adding a project opens it** | Every entry point — the dialog, a group's right-click menu, dropping a folder onto the list, SSH remote, "add worktree as project" — switches to the new project and opens its first terminal, instead of leaving you on an empty state to click "New terminal" once more |
 | **Hover preview for project rows** | Hover for 250ms to pop up a preview of the project's running AI session terminal area |
 | **Grouped settings panel** | A two-level sidebar: Terminal, Appearance, AI, System — every page fits on one screen instead of scrolling half a page to find a toggle |
 
@@ -85,7 +87,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,792 Rust tests** (29 test targets) |
+| Tests | **1,826 Rust tests** (29 test targets) |
 
 ---
 

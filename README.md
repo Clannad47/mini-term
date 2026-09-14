@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.11-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.12-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -68,6 +68,8 @@
 | **Alt+单击定位光标** | 按住 Alt（macOS ⌥）单击命令行任意位置，光标直接挪过去——同一行内按列差合成方向键；跨行一律不动，免得触发行编辑器的历史召回。shell 提示符下逐格准确，Claude CLI 这类 Ink TUI 不保证 |
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存） |
 | **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面 |
+| **宽字符不压字** | ①②③ 这类圈码、emoji 序列（肤色 / ZWJ 组合）、中文全角标点按真实字位簇落格，AI 输出的清单和状态行不再互相叠字、顶歪整行；缺字回退字形也按族名比对，`⚠ ✔ ⏺` 不再顶出一列 |
+| **添加项目即打开** | 弹窗、分组右键、拖目录进列表、SSH 远程、Worktree 设为项目——任何一条入口添加完直接切过去并开好第一个终端，不必再面对空态页点一次「新建终端」 |
 | **项目行悬停预览** | 悬停 250ms 弹出该项目正在运行的 AI Session 终端区 |
 | **设置面板分组** | 侧栏两级菜单：终端、外观、AI、系统，每页只剩一屏，不用滚半页找开关 |
 
@@ -87,7 +89,7 @@
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1792 个 Rust 测试**（29 个测试目标） |
+| 测试 | **1826 个 Rust 测试**（29 个测试目标） |
 
 ---
 

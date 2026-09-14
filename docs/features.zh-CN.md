@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.11-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.12-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -138,6 +138,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **项目行图标** — 项目行显示技术栈图标与该项目正在跑的 AI 品牌图标（按厂商去重、字母序排列，单色品牌图标上品牌色），pane 标签与会话列表同步展示品牌图标
 - **悬停 pane 预览** — **仅限跑着 AI 会话的项目**（判定与项目行 AI 品牌图标同口径：行上亮着图标才有预览；AI 退出后浮层随即收起，普通 shell 项目悬停只出绝对路径 tooltip，不弹卡打断视线）。悬停项目行 250ms 弹出该项目终端区的**微缩布局拼图**：按 SplitNode 树复现真实分屏比例，浮层固定宽度永不超屏，与切过去看到的所见即所得；打开期间 500ms 重画，预览是活的。实现为读取终端 grid 自绘微缩位图——与主终端同一条渲染链路取格子内容（同色 run 提取、粗体标准色亮化、256 色 / truecolor 解析），按 cell 网格绘制位图再等比缩放，隐藏 pane 的内容照样实时可得。每个分屏叶子显示当前 tab 的画面（左下锚定，保住最新输出与 TUI 输入区），隐藏 tab 以「+N」徽章示数并附其中最高优先级的状态点（error > ai-working > ai-idle，与状态聚合同口径）——藏在非激活 tab 里的 AI 状态不漏报；未起 PTY 的 pane 显示「未启动」占位（项目绝对路径在卡头可见）。**非激活的 pane tab** 悬停 250ms 同样弹单格缩略图浮层（同一渲染链路，打开期间 500ms 重画；未启动占位与远程断线遮罩同口径），且**不做 AI 开闸**——隐藏 tab 的内容不切过去本来就看不见，预览回答的就是「那个 tab 里现在是什么」。触发时序与项目行预览同一套，移出/点击/右键/滚动即关；卡片钳制左右边界，底部分屏放不下时翻到 tab 上方
 - **拖拽添加项目** — 从资源管理器拖拽文件夹到项目列表即可快速添加，自动识别文件 / 文件夹 / 重复项目并给出视觉反馈
+- **添加项目即打开** — 弹窗、分组右键、拖目录进列表、添加远程项目、Worktree「设为项目」五条入口添加完都直接切到新项目并用默认 shell 开好第一个终端；路径撞上既有项目时只切过去不重复添加，已有终端的项目不再多开。手动点项目切换仍不自动补终端——用户自己关光的空态是有意的
 - **嵌套分组** — 最多 3 级项目分组，拖拽排序，折叠 / 展开，分组右键菜单可直接添加本地项目或远程 SSH 项目并归入该组（折叠的分组自动展开）；「删除分组」先弹确认并说明组内项目会移到上一级而非被删除；「移动到分组」按分组树逐级展开子菜单，当前所在组标 ✓ 并置灰，超深度的组不可选
 - **Worktree 子项目** — worktree「设为项目」后挂在主项目下方作子项目（缩进跟随分组），拖出或右键「脱离父项目」可转回顶层，删除父项目时子项目原位晋升不丢失；项目列表为 worktree 项目显示 ⎇ 分支徽章，仓库列表与 Changes 下拉同样标注 worktree 条目；**外部删除的 worktree 自动收敛** —— 窗口重获焦点时探测子项目目录是否还在，AI agent 在终端里跑完 `git worktree remove` 后，目录已消失的子项目连同终端资源一并移除，⎇ 徽章同步重探（仅在父项目目录仍存在时清理，盘符掉线不会误删；SSH 远程与 UNC/WSL 路径不参与），worktree 弹窗「清理失效条目」也会一并移除指向它的项目
 - **文件树** — 集成目录浏览器，自然排序（V1 → V2 → V10 而非字典序），嵌套 `.gitignore` 置灰（每层子目录的忽略规则与 `!pattern` 白名单都会生效，与 git 行为一致），`notify` 文件监听实时刷新
@@ -177,6 +178,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，设置页卡片直接铺实况缩略图。导入的 `theme.css` 与 `theme.json` 的 `tokens` 覆盖过同一道外链闸：禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与 `image-set("…")` 这类裸字符串双查，`url(\68 ttps://…)` 之类的转义写法同样挡得住
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题；默认字族按平台选择——Windows Cascadia Mono、macOS Menlo、Linux DejaVu Sans Mono，各自带 CJK 与 emoji 回退，主字体缺席时不会回落成比例字体
 - **终端连体字** — 「设置 → 外观 → 字体」的「启用终端连体字」开关（默认关），开启后 `=>` `!=` `->` 等按字体自身的连字规则合并显示。合并段整段一次 shape、段原点钉在 `cell_width × 起始列`，连字总宽守恒时段内字符照旧落在列格上；shape 完若总宽不等于「列数 × 列宽」则退回禁连字重 shape 一次，防住连字不守恒的字体。注意默认字族 Cascadia **Mono** 是去连字版，要换 Cascadia Code / Fira Code 这类才看得见效果
+- **宽字符按字位簇落格** — ①②③ 这类带圈枚举符号按 2 列占位，emoji 序列（肤色修饰、ZWJ 组合、变体选择符）整簇一格，中文全角标点按 2 列落格；AI 输出的清单与状态行不再叠字或顶歪整行。缺字判定改为真正 shape 后按族名比对（此前 `GetGlyphIndices` 对缺字返回 glyph 0 会让 `⚠ ✔ ⏺` 顶出一列），窄格片段回退优先单色符号字体以保住 SGR 着色。ConPTY 对 ① 仍按 1 列计光标，属已知偏差
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复
 - **关闭确认** — 关闭窗口时只按 AI 会话数量盘点（ai-working / ai-idle 的 pane），裸 shell 终端不计入，仅当存在 AI 会话时才弹确认并列出会话名清单；无论是否弹窗都会 flush 所有项目布局
 - **版本检查** — 启动时拉取 GitHub Release，有新版本时侧栏图标高亮提示、点击前往下载；版本号写入原生窗口标题
@@ -201,7 +203,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1792 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1826 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -342,7 +344,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（29 个测试目标、1792 例）
+# 全工作区 Rust 测试（29 个测试目标、1826 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
