@@ -2083,10 +2083,12 @@ fn build_row(
                 font: plain_font,
                 ..run
             };
-            shaped =
-                window
-                    .text_system()
-                    .shape_line(text, font_size, std::slice::from_ref(&plain), None);
+            shaped = window.text_system().shape_line(
+                text,
+                font_size,
+                std::slice::from_ref(&plain),
+                None,
+            );
         }
 
         texts.push(TextPiece {
