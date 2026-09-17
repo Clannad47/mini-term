@@ -236,7 +236,8 @@ pub fn restore_line_ending(text: &str, ending: LineEnding) -> String {
     }
 }
 
-/// 文件名 → gpui-component 的语言名(`Language::from_str` 认得的那些)。
+/// 文件名 → 语言注册表里的名字(组件库内建的 30 种 + [`crate::syntax_languages`]
+/// 补充的那些)。
 ///
 /// 对照原版 `LanguageDescription.matchFilename(languages, fileName)`
 /// (`CodeEditor.tsx:300`)覆盖的常见类型。认不出返回 `"text"`,落到 `Language::Plain`
@@ -244,6 +245,10 @@ pub fn restore_line_ending(text: &str, ending: LineEnding) -> String {
 ///
 /// 特殊文件名(无扩展名的 `Makefile` / `Dockerfile` 之流)先于扩展名判定,
 /// 与 [`mt_ui::icons::FileIcon`] 的「特殊文件名压扩展名」同一条规矩。
+///
+/// 没有专属语法包的类型退到**近似语言**(Dockerfile → bash,scss → css,vue / razor →
+/// html,`.bzl` → python):语法树会带错误节点,但关键字/字符串/注释这些大头照样上色,
+/// 比整篇纯文本强。哪些类型为什么没有专属包见 `syntax_languages.rs` 模块注释。
 pub fn language_for(file_name: &str) -> &'static str {
     let name = file_name_of(file_name).to_ascii_lowercase();
     // 特殊文件名先判(有的根本没有扩展名,有的扩展名会指向错的语言:
@@ -251,9 +256,32 @@ pub fn language_for(file_name: &str) -> &'static str {
     match name.as_str() {
         "makefile" | "gnumakefile" => return "make",
         "cmakelists.txt" => return "cmake",
-        "dockerfile" => return "bash",
-        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => return "bash",
+        "dockerfile" | "containerfile" => return "bash",
+        ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".zshrc" | ".zshenv"
+        | ".zprofile" | ".profile" | ".envrc" | "pkgbuild" => return "bash",
+        // 锁文件与 Python 打包文件是 TOML 语法
+        "cargo.lock" | "pipfile" | "poetry.lock" | "uv.lock" | "pdm.lock" => return "toml",
+        // Ruby DSL
+        "gemfile" | "rakefile" | "vagrantfile" | "podfile" | "fastfile" | "brewfile"
+        | "guardfile" | "capfile" => return "ruby",
+        "jenkinsfile" => return "groovy",
+        "nginx.conf" => return "nginx",
+        // Bazel / Buck 的 Starlark 是 Python 子集
+        "build" | "build.bazel" | "workspace" | "workspace.bazel" | "buck" => return "python",
+        ".editorconfig" | ".gitconfig" | ".gitmodules" | ".npmrc" | ".yarnrc" => return "ini",
+        ".babelrc" | ".eslintrc" | ".prettierrc" | ".swcrc" | ".jshintrc" | ".stylelintrc" => {
+            return "json";
+        }
+        ".clang-format" | ".clang-tidy" | ".clangd" => return "yaml",
         _ => {}
+    }
+    // `requirements.txt` / `requirements-dev.txt` / `dev-requirements.txt`
+    if name.contains("requirements") && name.ends_with(".txt") {
+        return "requirements";
+    }
+    // `.env` / `.env.local` / `.env.production`:KEY=VALUE,bash 语法照单全收
+    if name == ".env" || name.starts_with(".env.") {
+        return "bash";
     }
     let Some((_, ext)) = name.rsplit_once('.') else {
         return "text";
@@ -263,31 +291,66 @@ pub fn language_for(file_name: &str) -> &'static str {
         "ts" | "mts" | "cts" => "typescript",
         "tsx" | "jsx" => "tsx",
         "js" | "mjs" | "cjs" => "javascript",
-        "json" | "jsonc" => "json",
-        "py" | "pyi" => "python",
+        "json" | "jsonc" | "jsonl" | "ndjson" | "json5" | "webmanifest" | "geojson" | "har"
+        | "avsc" | "code-workspace" | "code-snippets" | "ipynb" => "json",
+        "py" | "pyi" | "pyw" | "pyx" | "pxd" | "bzl" => "python",
         "go" => "go",
-        "rb" => "ruby",
-        "java" => "java",
-        "cs" => "csharp",
+        "rb" | "rake" | "gemspec" | "ru" | "rbw" => "ruby",
+        "java" | "aidl" => "java",
+        "cs" | "csx" => "csharp",
         "c" | "h" => "c",
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
-        "css" | "scss" | "less" => "css",
-        "html" | "htm" => "html",
-        "sh" | "bash" | "zsh" | "fish" => "bash",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" | "ino" | "cu" | "cuh" | "mm" => "cpp",
+        "css" | "scss" | "less" | "pcss" | "postcss" => "css",
+        // vue / razor / 各种 HTML 模板都退到 html:标签与 `<script>` / `<style>` 照常上色
+        "html" | "htm" | "xhtml" | "vue" | "cshtml" | "razor" | "astro" | "hbs" | "handlebars"
+        | "mustache" | "gohtml" | "jsp" | "twig" | "liquid" | "heex" | "eex" => "html",
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dockerfile" => "bash",
         "toml" => "toml",
         "yaml" | "yml" => "yaml",
         "md" | "markdown" | "mkd" | "mdx" => "markdown",
-        "sql" => "sql",
+        "sql" | "psql" | "pgsql" | "mysql" | "ddl" | "dml" => "sql",
         "swift" => "swift",
-        "zig" => "zig",
+        "zig" | "zon" => "zig",
         "ex" | "exs" => "elixir",
-        "scala" | "sbt" => "scala",
+        "scala" | "sbt" | "sc" => "scala",
         "proto" => "proto",
-        "graphql" | "gql" => "graphql",
+        "graphql" | "gql" | "graphqls" => "graphql",
         "diff" | "patch" => "diff",
         "cmake" => "cmake",
         "ejs" => "ejs",
         "erb" => "erb",
+        "mk" => "make",
+        // ---- 以下由 syntax_languages 补充 ----
+        "php" | "phtml" | "php5" | "phps" => "php",
+        "kt" | "kts" => "kotlin",
+        "lua" | "luau" => "lua",
+        "ps1" | "psm1" | "psd1" => "powershell",
+        // .NET / Java / Apple 工程里那一堆 XML 方言(csproj / xaml / plist / storyboard …)
+        "xml" | "xsd" | "xsl" | "xslt" | "wsdl" | "svg" | "plist" | "xaml" | "axaml" | "resx"
+        | "nuspec" | "csproj" | "fsproj" | "vbproj" | "vcxproj" | "filters" | "props"
+        | "targets" | "config" | "manifest" | "ps1xml" | "pom" | "iml" | "storyboard" | "xib"
+        | "ui" | "qrc" | "wxs" | "opml" | "rss" | "atom" | "fxml" | "xcscheme"
+        | "xcworkspacedata" | "xcprivacy" | "entitlements" => "xml",
+        "dtd" => "dtd",
+        "dart" => "dart",
+        "hs" => "haskell",
+        "ml" => "ocaml",
+        "mli" => "ocaml_interface",
+        "tf" | "tfvars" | "hcl" | "nomad" => "hcl",
+        "nix" => "nix",
+        "r" => "r",
+        "rmd" => "markdown",
+        "groovy" | "gradle" | "gvy" | "gy" | "gsh" => "groovy",
+        "ini" | "cfg" | "conf" | "reg" | "service" | "socket" | "timer" | "desktop" | "flake8"
+        | "pylintrc" | "gitconfig" => "ini",
+        "erl" | "hrl" | "escript" => "erlang",
+        "s" | "asm" | "nasm" => "asm",
+        "fs" | "fsi" | "fsx" | "fsscript" => "fsharp",
+        "pas" | "pp" | "dpr" | "dpk" | "lpr" => "pascal",
+        "properties" => "properties",
+        "bat" | "cmd" => "batch",
+        "svelte" => "svelte",
+        "j2" | "jinja" | "jinja2" => "jinja2",
         _ => "text",
     }
 }
