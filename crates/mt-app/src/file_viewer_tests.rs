@@ -1177,11 +1177,8 @@ fn 语言按扩展名映射到组件库认得的名字() {
     assert_eq!(language_for("Cargo.lock"), "toml");
     assert_eq!(language_for("Gemfile"), "ruby");
     assert_eq!(language_for("Jenkinsfile"), "groovy");
-    assert_eq!(language_for("nginx.conf"), "nginx");
     assert_eq!(language_for(".editorconfig"), "ini");
     assert_eq!(language_for(".prettierrc"), "json");
-    assert_eq!(language_for("requirements.txt"), "requirements");
-    assert_eq!(language_for("requirements-dev.txt"), "requirements");
     assert_eq!(language_for(".env"), "bash");
     assert_eq!(language_for(".env.local"), "bash");
     // 补充语言包
@@ -1194,18 +1191,19 @@ fn 语言按扩展名映射到组件库认得的名字() {
     assert_eq!(language_for("App.csproj"), "xml");
     assert_eq!(language_for("MainWindow.xaml"), "xml");
     assert_eq!(language_for("main.dart"), "dart");
-    assert_eq!(language_for("main.tf"), "hcl");
     assert_eq!(language_for("build.gradle"), "groovy");
     assert_eq!(language_for("setup.cfg"), "ini");
     assert_eq!(language_for("run.bat"), "batch");
-    assert_eq!(language_for("App.svelte"), "svelte");
-    assert_eq!(language_for("Program.fs"), "fsharp");
-    assert_eq!(language_for("a.mli"), "ocaml_interface");
+    assert_eq!(language_for("app.properties"), "ini");
     // 没有专属语法包的退到近似语言
     assert_eq!(language_for("App.vue"), "html");
+    assert_eq!(language_for("App.svelte"), "html");
     assert_eq!(language_for("Index.cshtml"), "html");
     assert_eq!(language_for("style.scss"), "css");
     assert_eq!(language_for("BUILD.bazel"), "python");
+    // 冷门语言不接:主流之外一律纯文本(用户 2026-09-17 定的口径)
+    assert_eq!(language_for("main.hs"), "text");
+    assert_eq!(language_for("main.tf"), "text");
     // 认不出 → 纯文本(原版「匹配不到就是纯文本」)
     assert_eq!(language_for("notes.xyz"), "text");
     assert_eq!(language_for("LICENSE"), "text");
@@ -1247,7 +1245,7 @@ fn 映射出来的语言名注册表全都认得() {
     names.sort_unstable();
     names.dedup();
     assert!(
-        names.len() > 40,
+        names.len() > 30,
         "只扫出 {} 个名字,扫描逻辑坏了: {names:?}",
         names.len()
     );

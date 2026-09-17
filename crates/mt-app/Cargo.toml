@@ -28,9 +28,10 @@ gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 #  1. 已在依赖树里的五个(gpui-component 拉进来的),这里只是为了拿解析器常量与
 #     `HIGHLIGHTS_QUERY`,版本号与 Cargo.lock 里的一致,净新增 crate = 0;
 #  2. 新增语法 crate,每个都是一份 `cc` 编译的 parser.c(与组件库那 30 个同一代价),
-#     版本全钉在 tree-sitter-language 0.1 / ABI 13~15,与树里的 tree-sitter 0.25 相容。
-#     **禁止**引依赖老版 `tree-sitter = "0.2x"` 的语法 crate(dockerfile / fish / scss /
-#     vue / vim / json5 都是):会把第二份 tree-sitter 运行时链进来,C 符号重定义。
+#     版本全钉在 tree-sitter-language 0.1 / ABI 14~15,与树里的 tree-sitter 0.25 相容。
+#     **只收主流类型**(冷门语言不值这份体积);**禁止**引依赖老版 `tree-sitter = "0.2x"`
+#     的语法 crate(dockerfile / fish / scss / vue / vim / json5 都是):会把第二份
+#     tree-sitter 运行时链进来,C 符号重定义。
 # 挑选口径见 syntax_languages.rs 模块注释;高亮查询 crate 没带的放 assets/syntax/。
 tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
@@ -43,23 +44,9 @@ tree-sitter-lua = "0.5"
 tree-sitter-powershell = "0.26"
 tree-sitter-xml = "0.7"
 tree-sitter-dart = "0.2"
-tree-sitter-haskell = "0.23"
-tree-sitter-ocaml = "0.26"
-tree-sitter-hcl = "1.1"
-tree-sitter-nix = "0.3"
-tree-sitter-r = "1.3"
 tree-sitter-groovy = "0.1"
 tree-sitter-ini = "1.4"
-tree-sitter-erlang = "0.20"
-tree-sitter-asm = "0.24"
-tree-sitter-fsharp = "0.3"
-tree-sitter-pascal = "0.10"
-tree-sitter-properties = "0.3"
 tree-sitter-batch = "0.11"
-tree-sitter-svelte-ng = "1.0"
-tree-sitter-nginx = "1.0"
-tree-sitter-requirements = "0.6"
-tree-sitter-jinja2 = "0.0.16"
 # 语法 crate 导出的 `LANGUAGE` 是这个类型(`LanguageFn`),表里要写它的名字;
 # 已在树里(每个语法 crate 都依赖它),零新增。
 tree-sitter-language = "0.1"

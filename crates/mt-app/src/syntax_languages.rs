@@ -7,17 +7,16 @@
 //! 组件库根本没有。
 //!
 //! 出口只有一个:[`register`],启动时调一次,往 `LanguageRegistry` 单例里
-//! (a) 用带高亮查询的配置**覆盖**上面五种;(b) **追加**二十来种新语言。注册表按
+//! (a) 用带高亮查询的配置**覆盖**上面五种;(b) **追加**九种主流语言。注册表按
 //! 名字查找,`InputState::code_editor(name)` 那条路一字不改;[`crate::file_viewer::language_for`]
 //! 负责扩展名 → 名字。
 //!
 //! # 高亮查询从哪来
 //!
 //! 优先用语法 crate 自带的 `HIGHLIGHTS_QUERY`(与解析器同版本发布,节点名必定对得上);
-//! crate 没带的(C# / Swift / Proto / HCL / GraphQL / Pascal / Nginx)从 Zed 的语言扩展、
-//! nvim-treesitter 或 crate 自己没导出的 queries/ 目录抄一份进 `assets/syntax/`,文件头
-//! 注明来源与许可证(都是 Apache-2.0 / MIT),GPL 的一律不碰;Groovy / Svelte 两份是
-//! 自己拼的(见文件头)。
+//! crate 没带的(C# / Swift / Proto / GraphQL)从 Zed 的语言扩展或 nvim-treesitter 抄一份
+//! 进 `assets/syntax/`,文件头注明来源与许可证(都是 Apache-2.0 / MIT),GPL 的一律不碰;
+//! Groovy 那份是拿 Java 的查询拼的(见文件头)。
 //!
 //! # 捕获名要翻译成 Zed 的那套
 //!
@@ -57,14 +56,17 @@
 //! # 注入只支持 `#set! injection.language`
 //!
 //! 组件库的注入解析(`highlighter.rs::injection_for_match`)只认 `#set!` 写死的语言名,
-//! `@injection.language` 捕获那条路被注释掉了。PHP 的 HTML 段、Svelte 的
-//! `<script>` / `<style>` 都是写死的,够用;heredoc 之类动态注入不做。
+//! `@injection.language` 捕获那条路被注释掉了。PHP 的 HTML 段是写死的,够用;
+//! heredoc 之类动态注入不做。
 //!
 //! # 挑选口径
 //!
-//! - 每个语法 crate 都是一份 `cc` 编译的 parser.c,进二进制几百 KB 到几 MB。挑的是
-//!   「日常项目里打得开的文件类型」,不追求全:Julia(50 MB parser.c)/ Razor(55 MB)/
-//!   Verilog / Fortran / LaTeX / Objective-C 这些体量大又小众的没要
+//! - **只收主流类型**(用户 2026-09-17 定的):每个语法 crate 都是一份 `cc` 编译的
+//!   parser.c,进二进制几百 KB 到几 MB,冷门语言不值这个价。现在是 PHP / Kotlin / Lua /
+//!   PowerShell / XML / Dart / Groovy / INI / 批处理九种;Haskell / OCaml / HCL / Nix / R /
+//!   Erlang / F# / Pascal / Svelte / nginx / Jinja2 这些曾经接过、按这条口径又撤了,
+//!   要加回来只是 Cargo.toml 一行 + 这张表一项(crates.io 上都有带查询的 crate,
+//!   HCL / Pascal / nginx 的查询要从 nvim-treesitter 或 crate 的 queries/ 目录抄)
 //! - 只要依赖 `tree-sitter-language 0.1` 的 crate。老一代 crate 直接依赖
 //!   `tree-sitter = "0.20"~"0.22"`(dockerfile / fish / scss / vue / vim / json5),
 //!   会把第二份 tree-sitter 运行时链进来、C 符号重定义 —— 这些类型退到近似语言
@@ -119,19 +121,6 @@ impl Pack {
 /// PHP 文件里 `<?php ?>` 之外的部分是 `text` 节点,交给 HTML 高亮。
 const PHP_INJECTIONS: &str = r#"((text) @injection.content (#set! injection.language "html"))"#;
 
-/// Svelte 的 `<script>` / `<style>` 与组件库 html/injections.scm 同一写法;
-/// `lang="ts"` 的脚本多注入一份 typescript(与 javascript 那份叠加,结果一致)。
-const SVELTE_INJECTIONS: &str = r#"
-((script_element (raw_text) @injection.content) (#set! injection.language "javascript"))
-((script_element
-   (start_tag (attribute (attribute_name) @_attr (quoted_attribute_value (attribute_value) @_lang)))
-   (raw_text) @injection.content)
- (#eq? @_attr "lang") (#any-of? @_lang "ts" "typescript")
- (#set! injection.language "typescript"))
-((style_element (raw_text) @injection.content) (#set! injection.language "css"))
-((expression) @injection.content (#set! injection.language "javascript"))
-"#;
-
 /// 全部语言包。名字与组件库内建重名的(csharp / swift / cmake / proto / graphql)
 /// 是覆盖,其余是追加。
 const PACKS: &[Pack] = &[
@@ -161,7 +150,7 @@ const PACKS: &[Pack] = &[
         tree_sitter_graphql::LANGUAGE,
         include_str!("../assets/syntax/graphql.scm"),
     ),
-    // ---- 新增 ----
+    // ---- 新增(只收主流类型,冷门语言不进来,见模块注释「挑选口径」)----
     Pack {
         name: "php",
         language: tree_sitter_php::LANGUAGE_PHP,
@@ -187,112 +176,33 @@ const PACKS: &[Pack] = &[
         tree_sitter_powershell::LANGUAGE,
         tree_sitter_powershell::HIGHLIGHTS_QUERY,
     ),
+    // csproj / xaml / plist / svg 这一大家子都是它
     Pack::plain(
         "xml",
         tree_sitter_xml::LANGUAGE_XML,
         tree_sitter_xml::XML_HIGHLIGHT_QUERY,
     ),
     Pack::plain(
-        "dtd",
-        tree_sitter_xml::LANGUAGE_DTD,
-        tree_sitter_xml::DTD_HIGHLIGHT_QUERY,
-    ),
-    Pack::plain(
         "dart",
         tree_sitter_dart::LANGUAGE,
         tree_sitter_dart::HIGHLIGHTS_QUERY,
     ),
-    Pack::plain(
-        "haskell",
-        tree_sitter_haskell::LANGUAGE,
-        tree_sitter_haskell::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "ocaml",
-        tree_sitter_ocaml::LANGUAGE_OCAML,
-        tree_sitter_ocaml::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "ocaml_interface",
-        tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE,
-        tree_sitter_ocaml::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "hcl",
-        tree_sitter_hcl::LANGUAGE,
-        include_str!("../assets/syntax/hcl.scm"),
-    ),
-    Pack::plain(
-        "nix",
-        tree_sitter_nix::LANGUAGE,
-        tree_sitter_nix::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "r",
-        tree_sitter_r::LANGUAGE,
-        tree_sitter_r::HIGHLIGHTS_QUERY,
-    ),
+    // 主要为 build.gradle / Jenkinsfile
     Pack::plain(
         "groovy",
         tree_sitter_groovy::LANGUAGE,
         include_str!("../assets/syntax/groovy.scm"),
     ),
+    // .ini / .cfg / .conf / .editorconfig / .gitconfig / .properties 都是 key=value
     Pack::plain(
         "ini",
         tree_sitter_ini::LANGUAGE,
         tree_sitter_ini::HIGHLIGHTS_QUERY,
     ),
     Pack::plain(
-        "erlang",
-        tree_sitter_erlang::LANGUAGE,
-        tree_sitter_erlang::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "asm",
-        tree_sitter_asm::LANGUAGE,
-        tree_sitter_asm::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "fsharp",
-        tree_sitter_fsharp::LANGUAGE_FSHARP,
-        tree_sitter_fsharp::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "pascal",
-        tree_sitter_pascal::LANGUAGE,
-        include_str!("../assets/syntax/pascal.scm"),
-    ),
-    Pack::plain(
-        "properties",
-        tree_sitter_properties::LANGUAGE,
-        tree_sitter_properties::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
         "batch",
         tree_sitter_batch::LANGUAGE,
         tree_sitter_batch::HIGHLIGHTS_QUERY,
-    ),
-    Pack {
-        name: "svelte",
-        language: tree_sitter_svelte_ng::LANGUAGE,
-        highlights: include_str!("../assets/syntax/svelte.scm"),
-        injections: SVELTE_INJECTIONS,
-        injection_languages: &["javascript", "typescript", "css"],
-    },
-    Pack::plain(
-        "nginx",
-        tree_sitter_nginx::LANGUAGE,
-        include_str!("../assets/syntax/nginx.scm"),
-    ),
-    Pack::plain(
-        "requirements",
-        tree_sitter_requirements::LANGUAGE,
-        tree_sitter_requirements::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "jinja2",
-        tree_sitter_jinja2::LANGUAGE,
-        tree_sitter_jinja2::HIGHLIGHTS_QUERY,
     ),
 ];
 

@@ -265,7 +265,6 @@ pub fn language_for(file_name: &str) -> &'static str {
         "gemfile" | "rakefile" | "vagrantfile" | "podfile" | "fastfile" | "brewfile"
         | "guardfile" | "capfile" => return "ruby",
         "jenkinsfile" => return "groovy",
-        "nginx.conf" => return "nginx",
         // Bazel / Buck 的 Starlark 是 Python 子集
         "build" | "build.bazel" | "workspace" | "workspace.bazel" | "buck" => return "python",
         ".editorconfig" | ".gitconfig" | ".gitmodules" | ".npmrc" | ".yarnrc" => return "ini",
@@ -274,10 +273,6 @@ pub fn language_for(file_name: &str) -> &'static str {
         }
         ".clang-format" | ".clang-tidy" | ".clangd" => return "yaml",
         _ => {}
-    }
-    // `requirements.txt` / `requirements-dev.txt` / `dev-requirements.txt`
-    if name.contains("requirements") && name.ends_with(".txt") {
-        return "requirements";
     }
     // `.env` / `.env.local` / `.env.production`:KEY=VALUE,bash 语法照单全收
     if name == ".env" || name.starts_with(".env.") {
@@ -331,26 +326,14 @@ pub fn language_for(file_name: &str) -> &'static str {
         | "targets" | "config" | "manifest" | "ps1xml" | "pom" | "iml" | "storyboard" | "xib"
         | "ui" | "qrc" | "wxs" | "opml" | "rss" | "atom" | "fxml" | "xcscheme"
         | "xcworkspacedata" | "xcprivacy" | "entitlements" => "xml",
-        "dtd" => "dtd",
         "dart" => "dart",
-        "hs" => "haskell",
-        "ml" => "ocaml",
-        "mli" => "ocaml_interface",
-        "tf" | "tfvars" | "hcl" | "nomad" => "hcl",
-        "nix" => "nix",
-        "r" => "r",
-        "rmd" => "markdown",
         "groovy" | "gradle" | "gvy" | "gy" | "gsh" => "groovy",
-        "ini" | "cfg" | "conf" | "reg" | "service" | "socket" | "timer" | "desktop" | "flake8"
-        | "pylintrc" | "gitconfig" => "ini",
-        "erl" | "hrl" | "escript" => "erlang",
-        "s" | "asm" | "nasm" => "asm",
-        "fs" | "fsi" | "fsx" | "fsscript" => "fsharp",
-        "pas" | "pp" | "dpr" | "dpk" | "lpr" => "pascal",
-        "properties" => "properties",
+        // key=value 一族:ini 语法允许节前裸键,.properties / systemd unit / .desktop 都吃得下
+        "ini" | "cfg" | "conf" | "reg" | "properties" | "service" | "socket" | "timer"
+        | "desktop" | "flake8" | "pylintrc" | "gitconfig" => "ini",
         "bat" | "cmd" => "batch",
-        "svelte" => "svelte",
-        "j2" | "jinja" | "jinja2" => "jinja2",
+        // 模板类没有专属语法,退到 html:标签与 <script> / <style> 照常上色
+        "svelte" | "j2" | "jinja" | "jinja2" => "html",
         _ => "text",
     }
 }
