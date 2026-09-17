@@ -105,6 +105,7 @@ mod ssh_panel;
 mod ssh_registry;
 mod startup_trace;
 mod store;
+mod syntax_languages;
 mod tab_expansion;
 mod terminal_area;
 mod terminals_panel;
@@ -2092,6 +2093,9 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
+        // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。
+        // 只是往注册表放字符串,毫秒级;必须早于任何文件页签建出来。
+        syntax_languages::register();
         // 预览器里的图片要靠它取字节:gpui 默认装 `NullHttpClient`(什么都发不出),
         // 而富文本渲染器把图片一律画成 `img(SharedUri)` —— 本地图片走 `file://`
         // (md / html 源里的相对路径在渲染前被改写成绝对 file URL),网络图片走

@@ -1174,55 +1174,93 @@ fn 语言按扩展名映射到组件库认得的名字() {
     assert_eq!(language_for("Makefile"), "make");
     assert_eq!(language_for("CMakeLists.txt"), "cmake");
     assert_eq!(language_for("Dockerfile"), "bash");
+    assert_eq!(language_for("Cargo.lock"), "toml");
+    assert_eq!(language_for("Gemfile"), "ruby");
+    assert_eq!(language_for("Jenkinsfile"), "groovy");
+    assert_eq!(language_for(".editorconfig"), "ini");
+    assert_eq!(language_for(".prettierrc"), "json");
+    assert_eq!(language_for(".env"), "bash");
+    assert_eq!(language_for(".env.local"), "bash");
+    // 补充语言包
+    assert_eq!(language_for("Program.cs"), "csharp");
+    assert_eq!(language_for("index.php"), "php");
+    assert_eq!(language_for("Main.kt"), "kotlin");
+    assert_eq!(language_for("build.gradle.kts"), "kotlin");
+    assert_eq!(language_for("init.lua"), "lua");
+    assert_eq!(language_for("deploy.ps1"), "powershell");
+    assert_eq!(language_for("App.csproj"), "xml");
+    assert_eq!(language_for("MainWindow.xaml"), "xml");
+    assert_eq!(language_for("main.dart"), "dart");
+    assert_eq!(language_for("build.gradle"), "groovy");
+    assert_eq!(language_for("setup.cfg"), "ini");
+    assert_eq!(language_for("run.bat"), "batch");
+    assert_eq!(language_for("app.properties"), "ini");
+    // 没有专属语法包的退到近似语言
+    assert_eq!(language_for("App.vue"), "html");
+    assert_eq!(language_for("App.svelte"), "html");
+    assert_eq!(language_for("Index.cshtml"), "html");
+    assert_eq!(language_for("style.scss"), "css");
+    assert_eq!(language_for("BUILD.bazel"), "python");
+    // 冷门语言不接:主流之外一律纯文本(用户 2026-09-17 定的口径)
+    assert_eq!(language_for("main.hs"), "text");
+    assert_eq!(language_for("main.tf"), "text");
     // 认不出 → 纯文本(原版「匹配不到就是纯文本」)
     assert_eq!(language_for("notes.xyz"), "text");
     assert_eq!(language_for("LICENSE"), "text");
 }
 
 #[test]
-fn 映射出来的语言名组件库全都认得() {
-    // 认不得会静默退成 Plain,画出来没有高亮而编译期无感 —— 用它自己的
-    // `from_str` 钉住:除了 "text",每个名字都要落到非 Plain 的分支
-    use gpui_component::highlighter::Language;
-    for name in [
-        "rust",
-        "typescript",
-        "tsx",
-        "javascript",
-        "json",
-        "python",
-        "go",
-        "ruby",
-        "java",
-        "csharp",
-        "c",
-        "cpp",
-        "css",
-        "html",
-        "bash",
-        "toml",
-        "yaml",
-        "markdown",
-        "sql",
-        "swift",
-        "zig",
-        "elixir",
-        "scala",
-        "proto",
-        "graphql",
-        "diff",
-        "cmake",
-        "ejs",
-        "erb",
-        "make",
-    ] {
-        assert_ne!(
-            Language::from_str(name).name(),
-            Language::Plain.name(),
-            "组件库不认得语言名 {name}"
+fn 映射出来的语言名注册表全都认得() {
+    // 认不得会静默退成纯文本,画出来没有高亮而编译期无感 —— 把 `language_for`
+    // 全部可能的返回值(从源码 match 臂里扫出来)逐个去注册表查一遍
+    use gpui_component::highlighter::LanguageRegistry;
+    crate::syntax_languages::register();
+    let registry = LanguageRegistry::singleton();
+    let source = include_str!("file_viewer.rs");
+    let body = source
+        .split("pub fn language_for(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("找不到 language_for 的函数体");
+    let mut names: Vec<&str> = body
+        .split("=> ")
+        .skip(1)
+        .filter_map(|arm| {
+            // `=> "rust",` / `=> return "make",` / `=> {\n return "json";` 三种写法
+            let mut arm = arm.trim_start();
+            loop {
+                let trimmed = arm
+                    .trim_start_matches("return ")
+                    .trim_start_matches('{')
+                    .trim_start();
+                if trimmed == arm {
+                    break;
+                }
+                arm = trimmed;
+            }
+            let rest = arm.strip_prefix('"')?;
+            rest.split('"').next()
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert!(
+        names.len() > 30,
+        "只扫出 {} 个名字,扫描逻辑坏了: {names:?}",
+        names.len()
+    );
+    for name in names {
+        if name == "text" {
+            continue;
+        }
+        let config = registry
+            .language(name)
+            .unwrap_or_else(|| panic!("注册表不认得语言名 {name}"));
+        assert!(
+            !config.highlights.is_empty(),
+            "语言 {name} 注册了但高亮查询是空的(组件库那五个漏网之鱼?)"
         );
     }
-    assert_eq!(Language::from_str("text").name(), Language::Plain.name());
 }
 
 #[test]
