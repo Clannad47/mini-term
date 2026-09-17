@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.13-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.14-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -86,7 +86,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,792 Rust tests** (29 test targets) |
+| Tests | **1,805 Rust tests** (29 test targets) |
 
 ---
 
@@ -96,7 +96,7 @@ The whole application is **native Rust**:
 
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
-- **Windows x64 (primary platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files)
+- **Windows x64 (primary platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files; the desktop shortcut is an opt-in checkbox on the components page, and upgrades keep your previous choice)
 - **macOS arm64 (Apple Silicon)** — `Mini-Term_*_aarch64.dmg`
 - **macOS x64 (Intel)** — `Mini-Term_*_x64.dmg`
 - **Linux x64** — `Mini-Term_*_amd64.deb` or `Mini-Term_*_amd64.tar.gz`
