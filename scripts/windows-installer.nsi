@@ -15,6 +15,11 @@
 ; 平铺 $INSTDIR,与便携解压、target\<profile>\ 开发布局同构(「与 exe 同目录」
 ; 定位铁律)。用户数据在 AppData 下,卸载不碰。
 ;
+; 桌面快捷方式是组件页上的可选项(SecDesktop):全新安装默认勾上;升级时沿用
+; 用户上一次的选择 —— .onInit 里看旧桌面快捷方式在不在(那时旧版还没卸),不在
+; 就默认不勾。静默安装(/S)走的就是这个默认值。开始菜单快捷方式始终建,它是
+; 卸载入口之一,不给选。
+;
 ; 编译期必须 /D 传入(全部绝对路径):
 ;   VERSION      完整语义版本(如 1.0.0-beta,进注册表 DisplayVersion)
 ;   VERSION_NUM  纯数字四段(如 1.0.0.0,VIProductVersion 只收这个)
@@ -26,6 +31,8 @@ Unicode true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
+; SelectSection / UnselectSection(.onInit 里按旧现场定桌面快捷方式的默认勾选)
+!include "Sections.nsh"
 
 !ifndef VERSION
   !error "makensis 需要 /DVERSION=<semver>"
@@ -73,6 +80,8 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "mini-term"
 !define MUI_UNICON "${ICON_FILE}"
 !define MUI_ABORTWARNING
 
+; 组件页只有两项(主程序必装 + 桌面快捷方式可选),右侧描述栏照给。
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\mini-term.exe"
@@ -92,6 +101,16 @@ LangString MSG_UNINST_RUN ${LANG_SIMPCHINESE} "正在卸载旧版 ${PRODUCT_NAME
 LangString MSG_UNINST_FAIL ${LANG_ENGLISH} "The old version was not fully removed (uninstaller exit code: $UninstStatus).$\r$\n$\r$\nInstall ${VERSION} anyway (overwriting the existing files)?"
 LangString MSG_UNINST_FAIL ${LANG_SIMPCHINESE} "旧版本没有卸载干净(卸载器退出码:$UninstStatus)。$\r$\n$\r$\n仍要继续安装 ${VERSION} 吗(直接覆盖现有文件)?"
 
+; 组件页的两项名称与描述。
+LangString SEC_MAIN_NAME ${LANG_ENGLISH} "${PRODUCT_NAME} (required)"
+LangString SEC_MAIN_NAME ${LANG_SIMPCHINESE} "${PRODUCT_NAME} 主程序(必装)"
+LangString SEC_MAIN_DESC ${LANG_ENGLISH} "The application, its helper programs and the Start Menu shortcut."
+LangString SEC_MAIN_DESC ${LANG_SIMPCHINESE} "主程序、随附的辅助程序与开始菜单快捷方式。"
+LangString SEC_DESKTOP_NAME ${LANG_ENGLISH} "Desktop shortcut"
+LangString SEC_DESKTOP_NAME ${LANG_SIMPCHINESE} "桌面快捷方式"
+LangString SEC_DESKTOP_DESC ${LANG_ENGLISH} "Create a ${PRODUCT_NAME} shortcut on the desktop."
+LangString SEC_DESKTOP_DESC ${LANG_SIMPCHINESE} "在桌面上创建 ${PRODUCT_NAME} 快捷方式。"
+
 ; 升级前放倒在跑的实例:主程序锁着 exe 没法覆盖;mt-ssh-cli 的 daemon 与
 ; hook 常驻同理(旧 Tauri 版主程序叫 Mini-Term.exe,taskkill 不分大小写,
 ; 同一条命令连旧版一起管住)。没在跑时 taskkill 报错,吞掉即可。
@@ -110,7 +129,8 @@ LangString MSG_UNINST_FAIL ${LANG_SIMPCHINESE} "旧版本没有卸载干净(卸�
 ; %TEMP% 再启动,ExecWait 等到的是那个立即返回的壳,新文件会和卸载动作打架。
 ; 代价是运行中的 uninstall.exe 删不掉自己,残留由本宏补删(旧 Tauri 版的卸载器
 ; 同样是 NSIS 出身,`_?=` 与 /S 都认)。
-; 卸载器会清掉快捷方式与 Uninstall 注册表键,本 Section 后半段原样重建。
+; 卸载器会清掉快捷方式与 Uninstall 注册表键:开始菜单那条与注册表键由 SecMain
+; 后半段原样重建,桌面那条看 SecDesktop 勾没勾。
 !macro UNINSTALL_OLD
   ${If} $OldUninstaller != ""
     DetailPrint "$(MSG_UNINST_RUN)"
@@ -130,8 +150,53 @@ LangString MSG_UNINST_FAIL ${LANG_SIMPCHINESE} "旧版本没有卸载干净(卸�
   ${EndIf}
 !macroend
 
+; 主程序:SectionIn RO = 组件页上灰掉、永远勾着。
+Section "$(SEC_MAIN_NAME)" SecMain
+  SectionIn RO
+  ; 先放倒实例再卸载:旧卸载器同样要动这几个 exe。
+  !insertmacro KILL_RUNNING
+  !insertmacro UNINSTALL_OLD
+
+  SetOutPath "$INSTDIR"
+  File "${SOURCE_DIR}\mini-term.exe"
+  File "${SOURCE_DIR}\miniterm-hook.exe"
+  File "${SOURCE_DIR}\mt-ssh-cli.exe"
+  File "${SOURCE_DIR}\mt-ssh-mcp.exe"
+  SetOutPath "$INSTDIR\portable-conpty"
+  File /r "${SOURCE_DIR}\portable-conpty\*"
+  SetOutPath "$INSTDIR"
+
+  WriteUninstaller "$INSTDIR\uninstall.exe"
+  CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}.lnk" "$INSTDIR\mini-term.exe"
+
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${PRODUCT_NAME}"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\mini-term.exe"
+  WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "mini-term"
+  WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
+  WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
+  WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  IntFmt $0 "0x%08X" $0
+  WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" $0
+SectionEnd
+
+; 桌面快捷方式:可选,默认勾选;升级时的默认值见 .onInit。
+Section "$(SEC_DESKTOP_NAME)" SecDesktop
+  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\mini-term.exe"
+SectionEnd
+
+; 组件页右侧的描述(宏要在 Section 之后展开,它引用 ${SecMain} / ${SecDesktop})。
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "$(SEC_MAIN_DESC)"
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "$(SEC_DESKTOP_DESC)"
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+
 ; 认出已装版本并征得同意。放 .onInit 是为了让用户在第一屏就知道要先卸载;真正
 ; 的卸载动作留到 Section(用户在目录页仍可反悔,反悔时旧版原封不动)。
+; 排在 Section 之后是因为它要引用 ${SecDesktop}(Section 编译到才有这个定义)。
 Function .onInit
   ReadRegStr $0 HKCU "${UNINST_KEY}" "UninstallString"
   ${If} $0 == ""
@@ -163,38 +228,12 @@ Function .onInit
     MessageBox MB_OKCANCEL|MB_ICONINFORMATION "$(MSG_OLD_FOUND)" /SD IDOK IDOK +2
       Abort
   ${EndIf}
+  ; 升级沿用上一次的选择:旧版装过桌面快捷方式就默认勾上,没装(或用户自己删了)
+  ; 就默认不勾。此刻旧版还没卸,桌面上那个 .lnk 就是现场。
+  ${IfNot} ${FileExists} "$DESKTOP\${PRODUCT_NAME}.lnk"
+    !insertmacro UnselectSection ${SecDesktop}
+  ${EndIf}
 FunctionEnd
-
-Section "Install"
-  ; 先放倒实例再卸载:旧卸载器同样要动这几个 exe。
-  !insertmacro KILL_RUNNING
-  !insertmacro UNINSTALL_OLD
-
-  SetOutPath "$INSTDIR"
-  File "${SOURCE_DIR}\mini-term.exe"
-  File "${SOURCE_DIR}\miniterm-hook.exe"
-  File "${SOURCE_DIR}\mt-ssh-cli.exe"
-  File "${SOURCE_DIR}\mt-ssh-mcp.exe"
-  SetOutPath "$INSTDIR\portable-conpty"
-  File /r "${SOURCE_DIR}\portable-conpty\*"
-  SetOutPath "$INSTDIR"
-
-  WriteUninstaller "$INSTDIR\uninstall.exe"
-  CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}.lnk" "$INSTDIR\mini-term.exe"
-  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\mini-term.exe"
-
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${PRODUCT_NAME}"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\mini-term.exe"
-  WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "mini-term"
-  WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
-  WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
-  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
-  IntFmt $0 "0x%08X" $0
-  WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" $0
-SectionEnd
 
 Section "Uninstall"
   !insertmacro KILL_RUNNING
