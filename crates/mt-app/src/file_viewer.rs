@@ -3917,9 +3917,51 @@ impl FileViewer {
         let key = MermaidKey::new(code, cx);
         // 先记后要:use_asset 一旦调用,资源系统里就有了这个 key 的任务
         self.mermaid_requested.get_mut().insert(key.clone());
+        let failure = |id: gpui::SharedString, err: &MermaidError| {
+            let reason = format!("{}: {err}", t("fileViewer", "mermaidRenderFailed"));
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    TextView::markdown(id, fallback.clone())
+                        .style(style.clone())
+                        .selectable(true),
+                )
+                .child(
+                    div()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .child(reason),
+                )
+                .into_any_element()
+        };
         match window.use_asset::<MermaidAsset>(&key, cx) {
+            // 主题切换后同一张图要按新配色重画,期间若换成一张矮矮的占位卡片,
+            // 列表总高一缩、滚动位置就被夹回上面(在文末切主题会被顶回开头,
+            // 真机复现)。旧配色的那份还在缓存里(重切分块前不放):画成功过的
+            // 按它的尺寸把占位撑到同高;失败过的直接照旧画退回的代码块(排版与
+            // 配色无关,新一轮结论必然相同)。首次渲染没有旧图,照旧一张卡片。
             None => {
-                md_image_placeholder(id, t("fileViewer", "mermaidRendering").into(), None, None)
+                let placeholder =
+                    md_image_placeholder(id.clone(), t("fileViewer", "mermaidRendering").into(), None, None);
+                match self.mermaid_sibling_result(&key, cx) {
+                    Some(Ok(data)) => {
+                        let width = image_display_width(&data, true, avail_w);
+                        div()
+                            .w_full()
+                            .h(px(width / image_aspect_ratio(&data)))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(placeholder)
+                            .into_any_element()
+                    }
+                    Some(Err(err)) => failure(id, &err),
+                    None => placeholder,
+                }
             }
             Some(Ok(data)) => {
                 let mut frame = div();
@@ -3936,28 +3978,25 @@ impl FileViewer {
                     )
                     .into_any_element()
             }
-            Some(Err(err)) => {
-                let reason = format!("{}: {err}", t("fileViewer", "mermaidRenderFailed"));
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .child(
-                        TextView::markdown(id, fallback.clone())
-                            .style(style.clone())
-                            .selectable(true),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::font_px(12.0))
-                            .text_color(ui::text_muted())
-                            .child(reason),
-                    )
-                    .into_any_element()
-            }
+            Some(Err(err)) => failure(id, &err),
         }
+    }
+
+    /// 同一张图表另一套配色的渲染结果(还在缓存里的话)。只翻
+    /// [`Self::mermaid_requested`] 里要过的 key —— `fetch_asset` 对没见过的 key
+    /// 会发起渲染,这里只准取现成的。
+    fn mermaid_sibling_result(
+        &self,
+        key: &MermaidKey,
+        cx: &mut App,
+    ) -> Option<<MermaidAsset as gpui::Asset>::Output> {
+        let sibling = self
+            .mermaid_requested
+            .borrow()
+            .iter()
+            .find(|other| other.code == key.code && *other != key)
+            .cloned()?;
+        cx.fetch_asset::<MermaidAsset>(&sibling)
     }
 
     /// 预览里链接的点击回调(挂在每个 `TextView` 上)。组件要 `Send + Sync`,
