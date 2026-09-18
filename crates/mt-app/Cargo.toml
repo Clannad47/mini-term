@@ -56,6 +56,34 @@ tree-sitter-language = "0.1"
 # 避免行级扫描漏掉跨行资源目标或误判代码围栏。该 crate 已由
 # gpui-component 锁定在依赖树中，不会新增第三方包。
 markdown = "1.0"
+# Markdown 预览里 ```mermaid 围栏的图表渲染(issue #80),纯 Rust:Mermaid 文本 →
+# SVG 字符串,不要浏览器 / Node。`default-features = false` 砍掉它自带的 CLI(clap)
+# 与 PNG 输出(resvg 0.47 —— 与 gpui 锁定的 0.46 不同版本,开了就是第二份 resvg);
+# 栅格化见 `file_viewer::rasterize_svg`。
+# 余下依赖(fontdb 0.23 / ttf-parser 0.25 / regex / serde / once_cell)全在树里,
+# 净新增只有 json5(+ucd-trie)。
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+# 上面那份 SVG 的栅格化。gpui-pre 已把 `SvgRenderer::render_single_frame` 公开
+# (它自带 2× 栅格 + BGRA 换通道 + 私有 `scale_factor`),日后可换过去省掉这条
+# 直接依赖;眼下沿用真机验收过的自绘路径(`file_viewer::rasterize_svg`),
+# 位图尺寸与 `image_display_width` 的换算才与本地 SVG 图片那条路一致。
+# **版本与 feature 集逐字照抄 gpui-pre 0.3.5 的声明**(`text` + `system-fonts` +
+# `memmap-fonts` + `raster-images`,关默认 feature),依赖树里因此仍只有一份
+# resvg / usvg / tiny-skia;gpui 升级 resvg 时这里要跟着改,否则就是两份。
+resvg = { version = "0.46", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+    "raster-images",
+] }
+# `image::Frame` / `RgbaImage` 只当 `gpui::RenderImage` 的字节容器(两处:
+# 弹窗毛玻璃快照 frost.rs、Mermaid 图表栅格 file_viewer.rs);版本跟随 gpui
+# 已锁定的那份(0.25.x),不引第二份 image。
+#
+# `png` 是唯一开的编解码后端 —— 剪贴板图片(clipboard::win)要把 CF_DIB 的
+# 裸像素编成 PNG 落盘。**只要编码器**,解码谁也不用(gpui 那条路拿到的本来
+# 就是编好的字节,原样写盘)。
+image = { version = "0.25", default-features = false, features = ["png"] }
 mt-ui.workspace = true
 mt-terminal.workspace = true
 mt-pty.workspace = true
@@ -177,13 +205,6 @@ windows = { version = "0.61", features = [
 ] }
 # 从 gpui 的 Window 取 HWND。
 raw-window-handle = "0.6"
-# 弹窗毛玻璃快照(frost.rs):只用 Frame/RgbaImage 当 RenderImage 的字节容器;
-# 版本跟随 gpui 已锁定的那份(0.25.x),不引第二份 image。
-#
-# `png` 是唯一开的编解码后端 —— 剪贴板图片(clipboard::win)要把 CF_DIB 的
-# 裸像素编成 PNG 落盘。**只要编码器**,解码谁也不用(gpui 那条路拿到的本来
-# 就是编好的字节,原样写盘)。
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # exe 图标与版本资源嵌入(见 build.rs)。build-dependencies 的 cfg 判的是

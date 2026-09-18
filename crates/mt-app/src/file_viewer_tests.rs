@@ -554,6 +554,151 @@ fn 纯图片段落自绘_混合段落保留给_textview() {
 }
 
 #[test]
+fn mermaid_围栏_只拆顶层_其余围栏与容器内的照走_textview() {
+    // issue #80 的最小样例:顶层围栏拆成 Mermaid 段,code 是围栏内文本、raw 含反引号行
+    let src = "前文\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n\n后文";
+    let segs = split_md_blocks(src);
+    assert_eq!(segs.len(), 3, "{segs:?}");
+    let MdSegment::Mermaid { code, raw } = &segs[1] else {
+        panic!("第二段应是 mermaid:{segs:?}");
+    };
+    assert_eq!(code, "graph TD\n    A[开始] --> B[结束]");
+    assert!(
+        raw.starts_with("```mermaid\n") && raw.ends_with("```"),
+        "{raw:?}"
+    );
+    assert!(matches!(&segs[0], MdSegment::Text(t) if t == "前文"));
+    assert!(matches!(&segs[2], MdSegment::Text(t) if t == "后文"));
+    // 图表块与图片 / 表格同档间距
+    assert_eq!(block_top_margin(1, &segs[1]), 13.0);
+
+    // info string 大小写放宽、带空格也认;别的语言与无语言围栏不拆;`mermaid-js`
+    // 这类方言后缀不认
+    assert!(is_mermaid_fence(Some("mermaid")));
+    assert!(is_mermaid_fence(Some("Mermaid")));
+    assert!(is_mermaid_fence(Some(" mermaid ")));
+    assert!(!is_mermaid_fence(Some("mermaid-js")));
+    assert!(!is_mermaid_fence(Some("rust")));
+    assert!(!is_mermaid_fence(None));
+    for src in [
+        "```\ngraph TD\nA-->B\n```",
+        "```rust\nfn main() {}\n```",
+        "~~~mermaid-js\nA-->B\n~~~",
+    ] {
+        let segs = split_md_blocks(src);
+        assert!(
+            matches!(segs.as_slice(), [MdSegment::Text(_)]),
+            "非 mermaid 围栏不得拆出图表段:{src:?} {segs:?}"
+        );
+    }
+    // `~~~` 围栏与 ``` 等价
+    let segs = split_md_blocks("~~~mermaid\ngraph LR\nA-->B\n~~~");
+    assert!(
+        matches!(segs.as_slice(), [MdSegment::Mermaid { code, .. }] if code == "graph LR\nA-->B"),
+        "{segs:?}"
+    );
+
+    // 列表项 / 引用块里的围栏随容器整块交给 TextView,不拆
+    for src in [
+        "- 一项\n\n  ```mermaid\n  graph TD\n  A-->B\n  ```",
+        "> ```mermaid\n> graph TD\n> A-->B\n> ```",
+    ] {
+        let segs = split_md_blocks(src);
+        assert!(
+            segs.iter()
+                .all(|segment| matches!(segment, MdSegment::Text(_))),
+            "容器内的 mermaid 围栏不得拆出图表段:{src:?} {segs:?}"
+        );
+    }
+    // 缩进代码块里的「```mermaid」是代码文本
+    let segs = split_md_blocks("    ```mermaid\n    graph TD\n    ```");
+    assert!(matches!(segs.as_slice(), [MdSegment::Text(_)]), "{segs:?}");
+}
+
+fn mermaid_key(code: &str, dark: bool) -> MermaidKey {
+    MermaidKey {
+        code: code.into(),
+        dark,
+        background: 0x1E1E2E,
+    }
+}
+
+#[test]
+fn mermaid_渲染_合法图表出_svg_且底色跟主题() {
+    let key = mermaid_key("graph TD\n    A[开始] --> B[结束]", false);
+    let svg = render_mermaid_svg(&key).expect("issue #80 的样例必须渲染成功");
+    assert!(svg.starts_with("<svg"), "{}", &svg[..svg.len().min(80)]);
+    assert!(
+        svg.contains("开始") && svg.contains("结束"),
+        "中文标签要原样进 SVG"
+    );
+    // 画布底色是 key 里的主题底色,不是 mermaid 自带的白 / #333
+    assert!(
+        svg.contains("fill=\"#1E1E2E\""),
+        "{}",
+        &svg[..svg.len().min(400)]
+    );
+    let dark = render_mermaid_svg(&mermaid_key("sequenceDiagram\n    A->>B: hi", true)).unwrap();
+    assert!(dark.contains("fill=\"#1E1E2E\""));
+
+    // 同一份图表栅格化后尺寸 = SVG 标称尺寸 × 2(与 gpui 的 svg 图片同倍率,
+    // image_display_width 按 is_svg 除回去才是逻辑宽)
+    let image = render_mermaid_image(&key).unwrap();
+    let size = image.size(0);
+    assert!(size.width.0 > 32 && size.height.0 > 32, "{size:?}");
+    let nominal =
+        mermaid_rs_renderer::measure(&key.code, mermaid_rs_renderer::RenderOptions::default())
+            .unwrap();
+    assert_eq!(size.width.0, (nominal.width * MERMAID_RASTER_SCALE) as i32);
+    assert_eq!(
+        size.height.0,
+        (nominal.height * MERMAID_RASTER_SCALE) as i32
+    );
+    // 底色像素:直通 BGRA(不透明底不受去预乘影响),B 在前
+    let bytes = image.as_bytes(0).unwrap();
+    assert_eq!(&bytes[..4], &[0x2E, 0x1E, 0x1E, 0xFF]);
+}
+
+#[test]
+fn mermaid_渲染_残缺与空图退回失败() {
+    // 解析器对没闭合的括号不报错、只排出 16×16 的空画布 —— 必须按失败处理
+    let err = render_mermaid_svg(&mermaid_key("graph TD\n    A[开始 --> B", false))
+        .expect_err("空画布必须报失败,否则预览里是一块什么都没有的空白");
+    assert_eq!(err.to_string(), t("fileViewer", "mermaidEmptyDiagram"));
+    // 校验器认得的硬错误(subgraph 没 end)走 ParseError
+    assert!(
+        render_mermaid_svg(&mermaid_key("graph TD\n    subgraph x\n    A-->B", false)).is_err()
+    );
+    // 空文本
+    assert!(render_mermaid_svg(&mermaid_key("", false)).is_err());
+    assert!(render_mermaid_svg(&mermaid_key("   \n", false)).is_err());
+}
+
+#[test]
+fn mermaid_像素_去预乘并交换红蓝() {
+    // 半透明红(预乘后 R=128,A=128)→ 直通 BGRA:B=0,G=0,R≈255,A=128
+    // (除法后截断而不是四舍五入,与 gpui 原函数一致,差 1 不算错)
+    let mut pixel = [128u8, 0, 0, 128];
+    unpremultiply_rgba_to_bgra(&mut pixel);
+    assert!(matches!(pixel, [0, 0, 254..=255, 128]), "{pixel:?}");
+    // 全透明不动通道值(除零)
+    let mut clear = [10u8, 20, 30, 0];
+    unpremultiply_rgba_to_bgra(&mut clear);
+    assert_eq!(clear, [30, 20, 10, 0]);
+    // 不透明只交换
+    let mut opaque = [0x11u8, 0x22, 0x33, 0xFF];
+    unpremultiply_rgba_to_bgra(&mut opaque);
+    assert_eq!(opaque, [0x33, 0x22, 0x11, 0xFF]);
+
+    assert_eq!(rgb_u32(gpui::rgb(0x1E1E2E).into()), 0x1E1E2E);
+    assert_eq!(
+        rgb_u32(gpui::rgba(0xFFFFFF80).into()),
+        0xFFFFFF,
+        "alpha 丢掉"
+    );
+}
+
+#[test]
 fn 远程图片必须先获批准_本地图片保持自动加载() {
     assert!(!markdown_image_can_load(true, false));
     assert!(markdown_image_can_load(true, true));
