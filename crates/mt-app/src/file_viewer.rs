@@ -2288,7 +2288,8 @@ fn render_mermaid_image(key: &MermaidKey) -> Result<Arc<gpui::RenderImage>, Merm
         .map_err(|err| MermaidError(err.to_string().into()))?;
     let (width, height) = (pixmap.width(), pixmap.height());
     let mut bytes = pixmap.take();
-    for pixel in bytes.chunks_exact_mut(4) {
+    // 像素宽度是常量,按 clippy 1.98 的 `chunks_exact_to_as_chunks` 用定长切片
+    for pixel in bytes.as_chunks_mut::<4>().0 {
         unpremultiply_rgba_to_bgra(pixel);
     }
     let buffer = image::RgbaImage::from_raw(width, height, bytes)
