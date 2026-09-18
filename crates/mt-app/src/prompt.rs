@@ -32,12 +32,45 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::WindowExt as _;
-use gpui_component::dialog::{Dialog, DialogButtonProps};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::{Cancel, Dialog, DialogFooter};
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::{t, tr};
 use crate::overlay;
 use crate::ui;
+
+// ─── 页脚按钮 ─────────────────────────────────────────────────
+
+/// 「取消 / 确定」页脚(`cancel` 为 `None` 时只有「确定」)。
+///
+/// gpui-component 0.6 的 `Dialog` 不再有 `.confirm()` / `.alert()`——自动页脚
+/// 只剩 `AlertDialog` 有,而它的 `build_surface` 是 crate 私有,套不进
+/// [`open_guarded`] 的 `Dialog → Dialog` 签名。这里按 0.5.1 的原样自绘:
+/// 按钮不直接调回调,而是派发 `Confirm` / `Cancel` 动作,由 Dialog 自己走
+/// `on_ok` / `on_cancel` → 关闭的既有路径(Enter / Esc 也走同一条)。
+pub fn confirm_footer<S: Into<SharedString>>(
+    ok: impl Into<SharedString>,
+    cancel: Option<S>,
+) -> DialogFooter {
+    DialogFooter::new()
+        .children(cancel.map(|cancel| {
+            Button::new("cancel")
+                .label(cancel.into())
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
+        }))
+        .child(
+            Button::new("ok")
+                .label(ok)
+                .primary()
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(gpui_component::dialog::Confirm { secondary: false }),
+                        cx,
+                    )
+                }),
+        )
+}
 
 // ─── 防叠开 ───────────────────────────────────────────────────
 
@@ -249,14 +282,12 @@ pub fn show_prompt(
         dialog
             .title(title.clone())
             .w(px(360.0))
-            .confirm()
             // 遮罩点击 = 取消(原版 prompt-overlay 的点击行为)
             .overlay_closable(true)
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(t("prompt", "confirm"))
-                    .cancel_text(t("prompt", "cancel")),
-            )
+            .footer(confirm_footer(
+                t("prompt", "confirm"),
+                Some(t("prompt", "cancel")),
+            ))
             .child(div().px(px(20.0)).child(Input::new(&input)))
             .on_ok(move |_: &ClickEvent, window, cx| {
                 let value = input_for_ok.read(cx).value().to_string();
@@ -321,13 +352,11 @@ impl Confirm {
                 .title(self.title.clone())
                 // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
                 .w(px(360.0))
-                .confirm()
                 .overlay_closable(true)
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(self.ok_text.clone())
-                        .cancel_text(self.cancel_text.clone()),
-                )
+                .footer(confirm_footer(
+                    self.ok_text.clone(),
+                    Some(self.cancel_text.clone()),
+                ))
                 .child(body(&self.message, &self.detail))
                 .on_ok(move |_: &ClickEvent, window, cx| {
                     on_ok(window, cx);
@@ -354,8 +383,7 @@ pub fn show_alert(
             .title(title.clone())
             // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
             .w(px(360.0))
-            .alert()
-            .button_props(DialogButtonProps::default().ok_text(t("prompt", "ok")))
+            .footer(confirm_footer(t("prompt", "ok"), None::<SharedString>))
             .child(body(&message, &[]))
     });
 }

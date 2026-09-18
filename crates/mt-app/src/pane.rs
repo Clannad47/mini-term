@@ -301,8 +301,8 @@ impl TerminalPane {
                 // 重绘交给全局节拍器:多个 pane 一起刷屏也只出一帧,窗口在后台
                 // 时还会自动降到 5fps。**这里不再自己 `notify`** —— 缘由见
                 // `crate::redraw` 的模块注释。
-                if exit.is_none() && cx.update(|cx| redraw::request(this.clone(), cx)).is_err() {
-                    return;
+                if exit.is_none() {
+                    cx.update(|cx| redraw::request(this.clone(), cx));
                 }
                 cx.background_executor().timer(DRAIN_PERIOD).await;
             }
@@ -483,7 +483,7 @@ impl TerminalPane {
             return;
         }
         overlay::pop(overlay::terminal_search(self.pty_id));
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -768,8 +768,8 @@ impl TerminalPane {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
     }
 
     /// 注册 SSH 密码自动填充(原版的 `arm_ssh_autofill` command)。
@@ -1351,7 +1351,7 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
                 let line = format!("{command}\r");
                 terminal.update(cx, |pane, cx| pane.write(line.as_bytes(), cx));
                 // 写完把键盘还给终端(原版 `term.focus()`)
-                terminal.read(cx).focus(window);
+                terminal.update(cx, |pane, cx| pane.focus(window, cx));
             });
         })
         .detach();
@@ -1470,7 +1470,7 @@ impl Render for TerminalPane {
                         menu::item(t("terminal", "paste"), move |window, cx| {
                             view_paste.update(cx, |view, cx| view.request_paste(window, cx));
                             // 粘完把键盘还给终端(原版 `term.focus()`)
-                            window.focus(&focus);
+                            window.focus(&focus, cx);
                         }),
                     ];
                     // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿

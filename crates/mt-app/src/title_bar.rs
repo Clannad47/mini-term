@@ -477,7 +477,7 @@ impl TitleBar {
             return;
         }
         self.prev_focus = window.focused(cx);
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.switcher_open = true;
         cx.notify();
     }
@@ -489,7 +489,7 @@ impl TitleBar {
         }
         self.switcher_open = false;
         if let Some(prev) = self.prev_focus.take() {
-            window.focus(&prev);
+            window.focus(&prev, cx);
         }
         cx.notify();
     }

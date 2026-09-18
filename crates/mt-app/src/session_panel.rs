@@ -279,7 +279,7 @@ fn format_message_time(iso: &str) -> Option<String> {
 fn preview_text_style(cx: &mut App) -> TextViewStyle {
     let mut code_block = gpui::StyleRefinement::default();
     {
-        let text = code_block.text.get_or_insert_default();
+        let text = &mut code_block.text;
         text.font_size = Some(ui::font_px(11.0).into());
         text.line_height = Some(gpui::relative(1.5).into());
     }
@@ -840,7 +840,7 @@ impl SessionPanel {
     fn render_preview(
         &mut self,
         preview_title: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(preview) = self.preview.as_ref() else {
@@ -944,8 +944,6 @@ impl SessionPanel {
                                     // id 带会话 id:换会话看时不复用上一份的解析缓存
                                     SharedString::from(format!("session-msg-{session_key}-{ix}")),
                                     rendered_content,
-                                    window,
-                                    cx,
                                 )
                                 .style(text_style.clone())
                                 .selectable(true),

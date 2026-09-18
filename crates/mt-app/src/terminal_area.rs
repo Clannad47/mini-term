@@ -839,7 +839,7 @@ impl TerminalArea {
             .update(cx, |store, cx| store.refresh_markers_for_pty(pty_id, cx));
         self.marker_open = Some((pane_id.to_string(), pty_id));
         self.marker_prev_focus = window.focused(cx);
-        window.focus(&self.marker_focus);
+        window.focus(&self.marker_focus, cx);
         cx.notify();
     }
 
@@ -850,7 +850,7 @@ impl TerminalArea {
         }
         overlay::pop(overlay::key(overlay::kind::MARKER_LIST));
         if let Some(prev) = self.marker_prev_focus.take() {
-            window.focus(&prev);
+            window.focus(&prev, cx);
         }
         cx.notify();
     }
@@ -2240,12 +2240,14 @@ impl TerminalArea {
                             offset: point(px(0.0), px(0.0)),
                             blur_radius: px(6.0),
                             spread_radius: px(0.0),
+                            inset: false,
                         },
                         gpui::BoxShadow {
                             color: ui::accent(),
                             offset: point(px(0.0), px(0.0)),
                             blur_radius: px(2.0),
                             spread_radius: px(0.0),
+                            inset: false,
                         },
                     ])
             }))
@@ -2981,6 +2983,7 @@ pub(crate) fn click_count(event: &ClickEvent) -> usize {
     match event {
         ClickEvent::Mouse(e) => e.up.click_count,
         ClickEvent::Keyboard(_) => 1,
+        ClickEvent::Touch(e) => e.tap_count,
     }
 }
 
@@ -2990,6 +2993,7 @@ pub(crate) fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point
     match event {
         ClickEvent::Mouse(e) => e.up.position,
         ClickEvent::Keyboard(_) => window.mouse_position(),
+        ClickEvent::Touch(e) => e.position,
     }
 }
 

@@ -503,7 +503,9 @@ impl Element for MiniTerminalElement {
                 {
                     continue;
                 }
-                _ = piece.line.paint(at, line_height, window, cx);
+                _ = piece
+                    .line
+                    .paint(at, line_height, gpui::TextAlign::Left, None, window, cx);
             }
         });
     }

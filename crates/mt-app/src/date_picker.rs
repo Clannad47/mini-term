@@ -186,7 +186,7 @@ impl DatePicker {
         overlay::push(overlay::key(overlay::kind::DATE_PICKER));
         let prev_focus = window.focused(cx);
         let focus = cx.focus_handle();
-        window.focus(&focus);
+        window.focus(&focus, cx);
         Self {
             anchor,
             month: month_start(selected.unwrap_or(today)),
@@ -213,14 +213,14 @@ impl DatePicker {
 
     /// 还焦点。三条关闭路(点外 / Esc / 选中)共用 —— 与 `menu.rs` 同一条纪律:
     /// **先还焦点再发事件**,宿主收到事件后可能立刻聚焦别的输入框,反过来会被抢。
-    fn restore_focus(&mut self, window: &mut Window) {
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut App) {
         if let Some(prev) = self.prev_focus.take() {
-            window.focus(&prev);
+            window.focus(&prev, cx);
         }
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.restore_focus(window);
+        self.restore_focus(window, cx);
         cx.emit(DatePickerEvent::Dismissed);
     }
 
@@ -228,7 +228,7 @@ impl DatePicker {
         if !self.in_range(date) {
             return;
         }
-        self.restore_focus(window);
+        self.restore_focus(window, cx);
         cx.emit(DatePickerEvent::Picked(date));
     }
 

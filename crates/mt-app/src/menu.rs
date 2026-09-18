@@ -109,7 +109,7 @@ use gpui::{
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
     div, point, prelude::FluentBuilder, px, relative,
 };
-use gpui_component::scroll::{Scrollbar, ScrollbarShow};
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::overlay;
 use crate::ui;
@@ -376,7 +376,7 @@ pub fn show_with(
         // 上一个菜单的滚动位置不带进这一个(见 `scrolls` 的字段注释)
         menu.scrolls.borrow_mut().clear();
         let focus = cx.focus_handle();
-        window.focus(&focus);
+        window.focus(&focus, cx);
         menu.open = Some(OpenMenu {
             position,
             options,
@@ -633,7 +633,7 @@ impl ContextMenu {
         };
         overlay::pop(overlay::key(overlay::kind::MENU));
         if let Some(prev) = open.prev_focus {
-            window.focus(&prev);
+            window.focus(&prev, cx);
         }
         cx.notify();
     }
@@ -909,7 +909,7 @@ impl ContextMenu {
             // (首帧为零,菜单进场动画会驱动下一帧补上)。阈值不取 0 的理由见
             // `SCROLLBAR_EPSILON`;`Scrollbar` 自己那道「不溢出就不画」比这道
             // 松,所以由这道说了算 —— 不满足时它压根不进元素树。
-            let overflowing = handle.max_offset().height > SCROLLBAR_EPSILON;
+            let overflowing = handle.max_offset().y > SCROLLBAR_EPSILON;
             let list = list
                 .track_scroll(&handle)
                 .when(overflowing, |el| el.pr(SCROLLBAR_GUTTER))
@@ -932,7 +932,7 @@ impl ContextMenu {
                             .child(
                                 Scrollbar::vertical(&handle)
                                     .id(scrollbar_id(&ancestors))
-                                    .scrollbar_show(ScrollbarShow::Always),
+                                    .mode(ScrollbarMode::Always),
                             ),
                     )
                 })

@@ -32,6 +32,7 @@ export const fileViewer = {
     remoteDownloadHint: "此类远程文件暂不支持内置预览，可下载后查看。",
     remoteImageClickToLoad: "点击加载远程图片",
     remoteRelativeImage: "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片",
+    linkTargetMissing: "链接指向的文件不存在",
   },
   en: {
     preview: "Preview",
@@ -66,5 +67,6 @@ export const fileViewer = {
     remoteDownloadHint: "This remote file cannot be previewed here yet. Download it to view it.",
     remoteImageClickToLoad: "Click to load remote image",
     remoteRelativeImage: "Remote Markdown can only load absolute HTTP(S) images on demand",
+    linkTargetMissing: "The linked file does not exist",
   },
 } as const;

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 859;
+pub const ZH_ENTRY_COUNT: usize = 860;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 859;
+pub const EN_ENTRY_COUNT: usize = 860;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -415,6 +415,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("externallyChanged", "文件已被外部修改"),
     ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
+    ("linkTargetMissing", "链接指向的文件不存在"),
     ("loading", "加载中..."),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
@@ -450,6 +451,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("externallyChanged", "File was modified externally"),
     ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
+    ("linkTargetMissing", "The linked file does not exist"),
     ("loading", "Loading..."),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),

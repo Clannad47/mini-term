@@ -239,18 +239,15 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
         !std::mem::replace(&mut pump.running, true)
     });
     if start_pump {
+        // gpui-pre 的 `AsyncApp::update` 不再会失败:App 退出时这个任务连同
+        // 循环一起被丢弃,不必再有「App 没了就收 running」的尾巴。
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(PULSE_TICK).await;
-                // App 没了(退出中)就把 running 收干净再走
-                let Ok(stop) = cx.update(pulse_tick) else {
-                    break;
-                };
-                if stop {
+                if cx.update(pulse_tick) {
                     return;
                 }
             }
-            PULSE.with(|pump| pump.borrow_mut().running = false);
         })
         .detach();
     }

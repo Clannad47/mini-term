@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
+gpui_platform.workspace = true
 # `tree-sitter-languages` 是文件预览器(`file_viewer.rs`)语法高亮的唯一来源:
 # 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
 # (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
@@ -22,8 +23,9 @@ gpui.workspace = true
 # `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 # ---- 语法高亮补充语言包(`syntax_languages.rs`)----
-# 组件库那 30 种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
-# 打开 .cs 整篇纯文本色;PHP / Kotlin / Lua / PowerShell / XML 这些常见类型它根本没有。
+# 组件库那 30 余种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
+# 打开 .cs 整篇纯文本色;PowerShell / XML / Dart 这些常见类型它根本没有
+# (PHP / Lua 自 0.6 起组件库内置且带查询,不再由这里补;Kotlin 内置的查询是坏的,仍补)。
 # 下面分两组:
 #  1. 已在依赖树里的五个(gpui-component 拉进来的),这里只是为了拿解析器常量与
 #     `HIGHLIGHTS_QUERY`,版本号与 Cargo.lock 里的一致,净新增 crate = 0;
@@ -38,9 +40,9 @@ tree-sitter-swift = "0.7"
 tree-sitter-cmake = "0.7"
 tree-sitter-proto = "0.2"
 tree-sitter-graphql = "0.1"
-tree-sitter-php = "0.24"
+# kotlin:组件库 0.6 内置的那份查询编不过(见 syntax_languages.rs),仍由这里覆盖;
+# 版本与组件库拉的同一个,净新增 crate = 0。
 tree-sitter-kotlin-sg = "0.4"
-tree-sitter-lua = "0.5"
 tree-sitter-powershell = "0.26"
 tree-sitter-xml = "0.7"
 tree-sitter-dart = "0.2"
@@ -130,7 +132,7 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
 [dev-dependencies]
 # 语言包单测要亲手 `Query::new` 把每份高亮查询编一遍:组件库那条路编不过只会
 # `tracing::warn` 后静默退成纯文本,编译期与测试期都无感。已在树里,零新增。
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 # 端到端验颜色要喂 `SyntaxHighlighter::update(&Rope)`;版本钉死跟组件库一致。
 ropey = "=2.0.0-beta.1"
 
@@ -138,7 +140,7 @@ ropey = "=2.0.0-beta.1"
 # Linux 的窗口后端不在 gpui 默认 feature 里(Windows / macOS 默认即可),
 # 不开的话构建出来没有任何 windowing 实现。feature 是可加的,workspace
 # 依赖之上追加不动根 manifest(与 gpui-component 的 tree-sitter 同一手法)。
-gpui = { workspace = true, features = ["x11", "wayland"] }
+gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。

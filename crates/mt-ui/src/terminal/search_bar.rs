@@ -302,7 +302,7 @@ impl TerminalSearchBar {
     /// `pub(super)` 的。action 要等输入框进了 dispatch 树才有人接,
     /// 所以推迟到下一帧发。
     pub fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.focus_handle(cx).focus(window);
+        self.input.focus_handle(cx).focus(window, cx);
         window.defer(cx, |window, cx| {
             window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
         });
