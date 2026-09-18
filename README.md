@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.14-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.3.0--pre-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -80,7 +80,7 @@
 
 | 层 | 实现 |
 |---|---|
-| 壳 / 渲染 | GPUI 0.2（Zed 同源框架，GPU 原生渲染，单进程、无 WebView） |
+| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程、无 WebView） |
 | UI | 纯 Rust：gpui-component + 自绘组件 |
 | 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化）· portable-pty |
 | 状态 / 布局 | 单一 Store · 递归 SplitNode 分屏树 |
@@ -88,7 +88,7 @@
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1805 个 Rust 测试**（29 个测试目标） |
+| 测试 | **1809 个 Rust 测试**（29 个测试目标） |
 
 ---
 

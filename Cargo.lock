@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ai"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4750,7 +4750,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "mt-config"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4829,14 +4829,14 @@ dependencies = [
 
 [[package]]
 name = "mt-i18n"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "mt-layout"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "mt-config",
@@ -4847,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "mt-project"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "git2",
@@ -4864,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "mt-pty"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "mt-core",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "mt-relay"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4930,7 +4930,7 @@ dependencies = [
 
 [[package]]
 name = "mt-terminal"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ui"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4956,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "mt-usage"
-version = "1.2.14"
+version = "1.3.0-pre"
 dependencies = [
  "anyhow",
  "chrono",
