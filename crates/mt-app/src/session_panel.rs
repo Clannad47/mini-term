@@ -290,6 +290,13 @@ fn preview_text_style(cx: &mut App) -> TextViewStyle {
         // 抽屉窄,段距按文档视图的 1rem 给会把一条消息撑得很散
         paragraph_gap: gpui::rems(0.5),
         code_block,
+        // 行内 code 与 md 预览同一口径(--accent 橙字 + --bg-elevated 底),
+        // 走 0.6.2 的 inline_code 钩子而不是改全局 accent
+        inline_code: gpui::HighlightStyle {
+            color: Some(ui::accent()),
+            background_color: Some(ui::bg_elevated()),
+            ..Default::default()
+        },
         ..Default::default()
     }
     .heading_font_size(|level, base| match level {

@@ -4271,6 +4271,14 @@ impl FileViewer {
             // 回到组件默认 1rem(16px,也接近原版 ul 的浏览器默认 margin 档)
             paragraph_gap: gpui::rems(1.0),
             code_block,
+            // 行内 code 对齐原版 `.md-preview code`:字 --accent 橙、底 --bg-elevated。
+            // 0.6.2 起 TextViewStyle 有了 inline_code 钩子(设了的字段赢,None 沿用
+            // 主题默认),不再借全局 `Theme.colors.accent` 换底
+            inline_code: gpui::HighlightStyle {
+                color: Some(ui::accent()),
+                background_color: Some(ui::bg_elevated()),
+                ..Default::default()
+            },
             ..Default::default()
         }
         .heading_font_size(|level, base| match level {
