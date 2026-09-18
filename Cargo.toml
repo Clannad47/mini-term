@@ -43,7 +43,7 @@ gpui = { package = "gpui-pre", version = "0.3.5" }
 gpui_platform = { package = "gpui-pre-platform", version = "0.3.5" }
 # 组件库:Resizable(替 Allotment) / Tree(替 FileTree) / TabBar / Modal / Input /
 # Table，以及 JSON 驱动的主题层 + 运行时主题注册表(替自研 theme_packs 的一部分)。
-gpui-component = "0.6.1"
+gpui-component = "0.6.2"
 
 # ---------------------------------------------------------------------------
 # 终端
