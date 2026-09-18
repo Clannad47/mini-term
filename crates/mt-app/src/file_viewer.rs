@@ -48,6 +48,7 @@
 //!    HTML 属于不可信输入，只走源码编辑器，不进入富文本 HTML 渲染器。
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -438,6 +439,11 @@ pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 // 相对路径按当前文件所在目录解析成 `Resource::Path`,见
 // [`split_top_level_image_paragraph`]
 // 与 [`FileViewer::render_md_images`]。
+//
+// **```mermaid 围栏是第三种自绘块**(issue #80):TextView 只会把它当代码块
+// 画出源文本。这里把顶层的 mermaid 围栏拆出来,交给 [`MermaidAsset`] 在后台
+// 线程渲染成位图(Mermaid 文本 → SVG → resvg 栅格化),画法与本地图片同一套框;
+// 渲染失败时退回代码块 + 一行原因,见 [`FileViewer::render_md_mermaid`]。
 
 /// GFM 表格的列对齐(分隔行的 `:---:` 语法)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +479,12 @@ enum MdSegment {
     Table(MdTable),
     /// 一整行的图片(徽章行可能并排多张)
     Images(Vec<MdImage>),
+    /// 顶层 ```mermaid 围栏。`code` 是围栏里的图表文本,`raw` 是整个围栏的
+    /// 原文(含反引号行)—— 渲染失败时按代码块退回 TextView 用它
+    Mermaid {
+        code: String,
+        raw: String,
+    },
 }
 
 /// 预处理好的一块正文:`Text` 里的图片目标已改写成绝对 `file://`
@@ -483,6 +495,12 @@ enum MdBlock {
     Text(gpui::SharedString),
     Table(MdTable),
     Images(Vec<MdImage>),
+    /// 图表文本用 `Arc<str>` 是因为它就是 [`MermaidKey`] 的主体,每帧构 key
+    /// 只加引用计数;`fallback` 是退回代码块时喂 TextView 的原文
+    Mermaid {
+        code: Arc<str>,
+        fallback: gpui::SharedString,
+    },
 }
 
 /// markdown 预览的分块缓存。key 是「源码 + 所在目录」,两者都没变就复用。
@@ -555,6 +573,14 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
                 parse_table_block(raw).map(|table| vec![MdSegment::Table(table)])
             }
             MarkdownNode::Paragraph(_) => split_top_level_image_paragraph(node),
+            // 只认顶层围栏:列表 / 引用里的 mermaid 围栏随容器整块交给 TextView,
+            // 与表格、图片同一口径(容器拆开会把外层结构拆散)
+            MarkdownNode::Code(code) if is_mermaid_fence(code.lang.as_deref()) => {
+                Some(vec![MdSegment::Mermaid {
+                    code: code.value.clone(),
+                    raw: raw.to_string(),
+                }])
+            }
             _ => None,
         };
         if let Some(custom) = custom {
@@ -586,6 +612,13 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
         push_markdown_text(source, text_start, text_end, &mut segs);
     }
     segs
+}
+
+/// 围栏的 info string 是不是 mermaid。GitHub 只认 `mermaid` 一种拼法,这里放宽
+/// 大小写(`Mermaid` 也偶有);`mermaid-js` 之类带后缀的不算 —— 那是别的渲染器
+/// 的方言,画错不如不画。
+fn is_mermaid_fence(lang: Option<&str>) -> bool {
+    lang.is_some_and(|lang| lang.trim().eq_ignore_ascii_case("mermaid"))
 }
 
 fn markdown_requires_shared_definition_scope(node: &MarkdownNode) -> bool {
@@ -1648,8 +1681,8 @@ fn block_top_margin(ix: usize, seg: &MdSegment) -> f32 {
     }
     match seg {
         // 图片与表格同档:原版 `.md-preview img` 吃 p 的 0.8em,块级化之后
-        // 按「独立块」给 1em(≈13px),与表格一致
-        MdSegment::Table(_) | MdSegment::Images(_) => 13.0,
+        // 按「独立块」给 1em(≈13px),与表格一致;mermaid 图表就是一张图
+        MdSegment::Table(_) | MdSegment::Images(_) | MdSegment::Mermaid { .. } => 13.0,
         MdSegment::Text(text) => {
             let first = text.trim_start();
             // `#`~`######` + 空格才是标题(# 后无空格在 CommonMark 里不算)
@@ -1974,6 +2007,192 @@ fn md_image_placeholder(
         .into_any_element()
 }
 
+// ─── mermaid 图表:后台渲染成位图,挂在 gpui 资源系统上 ─────────────
+
+/// [`MermaidAsset`] 的键。配色进 key 是因为亮 / 暗主题切换后同一份图表要
+/// 重画(底色、线色、字色全跟着主题走),而 gpui 的资源缓存只认 key。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MermaidKey {
+    code: Arc<str>,
+    dark: bool,
+    /// 画布底色 `0xRRGGBB`:取文档页的底色,让图表与正文融为一体(mermaid 自带
+    /// 的暗色底 #333 在本应用的暗色页面上是一块突兀的灰板)。取的是 `bg_base`
+    /// 而不是页面实际刷的 `bg_document` —— 后者在背景图皮肤下带透明度,而图表
+    /// 是一张不透明的位图,只能贴不透明的那个底。
+    background: u32,
+}
+
+impl MermaidKey {
+    fn new(code: &Arc<str>, cx: &App) -> Self {
+        Self {
+            code: code.clone(),
+            dark: cx.theme().mode.is_dark(),
+            background: rgb_u32(ui::bg_base()),
+        }
+    }
+}
+
+/// `Hsla` → `0xRRGGBB`(alpha 丢掉:画布底色必须不透明,否则去预乘那步会把
+/// 整张图的颜色算歪)。
+fn rgb_u32(color: gpui::Hsla) -> u32 {
+    let rgba = gpui::Rgba::from(color);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(rgba.r) << 16) | (byte(rgba.g) << 8) | byte(rgba.b)
+}
+
+/// 渲染失败的原因,画在退回的代码块下面(见 [`FileViewer::render_md_mermaid`])。
+#[derive(Clone, Debug)]
+struct MermaidError(Arc<str>);
+
+impl std::fmt::Display for MermaidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Mermaid 图表 → 位图,挂在 gpui 的资源系统上(`window.use_asset`):同一 key
+/// 只渲染一次、后台线程跑、完成后自动重画当前视图 —— 与本地图片那条路
+/// (`ImageAssetLoader`)同一机制,预览里的图表因此也是「先占位、好了换图」。
+///
+/// 两步:`mermaid-rs-renderer` 把图表文本排成 SVG(纯 Rust,用系统字体量字宽),
+/// 再用 resvg 栅格化([`rasterize_svg`],同样是系统字体,中文标签落到微软雅黑
+/// 之类)。栅格倍率照抄 gpui 给 svg 图片的 `SMOOTH_SVG_SCALE_FACTOR`
+/// (见 [`MERMAID_RASTER_SCALE`]),150% / 200% 缩放下不糊;像素格式按
+/// `elements/img.rs` 的 svg 分支处理(去预乘 + RGBA→BGRA)。
+/// **不能**走 `Image::from_bytes(ImageFormat::Svg)`:那条路 1× 栅格化且漏了
+/// 通道交换(见 [`FileViewer::render_image`] 的注释);也用不了 gpui 自己的
+/// `SvgRenderer` —— 它和 `SvgSize` 都是 crate 根私有 `use` 的项,外面命名不了。
+enum MermaidAsset {}
+
+impl gpui::Asset for MermaidAsset {
+    type Source = MermaidKey;
+    type Output = Result<Arc<gpui::RenderImage>, MermaidError>;
+
+    // 不能写成 `async fn`:trait 要求返回的 future 是 `'static`,而 `async fn`
+    // 会把 `_cx` 的借用捕获进 future 里,过不了 'static 检查
+    #[allow(clippy::manual_async_fn)]
+    fn load(
+        source: Self::Source,
+        _cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move { render_mermaid_image(&source) }
+    }
+}
+
+/// 与 gpui 私有常量 `SMOOTH_SVG_SCALE_FACTOR` 同值。位图尺寸是逻辑尺寸的这么
+/// 多倍,画的时候 [`image_display_width`] 按 `is_svg = true` 除回去。
+const MERMAID_RASTER_SCALE: f32 = 2.0;
+
+/// 排版出来的画布不超过这个尺寸就当空图:解析器对不少残缺写法(括号没闭合、
+/// 箭头写错)**不报错**,只排出一张 2×边距(8px)的空白画布 —— 这种要按失败
+/// 处理,退回代码块让用户看得见原文,而不是一块什么都没有的空白。
+const MERMAID_EMPTY_CANVAS: f32 = 16.0;
+
+fn render_mermaid_image(key: &MermaidKey) -> Result<Arc<gpui::RenderImage>, MermaidError> {
+    let svg = render_mermaid_svg(key)?;
+    let pixmap = rasterize_svg(svg.as_bytes(), MERMAID_RASTER_SCALE)
+        .map_err(|err| MermaidError(err.to_string().into()))?;
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let mut bytes = pixmap.take();
+    for pixel in bytes.chunks_exact_mut(4) {
+        unpremultiply_rgba_to_bgra(pixel);
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, bytes)
+        .ok_or_else(|| MermaidError("pixmap size mismatch".into()))?;
+    Ok(Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+        buffer,
+    )])))
+}
+
+/// SVG 字节 → 预乘 RGBA 位图,尺寸 = SVG 标称尺寸 × `scale`。照抄 gpui
+/// `svg_renderer.rs::render_pixmap` 的做法;字体库是进程级一份、首次用到时
+/// 加载系统字体(几十到几百毫秒,只付一次,而且在后台线程)。
+fn rasterize_svg(bytes: &[u8], scale: f32) -> Result<resvg::tiny_skia::Pixmap, resvg::usvg::Error> {
+    use resvg::usvg;
+    static FONT_DB: std::sync::LazyLock<Arc<usvg::fontdb::Database>> =
+        std::sync::LazyLock::new(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        });
+    let options = usvg::Options {
+        fontdb: FONT_DB.clone(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_data(bytes, &options)?;
+    let size = tree.size();
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(
+        (size.width() * scale) as u32,
+        (size.height() * scale) as u32,
+    )
+    .ok_or(usvg::Error::InvalidSize)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Ok(pixmap)
+}
+
+/// tiny-skia 吐出的是**预乘** RGBA,`RenderImage` 的帧要**直通** BGRA
+/// (`assets.rs` 文档明示)。逐像素照抄 gpui `color.rs` 的 `swap_rgba_pa_to_bgra`
+/// (那个函数是 `pub(crate)`,拿不到)。
+fn unpremultiply_rgba_to_bgra(pixel: &mut [u8]) {
+    pixel.swap(0, 2);
+    if pixel[3] > 0 {
+        let alpha = pixel[3] as f32 / 255.0;
+        for channel in &mut pixel[..3] {
+            *channel = (*channel as f32 / alpha) as u8;
+        }
+    }
+}
+
+/// Mermaid 文本 → SVG 字符串。走三段式管线而不是一把梭的 `render`,是为了
+/// 在排版结果上判空(见 [`MERMAID_EMPTY_CANVAS`])与截住它自己的「语法错误」
+/// 炸弹图(`DiagramData::Error`,mermaid.js 那张 bomb 图的复刻)—— 两种都退回
+/// 代码块,比画一张看不出所以然的图强。
+fn render_mermaid_svg(key: &MermaidKey) -> Result<String, MermaidError> {
+    use mermaid_rs_renderer::layout::DiagramData;
+    use mermaid_rs_renderer::{
+        LayoutConfig, Theme, compute_layout, parse_mermaid_strict, render_svg,
+    };
+
+    let mut theme = if key.dark {
+        Theme::dark()
+    } else {
+        Theme::modern()
+    };
+    theme.background = format!("#{:06X}", key.background);
+    let config = LayoutConfig::default();
+    let parsed =
+        parse_mermaid_strict(&key.code).map_err(|err| MermaidError(err.to_string().into()))?;
+    let layout = compute_layout(&parsed.graph, &theme, &config);
+    if let DiagramData::Error(error) = &layout.diagram {
+        return Err(MermaidError(error.message.clone().into()));
+    }
+    if layout.width <= MERMAID_EMPTY_CANVAS && layout.height <= MERMAID_EMPTY_CANVAS {
+        return Err(MermaidError(t("fileViewer", "mermaidEmptyDiagram").into()));
+    }
+    Ok(render_svg(&layout, &theme, &config))
+}
+
+/// 把这些图表从 gpui 的资源缓存与图集里放掉。渲染途中调用必须把当前窗口
+/// 递进来:那一刻它被从 `App.windows` 里摘出去了,`App::drop_image` 只遍历
+/// 得到**其它**窗口(`on_release` 不在任何窗口的更新里,传 `None` 即可)。
+///
+/// 只对要过的 key 调用(见 [`FileViewer::mermaid_requested`]):`fetch_asset`
+/// 对没见过的 key 会**发起**一次渲染,放东西反倒先做了一遍活。
+fn release_mermaid_assets(keys: &[MermaidKey], cx: &mut App, mut window: Option<&mut Window>) {
+    use futures::FutureExt as _;
+    for key in keys {
+        let (task, _) = cx.fetch_asset::<MermaidAsset>(key);
+        if let Some(Ok(image)) = task.now_or_never() {
+            cx.drop_image(image, window.as_deref_mut());
+        }
+        cx.remove_asset::<MermaidAsset>(key);
+    }
+}
+
 // ─── 视图 ─────────────────────────────────────────────────────
 
 pub struct FileViewer {
@@ -2021,6 +2240,13 @@ pub struct FileViewer {
     /// 远程 Markdown 图片按文档、按 URL 记录用户明确批准。未命中时只能画
     /// 占位，绝不能把 URI 交给进程级图片加载器。
     approved_remote_images: HashSet<String>,
+    /// 本页签向 gpui 资源系统要过的 mermaid 图表(见 [`MermaidAsset`])。gpui 的
+    /// 资源缓存与图集纹理都是**进程级、不自动淘汰**的:一份 2× 栅格的图表动辄
+    /// 几 MB,「改一笔源码 → 切预览」一轮就多一份,不收就是显存慢慢被吃光
+    /// (见 GPU 性能档案的「尺寸悬崖」)。于是记下要过的 key,重切分块时把
+    /// 已不在文档里的那些连缓存带纹理一起放掉([`Self::release_stale_mermaid`]),
+    /// 页签关闭时全放(`on_release`)。`RefCell` 的理由同 [`Self::md_cache`]。
+    mermaid_requested: RefCell<HashSet<MermaidKey>>,
     /// html 预览的滚动位置。**必须住在实体上**:裸
     /// `overflow_y_scroll()` 的偏移存在按帧回收的 element state 里,切去终端页
     /// 的那几帧预览不渲染、状态被回收,切回来就跳回顶部。「预览 ↔ 源码」来回切
@@ -2114,6 +2340,7 @@ impl FileViewer {
             md_list: ListState::new(0, ListAlignment::Top, px(600.0)).measure_all(),
             md_list_sync: std::cell::Cell::new((0, px(0.0))),
             approved_remote_images: HashSet::new(),
+            mermaid_requested: RefCell::new(HashSet::new()),
             preview_scroll: ScrollHandle::new(),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
@@ -2134,6 +2361,12 @@ impl FileViewer {
             _fs_task: fs_task,
             _editor_sub: None,
         };
+        // 页签关掉时把要过的 mermaid 图表从进程级缓存与图集里放掉(理由见字段注释)
+        cx.on_release(|this: &mut Self, cx: &mut App| {
+            let keys: Vec<MermaidKey> = this.mermaid_requested.get_mut().drain().collect();
+            release_mermaid_assets(&keys, cx, None);
+        })
+        .detach();
         this.reload(window, cx);
         this
     }
@@ -3469,6 +3702,70 @@ impl FileViewer {
         }
     }
 
+    /// 一块 ```mermaid 围栏(issue #80)。图表由 [`MermaidAsset`] 在后台渲染成
+    /// 位图,这里三态:还没好 → 占位卡片;好了 → 与本地图片同一套框(原尺寸与
+    /// 列宽取小、等比缩);失败 → **退回代码块**照 TextView 画,底下补一行原因
+    /// —— 画不出来的图表至少要让人看得见原文,与 GitHub 对错误围栏的处置一致。
+    ///
+    /// 与图片不同,这条路**不分本地 / 远程文档**:渲染是纯文本计算,不碰盘不触网。
+    #[allow(clippy::too_many_arguments)]
+    fn render_md_mermaid(
+        &mut self,
+        seg_ix: usize,
+        code: &Arc<str>,
+        fallback: &gpui::SharedString,
+        style: &TextViewStyle,
+        avail_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = gpui::SharedString::from(format!("file-viewer-md-mermaid-{seg_ix}"));
+        let key = MermaidKey::new(code, cx);
+        // 先记后要:use_asset 一旦调用,资源系统里就有了这个 key 的任务
+        self.mermaid_requested.get_mut().insert(key.clone());
+        match window.use_asset::<MermaidAsset>(&key, cx) {
+            None => {
+                md_image_placeholder(id, t("fileViewer", "mermaidRendering").into(), None, None)
+            }
+            Some(Ok(data)) => {
+                let mut frame = div();
+                frame.style().aspect_ratio = Some(image_aspect_ratio(&data));
+                frame
+                    .w(px(image_display_width(&data, true, avail_w)))
+                    .max_w_full()
+                    .min_w_0()
+                    .child(
+                        img(data.clone())
+                            .id(id)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            }
+            Some(Err(err)) => {
+                let reason = format!("{}: {err}", t("fileViewer", "mermaidRenderFailed"));
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        TextView::markdown(id, fallback.clone(), window, cx)
+                            .style(style.clone())
+                            .selectable(true),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(reason),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
     /// 预览态的正文当前目录:相对路径的图片 / 资源按它解析。
     fn preview_base_dir(&self) -> PathBuf {
         self.current_path
@@ -3486,11 +3783,16 @@ impl FileViewer {
 
     /// 正文分块(带缓存,见 [`MdCache`])。源码或所在目录变了才重切。
     /// 返回 `(分块, 代次)`,代次每重切一次 +1(见 [`MdCache::generation`])。
+    ///
+    /// 重切时顺手把文档里已经没有的 mermaid 图表从资源系统里放掉
+    /// ([`Self::release_stale_mermaid`]),`window` / `cx` 只为这一件事。
     fn md_blocks(
         &self,
         source: &str,
         base_dir: &Path,
         local_resources: bool,
+        window: &mut Window,
+        cx: &mut App,
     ) -> (Rc<Vec<(f32, MdBlock)>>, u64) {
         // 先把命中与否算完再撒手,别让 borrow 活到 borrow_mut 那一行
         let (hit, last_generation) = {
@@ -3538,10 +3840,22 @@ impl FileViewer {
                         MdBlock::Table(table)
                     }
                     MdSegment::Images(images) => MdBlock::Images(images),
+                    // 围栏原文按与 Text 段相同的口径过一遍(代码块里没有活动构造,
+                    // 两个函数对它都是恒等,过一遍只是不让它成为口径上的例外)
+                    MdSegment::Mermaid { code, raw } => MdBlock::Mermaid {
+                        code: code.into(),
+                        fallback: if local_resources {
+                            rewrite_md_image_urls(&raw, base_dir).into()
+                        } else {
+                            sanitize_remote_markdown(&raw).into()
+                        },
+                    },
                 };
                 (mt, block)
             })
             .collect();
+
+        self.release_stale_mermaid(&blocks, window, cx);
 
         let blocks = Rc::new(blocks);
         *self.md_cache.borrow_mut() = Some(MdCache {
@@ -3552,6 +3866,32 @@ impl FileViewer {
             blocks: blocks.clone(),
         });
         (blocks, generation)
+    }
+
+    /// 重切分块后,把要过但新分块里已经没有的 mermaid 图表放掉(理由见
+    /// [`Self::mermaid_requested`])。按图表文本比,不按 key 比:主题切换后旧配色
+    /// 的那份也一并放掉 —— 切回来重画一次是 ms 级的事,留着是几 MB 的显存。
+    fn release_stale_mermaid(&self, blocks: &[(f32, MdBlock)], window: &mut Window, cx: &mut App) {
+        let mut requested = self.mermaid_requested.borrow_mut();
+        if requested.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = blocks
+            .iter()
+            .filter_map(|(_, block)| match block {
+                MdBlock::Mermaid { code, .. } => Some(&**code),
+                _ => None,
+            })
+            .collect();
+        let stale: Vec<MermaidKey> = requested
+            .iter()
+            .filter(|key| !live.contains(&*key.code))
+            .cloned()
+            .collect();
+        for key in &stale {
+            requested.remove(key);
+        }
+        release_mermaid_assets(&stale, cx, Some(window));
     }
 
     /// 让 [`Self::md_list`] 与当前分块对齐:块数变了、分块代次变了(源码或所在
@@ -3674,14 +4014,19 @@ impl FileViewer {
     /// 回收,滚回来重新解析那一块(几百微秒);② 滚轮步长由 list 写死为每行 20px,
     /// 比 `overflow_y_scroll` 按行高算的略慢;③ 水平内边距放在每一项上而不是
     /// 列表上 —— list 的 padding 只影响纵向,横向不缩项宽。
-    fn render_markdown(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let base_dir = self.preview_base_dir();
-        // 表格与图片拆出来自绘(组件表格单行截断、图片只认网络 URI,见
-        // split_md_blocks 一节的说明),其余段落照走 TextView。分块结果跨帧缓存
-        // (见 MdCache)——「滚一格重 render 一遍」这条路上,每帧重切 40 KB 正文
-        // 是白烧。
-        let (blocks, generation) =
-            self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
+        // 表格、图片与 mermaid 图表拆出来自绘(组件表格单行截断、图片只认网络
+        // URI、mermaid 只会画成代码,见 split_md_blocks 一节的说明),其余段落照走
+        // TextView。分块结果跨帧缓存(见 MdCache)——「滚一格重 render 一遍」
+        // 这条路上,每帧重切 40 KB 正文是白烧。
+        let (blocks, generation) = self.md_blocks(
+            self.preview_source(),
+            &base_dir,
+            !self.source.is_remote(),
+            window,
+            cx,
+        );
         self.sync_md_list(blocks.len(), generation);
         let content = div()
             .size_full()
@@ -3739,6 +4084,15 @@ impl FileViewer {
             MdBlock::Images(images) => {
                 self.render_md_images(ix, images, MARKDOWN_CONTENT_MAX_WIDTH, window, cx)
             }
+            MdBlock::Mermaid { code, fallback } => self.render_md_mermaid(
+                ix,
+                code,
+                fallback,
+                &style,
+                MARKDOWN_CONTENT_MAX_WIDTH,
+                window,
+                cx,
+            ),
         };
         div()
             .w_full()

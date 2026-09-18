@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 859;
+pub const ZH_ENTRY_COUNT: usize = 862;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 859;
+pub const EN_ENTRY_COUNT: usize = 862;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -416,6 +416,9 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
     ("loading", "加载中..."),
+    ("mermaidEmptyDiagram", "图表为空或语法不受支持"),
+    ("mermaidRenderFailed", "Mermaid 图表渲染失败，已按代码显示"),
+    ("mermaidRendering", "Mermaid 图表渲染中…"),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
@@ -451,6 +454,9 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
     ("loading", "Loading..."),
+    ("mermaidEmptyDiagram", "The diagram is empty or uses unsupported syntax"),
+    ("mermaidRenderFailed", "Mermaid diagram could not be rendered; showing the source instead"),
+    ("mermaidRendering", "Rendering Mermaid diagram…"),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),

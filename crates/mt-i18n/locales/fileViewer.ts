@@ -32,6 +32,9 @@ export const fileViewer = {
     remoteDownloadHint: "此类远程文件暂不支持内置预览，可下载后查看。",
     remoteImageClickToLoad: "点击加载远程图片",
     remoteRelativeImage: "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片",
+    mermaidRendering: "Mermaid 图表渲染中…",
+    mermaidRenderFailed: "Mermaid 图表渲染失败，已按代码显示",
+    mermaidEmptyDiagram: "图表为空或语法不受支持",
   },
   en: {
     preview: "Preview",
@@ -66,5 +69,8 @@ export const fileViewer = {
     remoteDownloadHint: "This remote file cannot be previewed here yet. Download it to view it.",
     remoteImageClickToLoad: "Click to load remote image",
     remoteRelativeImage: "Remote Markdown can only load absolute HTTP(S) images on demand",
+    mermaidRendering: "Rendering Mermaid diagram…",
+    mermaidRenderFailed: "Mermaid diagram could not be rendered; showing the source instead",
+    mermaidEmptyDiagram: "The diagram is empty or uses unsupported syntax",
   },
 } as const;
