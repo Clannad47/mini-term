@@ -164,17 +164,17 @@ pub fn request(pane: WeakEntity<TerminalPane>, cx: &mut App) {
     // 前沿:空闲时的第一次请求当场兑现,不欠用户一拍的回显延迟
     flush(cx);
 
+    // gpui-pre 的 `AsyncApp::update` 不再会失败:App 退出时这个任务连同循环一起
+    // 被丢弃,不必再有「App 没了就收 running」的尾巴。
     cx.spawn(async move |cx| {
         loop {
             let period = PUMP.with(|pump| pump.borrow().schedule.period());
             cx.background_executor().timer(period).await;
-            // App 没了(退出中)——把 running 收干净再走,免得留一个假的「在跑」
-            let Ok(had_work) = cx.update(flush) else { break };
+            let had_work = cx.update(flush);
             if PUMP.with(|pump| pump.borrow_mut().schedule.tick(had_work)) {
                 return;
             }
         }
-        PUMP.with(|pump| pump.borrow_mut().schedule.running = false);
     })
     .detach();
 }

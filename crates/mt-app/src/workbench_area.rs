@@ -278,6 +278,15 @@ pub fn open_active_file(
     });
 }
 
+/// 文件页内 Markdown 链接指向的本地文件:来源身份(项目 / 连接)沿用当前页签的,
+/// 已开的页签就切过去,没开的新开一个。
+pub fn open_document_source(source: DocumentSource, window: &mut Window, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| area.open_document(source, None, window, cx));
+}
+
 /// 文件页内部的 Ctrl/Cmd+W 入口。延迟执行前先快照来源身份，避免用户在
 /// `window.defer` 落地前切换页签后误关新的活动页。
 pub fn close_document_source(source: DocumentSource, window: &mut Window, cx: &mut App) {
@@ -412,7 +421,7 @@ impl WorkbenchArea {
         }
         let offset = tab_drag_offset(
             f32::from(self.tab_scroll.bounds().size.width),
-            f32::from(self.tab_scroll.max_offset().width),
+            f32::from(self.tab_scroll.max_offset().x),
             f32::from(anchor_offset),
             f32::from(event.position.x - anchor_x),
         );
@@ -1020,7 +1029,7 @@ impl Render for WorkbenchArea {
             .then(|| {
                 tab_thumb_geometry(
                     f32::from(self.tab_scroll.bounds().size.width),
-                    f32::from(self.tab_scroll.max_offset().width),
+                    f32::from(self.tab_scroll.max_offset().x),
                     f32::from(self.tab_scroll.offset().x),
                 )
             })

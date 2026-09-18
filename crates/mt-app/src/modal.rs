@@ -27,11 +27,10 @@ use gpui::{
     App, AppContext, ClickEvent, Entity, Focusable as _, ParentElement, PathPromptOptions,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
-use crate::prompt::{autofocus, is_open, kind, open_guarded, show_alert};
+use crate::prompt::{autofocus, confirm_footer, is_open, kind, open_guarded, show_alert};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -82,12 +81,10 @@ pub fn open_rename_pane(
             .title(t("paneGroup", "renameTerminal"))
             // 与 `showPrompt` 同宽:原版这条就是走 `.prompt-dialog`(360px)
             .w(px(360.0))
-            .confirm()
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(t("prompt", "confirm"))
-                    .cancel_text(t("prompt", "cancel")),
-            )
+            .footer(confirm_footer(
+                t("prompt", "confirm"),
+                Some(t("prompt", "cancel")),
+            ))
             .child(div().px(px(20.0)).child(Input::new(&input)))
             .on_ok(move |_: &ClickEvent, _window, cx| {
                 let title = input_for_ok.read(cx).value().to_string();
@@ -126,12 +123,10 @@ pub fn open_confirm_remove_project(
                 .title(t("projectList", "removeConfirm.title"))
                 // 原版 `ProjectList.tsx` 的删除确认是 `w-[320px]`
                 .w(px(320.0))
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(t("projectList", "removeConfirm.confirm"))
-                        .cancel_text(t("projectList", "removeConfirm.cancel")),
-                )
+                .footer(confirm_footer(
+                    t("projectList", "removeConfirm.confirm"),
+                    Some(t("projectList", "removeConfirm.cancel")),
+                ))
                 .child(
                     div()
                         .px(px(20.0))
@@ -220,12 +215,10 @@ pub fn open_add_project_into(
             dialog
                 .title(t("projectList", "menu.addProject"))
                 .w(px(460.0))
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(t("settings", "common.add"))
-                        .cancel_text(t("settings", "common.cancel")),
-                )
+                .footer(confirm_footer(
+                    t("settings", "common.add"),
+                    Some(t("settings", "common.cancel")),
+                ))
                 .child(
                     div()
                         .px(px(20.0))

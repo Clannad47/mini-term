@@ -752,7 +752,7 @@ fn render_body(
 /// 不挂字族的话 diff 会继承界面字体 —— 比例字体下行号与代码列全对不齐。
 fn mono_body(body: AnyElement) -> AnyElement {
     let mut wrap = div().size_full();
-    let ts = wrap.text_style().get_or_insert_default();
+    let ts = wrap.text_style();
     ts.font_family = Some(ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into()));
     ts.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
         "Cascadia Mono".into(),
@@ -796,7 +796,7 @@ fn render_inline(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
     )
     .size_full()
     .text_size(ui::font_px(font_size))
-    .track_scroll(scroll)
+    .track_scroll(&scroll)
     // 见模块注释第 3 条:量宽只量这一行,量错了长行就滚不到头
     .with_width_from_item(Some(widest_ix))
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
@@ -865,7 +865,7 @@ fn render_side_by_side(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
             },
         )
         .size_full()
-        .track_scroll(scroll)
+        .track_scroll(&scroll)
         .with_width_from_item(Some(widest_ix))
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     };

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
+gpui_platform.workspace = true
 # `tree-sitter-languages` 是文件预览器(`file_viewer.rs`)语法高亮的唯一来源:
 # 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
 # (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
@@ -22,8 +23,9 @@ gpui.workspace = true
 # `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 # ---- 语法高亮补充语言包(`syntax_languages.rs`)----
-# 组件库那 30 种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
-# 打开 .cs 整篇纯文本色;PHP / Kotlin / Lua / PowerShell / XML 这些常见类型它根本没有。
+# 组件库那 30 余种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
+# 打开 .cs 整篇纯文本色;PowerShell / XML / Dart 这些常见类型它根本没有
+# (PHP / Lua 自 0.6 起组件库内置且带查询,不再由这里补;Kotlin 内置的查询是坏的,仍补)。
 # 下面分两组:
 #  1. 已在依赖树里的五个(gpui-component 拉进来的),这里只是为了拿解析器常量与
 #     `HIGHLIGHTS_QUERY`,版本号与 Cargo.lock 里的一致,净新增 crate = 0;
@@ -38,9 +40,9 @@ tree-sitter-swift = "0.7"
 tree-sitter-cmake = "0.7"
 tree-sitter-proto = "0.2"
 tree-sitter-graphql = "0.1"
-tree-sitter-php = "0.24"
+# kotlin:组件库 0.6 内置的那份查询编不过(见 syntax_languages.rs),仍由这里覆盖;
+# 版本与组件库拉的同一个,净新增 crate = 0。
 tree-sitter-kotlin-sg = "0.4"
-tree-sitter-lua = "0.5"
 tree-sitter-powershell = "0.26"
 tree-sitter-xml = "0.7"
 tree-sitter-dart = "0.2"
@@ -56,20 +58,23 @@ tree-sitter-language = "0.1"
 markdown = "1.0"
 # Markdown 预览里 ```mermaid 围栏的图表渲染(issue #80),纯 Rust:Mermaid 文本 →
 # SVG 字符串,不要浏览器 / Node。`default-features = false` 砍掉它自带的 CLI(clap)
-# 与 PNG 输出(resvg 0.47 —— 与 gpui 锁定的 0.45 不同版本,开了就是第二份 resvg);
-# 栅格化交给 gpui 自己的 `SvgRenderer`(见 `file_viewer::MermaidAsset`)。
+# 与 PNG 输出(resvg 0.47 —— 与 gpui 锁定的 0.46 不同版本,开了就是第二份 resvg);
+# 栅格化见 `file_viewer::rasterize_svg`。
 # 余下依赖(fontdb 0.23 / ttf-parser 0.25 / regex / serde / once_cell)全在树里,
 # 净新增只有 json5(+ucd-trie)。
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
-# 上面那份 SVG 的栅格化。gpui 自己的 `SvgRenderer` / `SvgSize` 是 `use` 进 crate
-# 根的私有项(不是 `pub use`),外面构造不了 `SvgSize`,只能自己拿 resvg 画。
-# **版本与 feature 集逐字照抄 gpui 0.2.2 的声明**(`text` + `system-fonts` +
-# `memmap-fonts`,关默认 feature),依赖树里因此仍只有一份 resvg / usvg / tiny-skia;
-# gpui 升级 resvg 时这里要跟着改,否则就是两份。
-resvg = { version = "0.45", default-features = false, features = [
+# 上面那份 SVG 的栅格化。gpui-pre 已把 `SvgRenderer::render_single_frame` 公开
+# (它自带 2× 栅格 + BGRA 换通道 + 私有 `scale_factor`),日后可换过去省掉这条
+# 直接依赖;眼下沿用真机验收过的自绘路径(`file_viewer::rasterize_svg`),
+# 位图尺寸与 `image_display_width` 的换算才与本地 SVG 图片那条路一致。
+# **版本与 feature 集逐字照抄 gpui-pre 0.3.5 的声明**(`text` + `system-fonts` +
+# `memmap-fonts` + `raster-images`,关默认 feature),依赖树里因此仍只有一份
+# resvg / usvg / tiny-skia;gpui 升级 resvg 时这里要跟着改,否则就是两份。
+resvg = { version = "0.46", default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
+    "raster-images",
 ] }
 # `image::Frame` / `RgbaImage` 只当 `gpui::RenderImage` 的字节容器(两处:
 # 弹窗毛玻璃快照 frost.rs、Mermaid 图表栅格 file_viewer.rs);版本跟随 gpui
@@ -155,7 +160,7 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
 [dev-dependencies]
 # 语言包单测要亲手 `Query::new` 把每份高亮查询编一遍:组件库那条路编不过只会
 # `tracing::warn` 后静默退成纯文本,编译期与测试期都无感。已在树里,零新增。
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 # 端到端验颜色要喂 `SyntaxHighlighter::update(&Rope)`;版本钉死跟组件库一致。
 ropey = "=2.0.0-beta.1"
 
@@ -163,7 +168,7 @@ ropey = "=2.0.0-beta.1"
 # Linux 的窗口后端不在 gpui 默认 feature 里(Windows / macOS 默认即可),
 # 不开的话构建出来没有任何 windowing 实现。feature 是可加的,workspace
 # 依赖之上追加不动根 manifest(与 gpui-component 的 tree-sitter 同一手法)。
-gpui = { workspace = true, features = ["x11", "wayland"] }
+gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。

@@ -1953,7 +1953,7 @@ impl ProjectList {
                             if this.editing.is_none()
                                 && let Some(focus) = this.row_focus.get(id_focus.as_str())
                             {
-                                window.focus(focus);
+                                window.focus(focus, cx);
                             }
                         }),
                     )
@@ -2540,7 +2540,7 @@ impl ProjectList {
                     if this.editing.is_none()
                         && let Some(focus) = this.row_focus.get(id_focus.as_str())
                     {
-                        window.focus(focus);
+                        window.focus(focus, cx);
                     }
                 }),
             )

@@ -118,9 +118,6 @@ impl Pack {
     }
 }
 
-/// PHP 文件里 `<?php ?>` 之外的部分是 `text` 节点,交给 HTML 高亮。
-const PHP_INJECTIONS: &str = r#"((text) @injection.content (#set! injection.language "html"))"#;
-
 /// 全部语言包。名字与组件库内建重名的(csharp / swift / cmake / proto / graphql)
 /// 是覆盖,其余是追加。
 const PACKS: &[Pack] = &[
@@ -151,25 +148,19 @@ const PACKS: &[Pack] = &[
         include_str!("../assets/syntax/graphql.scm"),
     ),
     // ---- 新增(只收主流类型,冷门语言不进来,见模块注释「挑选口径」)----
-    Pack {
-        name: "php",
-        language: tree_sitter_php::LANGUAGE_PHP,
-        highlights: tree_sitter_php::HIGHLIGHTS_QUERY,
-        injections: PHP_INJECTIONS,
-        injection_languages: &["html"],
-    },
-    // kotlin-sg 是 fwcd 那份语法的 crates.io 发布版(ast-grep 维护),自带 nvim 派生的
-    // 查询;tree-sitter-grammars 的 kotlin-ng 是重写过的语法,节点名不同,nvim / Zed /
-    // Helix 三家的查询都对不上它,没处抄
+    // php / lua 曾在这里补过:gpui-component 0.6 起内置(php 带 HTML 注入、lua 带
+    // injections + locals),不再覆盖 —— 再引 tree-sitter-lua 会与组件库那份版本
+    // 不同、C 符号重定义链接失败。
+    //
+    // kotlin 0.6 也内置了,但它那份 highlights.scm 在自己拉的 kotlin-sg 0.4.1 上
+    // **编不过**(`Invalid node type "!is"`),组件库只 warn 后静默退成纯文本 ——
+    // 这里继续用 crate 自带的 nvim 派生查询覆盖(kotlin-sg 是 fwcd 那份语法的
+    // crates.io 发布版;tree-sitter-grammars 的 kotlin-ng 是重写过的语法,节点名
+    // 不同,nvim / Zed / Helix 三家的查询都对不上它,没处抄)。
     Pack::plain(
         "kotlin",
         tree_sitter_kotlin_sg::LANGUAGE,
         tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "lua",
-        tree_sitter_lua::LANGUAGE,
-        tree_sitter_lua::HIGHLIGHTS_QUERY,
     ),
     Pack::plain(
         "powershell",
@@ -656,7 +647,8 @@ mod tests {
         for pack in PACKS {
             let config = pack.config();
             let source = format!("{}\n{}", config.injections, config.highlights);
-            if let Err(err) = tree_sitter::Query::new(&config.language, &source) {
+            let language = config.language.as_ref().expect("语言包一定带解析器");
+            if let Err(err) = tree_sitter::Query::new(language, &source) {
                 failed.push(format!("{}: {err}", pack.name));
             }
         }
@@ -685,9 +677,9 @@ mod tests {
         use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
         register();
         let mut highlighter = SyntaxHighlighter::new(lang);
-        highlighter.update(None, &ropey::Rope::from_str(code));
+        highlighter.update(None, &ropey::Rope::from_str(code), None);
         let theme = HighlightTheme::default_dark();
-        let styles = highlighter.styles(&(0..code.len()), &theme);
+        let styles = highlighter.styles(&(0..code.len()), &*theme);
         let at = code.find(needle).expect("靶子不在代码里");
         let (range, style) = styles
             .iter()
@@ -720,6 +712,7 @@ mod tests {
 
     /// crate 自带的 nvim 风格查询经捕获名翻译后能上色:`this` 是 variable.special
     /// (`(this_expression) @variable.builtin` 翻过来的),关键字 / 类型 / 字符串各归各。
+    /// 同时也是「组件库内置 kotlin 查询编不过、我们的覆盖仍然生效」的对账。
     #[test]
     fn kotlin_捕获名翻译后上色() {
         let code = "class A { fun f(xs: List<Int>) = this.g(xs, \"s\") }";

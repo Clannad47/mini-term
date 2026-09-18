@@ -532,8 +532,10 @@ mod tests {
         let b = rect(0.0, 0.0, 100.0, 100.0);
         // 正左上角:四档里 left 与 top 同为 0,取 left
         assert_eq!(at(b, 0.0, 0.0), Some(DropZone::Left));
-        // 正右上角:right 与 top 同为 0,取 right
-        assert_eq!(at(b, 100.0, 0.0), Some(DropZone::Right));
+        // 右上角往里一格:right 与 top 同为 0.125(二进制可精确表示,免得浮点
+        // 误差打破并列),取 right —— 右缘本身在 gpui-pre 的 `Bounds::contains`
+        // 里是开区间,落在正右缘不算在矩形里
+        assert_eq!(at(b, 87.5, 12.5), Some(DropZone::Right));
     }
 
     #[test]

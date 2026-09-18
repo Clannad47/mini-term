@@ -518,7 +518,7 @@ impl AppStore {
             .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id);
         if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)) {
-            entity.update(cx, |pane, _| pane.focus(window));
+            entity.update(cx, |pane, cx| pane.focus(window, cx));
         }
         cx.notify();
     }

@@ -286,6 +286,8 @@ fn install_highlight_theme(palette: &Palette, appearance: Appearance, cx: &mut A
         // 补全提示类:灰掉(原版没有对应 tag,取 --text-muted 最接近)
         hint: plain(palette.text_muted),
         predictive: plain(palette.text_muted),
+        // 0.6.1 新增:Markdown 行内代码,与代码块同色
+        text_code_span: primary,
     };
 
     let theme = HighlightTheme {

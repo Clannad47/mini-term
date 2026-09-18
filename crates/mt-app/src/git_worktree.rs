@@ -1517,16 +1517,14 @@ fn open_remove_confirm(
             dialog
                 .title(t("worktree", "removeConfirmTitle"))
                 .w(px(400.0))
-                .confirm()
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default()
-                        .ok_text(if removing {
-                            t("worktree", "removing")
-                        } else {
-                            t("worktree", "removeConfirm")
-                        })
-                        .cancel_text(t("worktree", "cancel")),
-                )
+                .footer(crate::prompt::confirm_footer(
+                    if removing {
+                        t("worktree", "removing")
+                    } else {
+                        t("worktree", "removeConfirm")
+                    },
+                    Some(t("worktree", "cancel")),
+                ))
                 .child(body)
                 .on_ok(move |_: &ClickEvent, window, cx| {
                     if form_for_ok.read(cx).removing {

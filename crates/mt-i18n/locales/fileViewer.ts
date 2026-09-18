@@ -35,6 +35,7 @@ export const fileViewer = {
     mermaidRendering: "Mermaid 图表渲染中…",
     mermaidRenderFailed: "Mermaid 图表渲染失败，已按代码显示",
     mermaidEmptyDiagram: "图表为空或语法不受支持",
+    linkTargetMissing: "链接指向的文件不存在",
   },
   en: {
     preview: "Preview",
@@ -72,5 +73,6 @@ export const fileViewer = {
     mermaidRendering: "Rendering Mermaid diagram…",
     mermaidRenderFailed: "Mermaid diagram could not be rendered; showing the source instead",
     mermaidEmptyDiagram: "The diagram is empty or uses unsupported syntax",
+    linkTargetMissing: "The linked file does not exist",
   },
 } as const;

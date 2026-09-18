@@ -1527,3 +1527,99 @@ fn 保存走原子写且_crlf_全程不变() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─── 链接处置 ─────────────────────────────────────────────────
+
+#[test]
+fn 链接按原版四条口径分类() {
+    let cur = "D:/Git/x/docs/README.md";
+    assert_eq!(
+        classify_link(cur, "https://example.com/a?b=1"),
+        LinkAction::External("https://example.com/a?b=1".into())
+    );
+    assert_eq!(
+        classify_link(cur, "HTTP://EXAMPLE.COM"),
+        LinkAction::External("HTTP://EXAMPLE.COM".into())
+    );
+    assert_eq!(
+        classify_link(cur, "#%E5%AE%89%E8%A3%85"),
+        LinkAction::Anchor("安装".into())
+    );
+    assert_eq!(
+        classify_link(cur, "mailto:a@b.c"),
+        LinkAction::Scheme("mailto:a@b.c".into())
+    );
+    // 盘符不是协议
+    assert_eq!(
+        classify_link(cur, r"C:\tmp\a.md"),
+        LinkAction::Local("C:/tmp/a.md".into())
+    );
+    assert_eq!(
+        classify_link(cur, "../src/main.rs#L10"),
+        LinkAction::Local("D:/Git/x/src/main.rs".into())
+    );
+    assert_eq!(classify_link(cur, "   "), LinkAction::Ignore);
+    assert_eq!(classify_link(cur, "#"), LinkAction::Anchor(String::new()));
+}
+
+#[test]
+fn 本地链接解析规范化路径() {
+    // 相对路径、`./`、`..`、`%20`、反斜杠
+    assert_eq!(
+        resolve_local_href("D:/p/docs/a.md", "./img/b%20c.png?x=1"),
+        Some("D:/p/docs/img/b c.png".into())
+    );
+    assert_eq!(
+        resolve_local_href("D:/p/docs/a.md", r"..\..\..\etc"),
+        Some("etc".into())
+    );
+    // POSIX 绝对路径保留前导 `/`(远程项目)
+    assert_eq!(
+        resolve_local_href("/home/u/p/a.md", "/etc/hosts"),
+        Some("/etc/hosts".into())
+    );
+    assert_eq!(
+        resolve_local_href("/home/u/p/a.md", "sub/../b.md"),
+        Some("/home/u/p/b.md".into())
+    );
+    // Windows 绝对路径
+    assert_eq!(
+        resolve_local_href("/home/u/p/a.md", "D:/x/y.md"),
+        Some("D:/x/y.md".into())
+    );
+    assert_eq!(resolve_local_href("D:/p/a.md", "#only-anchor"), None);
+}
+
+#[test]
+fn 标题_slug_与原版一致() {
+    assert_eq!(heading_slug("  Hello  World "), "hello-world");
+    assert_eq!(heading_slug("安装 与 使用!"), "安装-与-使用");
+    assert_eq!(heading_slug("v1.2.3 (beta)"), "v123-beta");
+    assert_eq!(heading_slug("snake_case-name"), "snake_case-name");
+    assert_eq!(heading_slug("Héllo"), "hllo");
+    assert_eq!(
+        strip_inline_markup("**Bold** `code` [link](http://x) ~~s~~"),
+        "Bold code link s"
+    );
+}
+
+#[test]
+fn 锚点按标题_slug_或_html_id_命中() {
+    let block = "## 快速开始\n\n正文";
+    assert!(block_has_anchor(block, "快速开始"));
+    assert!(block_has_anchor(block, "快速开始"));
+    assert!(!block_has_anchor(block, "别的"));
+    // 标题里的行内标记不影响
+    assert!(block_has_anchor(
+        "### Using `cargo` **now**",
+        "using-cargo-now"
+    ));
+    // 围栏代码块里的 `# 注释` 不算标题
+    assert!(!block_has_anchor("```bash\n# install\n```", "install"));
+    // 原始 HTML 锚点
+    assert!(block_has_anchor("<a id=\"top\"></a>\n\n# Title", "top"));
+    // `#` 后无空格不是标题
+    assert!(!block_has_anchor("#hashtag", "hashtag"));
+    // 空 id 不命中任何块
+    assert!(!block_has_anchor("# x", ""));
+}
