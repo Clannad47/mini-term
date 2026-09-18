@@ -151,8 +151,13 @@ impl Element for TruncatedText {
         }
         let font = window.text_style().font();
         let mut wrapper = window.text_system().line_wrapper(font, measured.font_size);
-        let mut runs = measured.runs.clone();
-        let truncated = wrapper.truncate_line(self.text.clone(), width, ELLIPSIS, &mut runs);
+        let (truncated, runs) = wrapper.truncate_line(
+            self.text.clone(),
+            width,
+            ELLIPSIS,
+            &measured.runs,
+            gpui::TruncateFrom::End,
+        );
         Some(
             window
                 .text_system()
@@ -172,7 +177,14 @@ impl Element for TruncatedText {
     ) {
         let line = truncated.as_ref().unwrap_or(&measured.full);
         // 整形失败只会少画一行字,不值得 panic
-        let _ = line.paint(bounds.origin, measured.line_height, window, cx);
+        let _ = line.paint(
+            bounds.origin,
+            measured.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     }
 }
 

@@ -2090,10 +2090,10 @@ impl FileTree {
                 MouseButton::Left,
                 cx.listener({
                     let path = row.path.clone();
-                    move |this, _event: &MouseDownEvent, window, _cx| {
+                    move |this, _event: &MouseDownEvent, window, cx| {
                         // 浏览器点 `tabIndex=0` 的行就会聚焦,←→ 折叠展开靠这一条才够得着
                         if let Some(focus) = this.row_focus.get(&path) {
-                            window.focus(focus);
+                            window.focus(focus, cx);
                         }
                     }
                 }),

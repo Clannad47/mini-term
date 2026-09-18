@@ -766,8 +766,8 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _event, window, _cx| {
-                    window.focus(&this.focus);
+                cx.listener(|this, _event, window, cx| {
+                    window.focus(&this.focus, cx);
                 }),
             )
             .child(element)

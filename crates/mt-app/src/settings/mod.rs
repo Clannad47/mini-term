@@ -489,8 +489,8 @@ pub fn open_settings(
     });
 
     // Dialog 打开时会把焦点抢到自己面板上,↑↓ 导航要的焦点必须排在它后面
-    window.defer(cx, move |window, _cx| {
-        window.focus(&focus);
+    window.defer(cx, move |window, cx| {
+        window.focus(&focus, cx);
     });
 }
 

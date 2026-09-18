@@ -31,7 +31,7 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::{ChangeFileStatus, GitStatus};
 use mt_ui::TruncatedText;
 
@@ -217,7 +217,7 @@ pub struct GitChanges {
     repo_path: String,
     changes: Vec<ChangeFileStatus>,
     loading: bool,
-    commit_input: Entity<InputState>,
+    commit_input: Entity<TextareaState>,
     committing: bool,
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
@@ -232,8 +232,7 @@ impl EventEmitter<GitChangesEvent> for GitChanges {}
 impl GitChanges {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let commit_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(3)
                 .placeholder(t("panels", "commitPlaceholder"))
         });
@@ -540,7 +539,7 @@ impl Render for GitChanges {
             .border_t_1()
             .border_color(ui::border_subtle())
             .p(px(8.0))
-            .child(Input::new(&self.commit_input))
+            .child(Textarea::new(&self.commit_input))
             .child(
                 div()
                     .id("git-commit-button")

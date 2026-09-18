@@ -1723,6 +1723,8 @@ impl Element for TerminalElement {
                     _ = piece.line.paint(
                         piece.origin + delta,
                         prepared.cell_size.height,
+                        gpui::TextAlign::Left,
+                        None,
                         window,
                         cx,
                     );
@@ -1763,7 +1765,9 @@ impl Element for TerminalElement {
                     Bounds::new(p.origin, size(p.width, height)),
                     self.theme.background,
                 ));
-                _ = p.line.paint(p.origin, height, window, cx);
+                _ = p
+                    .line
+                    .paint(p.origin, height, gpui::TextAlign::Left, None, window, cx);
                 // 组合串内的插入符:细竖线,颜色跟光标走
                 window.paint_quad(fill(
                     Bounds::new(

@@ -152,7 +152,7 @@ impl BackgroundArtElement {
         // 裁到容器内:cover 一定有一维溢出,不裁会糊到邻居身上
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             if window
-                .paint_image(img_bounds, Corners::default(), data, 0, false)
+                .paint_image(bounds, img_bounds, Corners::default(), data, 0, false)
                 .is_err()
             {
                 return;

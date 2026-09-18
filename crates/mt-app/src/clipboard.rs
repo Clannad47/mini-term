@@ -243,7 +243,7 @@ pub fn read_clipboard_image(item: Option<&gpui::ClipboardItem>) -> ClipboardImag
 fn gpui_image(item: Option<&gpui::ClipboardItem>) -> Option<Result<PathBuf, String>> {
     let image = item?.entries().iter().find_map(|entry| match entry {
         gpui::ClipboardEntry::Image(image) => Some(image),
-        gpui::ClipboardEntry::String(_) => None,
+        gpui::ClipboardEntry::String(_) | gpui::ClipboardEntry::ExternalPaths(_) => None,
     })?;
     Some(save_clipboard_image(&image.bytes, image_ext(image.format)))
 }
@@ -262,6 +262,8 @@ fn image_ext(format: gpui::ImageFormat) -> &'static str {
         F::Svg => "svg",
         F::Bmp => "bmp",
         F::Tiff => "tiff",
+        F::Ico => "ico",
+        F::Pnm => "pnm",
     }
 }
 

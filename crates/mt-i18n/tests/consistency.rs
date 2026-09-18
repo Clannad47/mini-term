@@ -89,7 +89,7 @@ use mt_i18n::{
 /// 854 → 859：文档页签右键菜单（关闭 / 关闭其他 / 关闭右边 / 关闭左边）四条，
 /// 外加批量关闭时的未保存确认正文。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 859;
+const EXPECTED_ENTRIES_PER_LANG: usize = 860;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

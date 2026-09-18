@@ -124,10 +124,10 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
-    AnimationExt as _, AnyView, App, AppContext, Application, Bounds, Context, Entity,
-    InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, StyleRefinement, Styled, Size, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, div, point, prelude::FluentBuilder, px, size,
+    AnimationExt as _, AnyView, App, AppContext, Bounds, Context, Entity, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
+    StyleRefinement, Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, point, prelude::FluentBuilder, px, size,
 };
 // img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
 use gpui::StyledImage as _;
@@ -471,10 +471,7 @@ impl Workspace {
         let mut ai_events = ai_events;
         let ai_pump = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = ai_events.next().await {
-                let Ok(alert) = ai_store.update(cx, |store, cx| store.apply_ai_event(event, cx))
-                else {
-                    return;
-                };
+                let alert = ai_store.update(cx, |store, cx| store.apply_ai_event(event, cx));
                 if let Some(alert) = alert
                     && this
                         .update_in(cx, |workspace, window, cx| {
@@ -1292,7 +1289,7 @@ impl Workspace {
 /// 这里传的这一份(`view.rs:171-176`)。`StyleRefinement::default()` 的 size 是
 /// `auto`,没有子节点即 0×0 —— 面板会整块塌掉。所以必须传一份与该面板
 /// **render 根节点等价**的尺寸样式。
-fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> AnyView {
+fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> gpui::ViewElement<AnyView> {
     AnyView::from(view.clone()).cached(style)
 }
 
@@ -2090,7 +2087,7 @@ fn main() {
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
         // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。

@@ -36,10 +36,11 @@
 //!
 //! # 与原版的偏差(逐条,详见各处注释)
 //!
-//! 1. **Markdown 里的链接点击拦不住**:gpui-component 的富文本渲染器把链接写死成
-//!    `cx.open_url(&link.url)`(`text/node.rs:622`、`text/inline.rs:359`),没有回调口。
-//!    于是原版三条链接处置(外链弹确认框 / 文档内锚点滚动 / 本地文件在页内跳转)
-//!    都做不到,**页内跳转历史栈(`←` 返回)随之整条不做**。记档。
+//! 1. **Markdown 链接的「本地文件」一律作为页签打开**,不在页内换文件:原版是
+//!    单个 modal 里换文件、靠 `←` 历史栈回退;GPUI 版文件本来就是页签,已开的
+//!    切过去、没开的新开,历史栈由页签条承担。外链确认 / 文档内锚点滚动两条与
+//!    原版一致(gpui-component 0.6 起 `TextView::on_link_click` 开了回调口,
+//!    0.5.1 时代这三条整块做不了)。见 [`FileViewer::follow_link`]。
 //! 2. **本地 HTML 是简版渲染,不是浏览器**:GPUI 侧没有 iframe 等价物,`TextView::html`
 //!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS)。此处曾按规格 B.6.3
 //!    的建议「只留源码编辑器」,**已翻案**(用户要求):现在给预览态,但配一条
@@ -68,7 +69,7 @@ use gpui::http_client::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::WindowExt as _;
-use gpui_component::input::{Input, InputEvent, InputState, Position, Search, TabSize};
+use gpui_component::input::{Editor, EditorState, InputEvent, Position, Search, TabSize};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
@@ -79,6 +80,7 @@ use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::t;
+use crate::prompt::{Confirm, show_alert};
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 use crate::ui;
 
@@ -799,10 +801,6 @@ pub struct PreviewHttpClient;
 const PREVIEW_IMAGE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 impl HttpClient for PreviewHttpClient {
-    fn type_name(&self) -> &'static str {
-        "PreviewHttpClient"
-    }
-
     fn user_agent(&self) -> Option<&HeaderValue> {
         None
     }
@@ -1638,6 +1636,204 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// ─── 链接处置(纯逻辑) ────────────────────────────────────────
+
+/// 预览里点到的链接该怎么处置(`FileViewerModal.tsx:188-214` 的 `handleLinkClick`)。
+///
+/// 原版是一个 modal 里换文件、带 `←` 历史栈;GPUI 版文件本来就是页签,
+/// 「本地文件」一律作为页签打开(已开的就切过去),历史栈由页签条承担。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkAction {
+    /// http(s) 外链:弹确认后交给系统浏览器
+    External(String),
+    /// 文档内锚点(`#标题`):滚到对应标题所在的块
+    Anchor(String),
+    /// mailto: / tel: 这类其它协议:直接交给系统
+    Scheme(String),
+    /// 本地文件:已按当前文件所在目录解析成绝对路径(正斜杠)
+    Local(String),
+    /// 空 href / 解析不出目标
+    Ignore,
+}
+
+fn classify_link(current_file: &str, href: &str) -> LinkAction {
+    let href = href.trim();
+    if href.is_empty() {
+        return LinkAction::Ignore;
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return LinkAction::External(href.to_string());
+    }
+    if let Some(id) = href.strip_prefix('#') {
+        return LinkAction::Anchor(percent_decode(id));
+    }
+    if has_url_scheme(href) {
+        return LinkAction::Scheme(href.to_string());
+    }
+    match resolve_local_href(current_file, href) {
+        Some(path) => LinkAction::Local(path),
+        None => LinkAction::Ignore,
+    }
+}
+
+/// `^[a-zA-Z][a-zA-Z0-9+.-]*:` 且不是 Windows 盘符 `X:\` / `X:/` 形式。
+fn has_url_scheme(href: &str) -> bool {
+    let bytes = href.as_bytes();
+    if !bytes.first().is_some_and(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let Some(colon) = href.find(':') else {
+        return false;
+    };
+    if !href[1..colon]
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
+    {
+        return false;
+    }
+    !(colon == 1 && matches!(bytes.get(2), Some(b'\\') | Some(b'/')))
+}
+
+/// 把相对/绝对本地链接解析成规范化的绝对路径(正斜杠、去掉 `./` 与 `..`),
+/// `FileViewerModal.tsx:40-61` 的 `resolveLocalHref`。`#锚点` 与 `?查询` 先剥掉。
+fn resolve_local_href(current_file: &str, href: &str) -> Option<String> {
+    let raw = href.split(['#', '?']).next().unwrap_or("").trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = percent_decode(raw).replace('\\', "/");
+    let curr = current_file.replace('\\', "/");
+    let dir = curr.rfind('/').map(|i| &curr[..i]).unwrap_or("");
+    let is_win_abs =
+        raw.len() >= 3 && raw.as_bytes()[0].is_ascii_alphabetic() && raw[1..].starts_with(":/");
+    let is_posix_abs = raw.starts_with('/');
+    let base = if is_win_abs || is_posix_abs {
+        raw
+    } else {
+        format!("{dir}/{raw}")
+    };
+    // 前导 `/` 看拼完的路径而不是 href 本身:远程(POSIX)文件里的相对链接也得
+    // 保住根(原版 `isPosixAbs` 只看 href,这一步会丢掉 `/`,是它的 bug)
+    let is_posix_abs = base.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in base.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            seg => out.push(seg),
+        }
+    }
+    let first_is_drive = out
+        .first()
+        .is_some_and(|s| s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.ends_with(':'));
+    let joined = out.join("/");
+    Some(if is_posix_abs && !first_is_drive {
+        format!("/{joined}")
+    } else {
+        joined
+    })
+}
+
+/// GitHub 风格 slug(`FileViewerModal.tsx:72-77` 的 `slugify`):小写、只留
+/// 字母数字下划线连字符与中文、空白折成一个 `-`。
+fn heading_slug(text: &str) -> String {
+    let lowered = text.trim().to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut pending_dash = false;
+    for c in lowered.chars() {
+        if c.is_whitespace() {
+            pending_dash = true;
+            continue;
+        }
+        let keep = c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-')
+            || ('\u{4e00}'..='\u{9fa5}').contains(&c);
+        if !keep {
+            continue;
+        }
+        if pending_dash {
+            out.push('-');
+            pending_dash = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 标题行的纯文本:原版取的是渲染后的 `textContent`,这里把常见的行内标记
+/// (强调、code span、链接的 `[文字](url)`)剥掉后再做 slug。
+fn strip_inline_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open + 1..];
+        // `[文字](url)`:只留文字;不成对就把 `[` 当普通字符
+        if let Some(close) = rest.find("](")
+            && let Some(end) = rest[close..].find(')')
+        {
+            out.push_str(&rest[..close]);
+            rest = &rest[close + end + 1..];
+        } else {
+            out.push('[');
+        }
+    }
+    out.push_str(rest);
+    out.chars()
+        .filter(|c| !matches!(c, '*' | '`' | '~'))
+        .collect()
+}
+
+/// 一块正文里有没有这个锚点:原始 HTML 的 `id="…"`,或某一行是 ATX 标题且
+/// slug 相同(围栏代码块里的 `# 注释` 不算)。目标也过一遍 slug,
+/// `#My Heading` / `#my-heading` 都能命中。
+fn block_has_anchor(text: &str, raw_id: &str) -> bool {
+    if text.contains(&format!("id=\"{raw_id}\"")) || text.contains(&format!("id='{raw_id}'")) {
+        return true;
+    }
+    let want = heading_slug(raw_id);
+    if want.is_empty() {
+        return false;
+    }
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        if !(1..=6).contains(&hashes) || !trimmed[hashes..].starts_with(' ') {
+            continue;
+        }
+        let title = trimmed[hashes..].trim().trim_end_matches('#').trim();
+        if heading_slug(&strip_inline_markup(title)) == want {
+            return true;
+        }
+    }
+    false
+}
+
+/// 与组件库无回调时的默认口径一致:左/中键、键盘、非长按触摸才算「点开」。
+fn is_primary_link_click(event: &ClickEvent) -> bool {
+    match event {
+        ClickEvent::Mouse(click) => {
+            matches!(
+                click.up.button,
+                gpui::MouseButton::Left | gpui::MouseButton::Middle
+            )
+        }
+        ClickEvent::Keyboard(_) => true,
+        ClickEvent::Touch(click) => !click.long_press,
+    }
+}
+
 /// 块顶间距:对照 `.md-preview` 的纵向节奏 —— 段落间 `p { margin: 0.8em }`
 /// (相邻外边距在 CSS 里折叠,取 0.8em ≈ 11px);标题前 `margin-top: 1.4em`
 /// (≈20px,原版按标题自身字号算,这里取 h2/h3 档的近似);表格 `margin: 1em`
@@ -1809,8 +2005,8 @@ fn render_md_cell(
     col_ix: usize,
     cell: &str,
     style: &TextViewStyle,
-    window: &mut Window,
-    cx: &mut App,
+    _window: &mut Window,
+    _cx: &mut App,
 ) -> gpui::AnyElement {
     if is_plain_cell(cell) {
         // 外层刻意与 TextView 那条路同形(它的最外层也是 `div().size_full()`,
@@ -1824,8 +2020,6 @@ fn render_md_cell(
     TextView::markdown(
         gpui::SharedString::from(format!("md-tbl-{seg_ix}-{row_ix}-{col_ix}")),
         cell.to_string(),
-        window,
-        cx,
     )
     .style(style.clone())
     .into_any_element()
@@ -1993,7 +2187,7 @@ pub struct FileViewer {
     /// 编辑器实体。**换文件 / 显式重载才重建** —— `set_value` 会清撤销栈,
     /// 「预览 ↔ 源码」来回切只是不画它,草稿与撤销栈都留着
     /// (原版 `className={preview ? 'hidden' : 'h-full'}`,只隐藏不卸载)。
-    editor: Option<Entity<InputState>>,
+    editor: Option<Entity<EditorState>>,
     /// 磁盘上最后一次已知内容的**编辑器投影**(已归一成 `\n`、Tab 已展开)。
     /// 载入 / 保存成功时更新。
     saved: String,
@@ -2378,7 +2572,7 @@ impl FileViewer {
                                 view.refresh_warning = None;
                                 view.error = Some(error);
                                 if view.can_take_async_focus(window, cx) {
-                                    view.focus.focus(window);
+                                    view.focus.focus(window, cx);
                                 }
                             }
                         }
@@ -2415,8 +2609,8 @@ impl FileViewer {
             let wrap = should_wrap(&name);
             let tab_indented = self.tabs.indents_with_tabs();
             let editor = cx.new(|cx| {
-                let state = InputState::new(window, cx)
-                    .code_editor(lang)
+                let state = EditorState::new(window, cx)
+                    .language(lang)
                     .line_number(true)
                     .soft_wrap(wrap)
                     .default_value(text.clone());
@@ -2790,7 +2984,7 @@ impl FileViewer {
             Some(editor) if !(self.has_preview_toggle() && self.preview) => {
                 editor.update(cx, |state, cx| state.focus(window, cx));
             }
-            _ => self.focus.focus(window),
+            _ => self.focus.focus(window, cx),
         }
     }
 
@@ -3469,6 +3663,102 @@ impl FileViewer {
         }
     }
 
+    /// 预览里链接的点击回调(挂在每个 `TextView` 上)。组件要 `Send + Sync`,
+    /// 只捕获 `WeakEntity`(它是 `PhantomData<fn(T) -> T>`,与 `T` 无关);
+    /// 真正的处置在 [`Self::follow_link`]。
+    fn preview_link_handler(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(&gpui::SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static
+    {
+        let this = cx.weak_entity();
+        move |url, event, window, cx| {
+            if !is_primary_link_click(event) {
+                return;
+            }
+            let url = url.to_string();
+            let _ = this.update(cx, |viewer, cx| viewer.follow_link(&url, window, cx));
+        }
+    }
+
+    /// 原版 `handleLinkClick` 的四条处置(分类在 [`classify_link`]):
+    /// 外链弹确认再开浏览器;锚点滚到标题所在的块;其它协议直接交给系统;
+    /// 本地文件作为页签打开(本地来源先验文件在不在,远程交给页签自己报错)。
+    fn follow_link(&mut self, href: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match classify_link(&self.current_path.to_string_lossy(), href) {
+            LinkAction::External(url) => {
+                let open = url.clone();
+                Confirm::new(t("externalLink", "openConfirm"), url).open(
+                    move |_window, cx| cx.open_url(&open),
+                    window,
+                    cx,
+                );
+            }
+            LinkAction::Anchor(id) => self.scroll_to_anchor(&id, cx),
+            LinkAction::Scheme(url) => cx.open_url(&url),
+            LinkAction::Local(target) => {
+                // 解析结果是正斜杠的;本地来源按组件重拼成平台分隔符,页头显示的
+                // 路径才与从文件树打开的一致(页签去重本身不看分隔符)
+                let path: PathBuf = PathBuf::from(&target).components().collect();
+                let source = match &self.source {
+                    DocumentSource::Local {
+                        project_id,
+                        project_root,
+                        ..
+                    } => {
+                        if !path.is_file() {
+                            show_alert(t("fileViewer", "linkTargetMissing"), target, window, cx);
+                            return;
+                        }
+                        DocumentSource::Local {
+                            project_id: project_id.clone(),
+                            project_root: project_root.clone(),
+                            path,
+                        }
+                    }
+                    DocumentSource::Remote {
+                        project_id,
+                        connection,
+                        project_root,
+                        ..
+                    } => DocumentSource::Remote {
+                        project_id: project_id.clone(),
+                        connection: connection.clone(),
+                        project_root: project_root.clone(),
+                        // 远程一律 POSIX,保持解析出来的正斜杠形态
+                        path: PathBuf::from(&target),
+                    },
+                };
+                // 回调在事件派发里跑,开页签要动 WorkbenchArea 与(可能是本页签的)
+                // 文档实体,推到下一轮 effect 再做
+                window.defer(cx, move |window, cx| {
+                    crate::workbench_area::open_document_source(source, window, cx);
+                });
+            }
+            LinkAction::Ignore => {}
+        }
+    }
+
+    /// 文档内锚点:找到含该标题的块,滚到块顶(原版 `scrollIntoView({block: "start"})`)。
+    /// 分块缓存一定在(能点到链接就说明预览已经渲染过)。
+    fn scroll_to_anchor(&mut self, id: &str, cx: &mut Context<Self>) {
+        let blocks = self.md_cache.borrow().as_ref().map(|c| c.blocks.clone());
+        let Some(blocks) = blocks else {
+            return;
+        };
+        let hit = blocks.iter().position(|(_, block)| match block {
+            MdBlock::Text(text) => block_has_anchor(text, id),
+            _ => false,
+        });
+        if let Some(item_ix) = hit {
+            self.md_list.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item: px(0.0),
+            });
+            cx.notify();
+        }
+    }
+
     /// 预览态的正文当前目录:相对路径的图片 / 资源按它解析。
     fn preview_base_dir(&self) -> PathBuf {
         self.current_path
@@ -3590,7 +3880,7 @@ impl FileViewer {
         {
             // `refine_style` 排在组件自己的 `.text_size(mono_font_size)` 之后,
             // 这里的字号能赢(node.rs:384-386)
-            let text = code_block.text.get_or_insert_default();
+            let text = &mut code_block.text;
             text.font_size = Some(ui::font_px(11.9).into());
             text.line_height = Some(gpui::relative(1.6).into());
         }
@@ -3729,11 +4019,10 @@ impl FileViewer {
             MdBlock::Text(text) => TextView::markdown(
                 gpui::SharedString::from(format!("file-viewer-md-body-{ix}")),
                 text.clone(),
-                window,
-                cx,
             )
             .style(style.clone())
             .selectable(true)
+            .on_link_click(self.preview_link_handler(cx))
             .into_any_element(),
             MdBlock::Table(table) => render_md_table(ix, table, &style, window, cx),
             MdBlock::Images(images) => {
@@ -3763,7 +4052,7 @@ impl FileViewer {
     /// 顶上一句说明写清楚它是简版,工具栏常驻「用浏览器打开」给真效果的出口。
     /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
     /// `convertFileSrc`),由 [`PreviewHttpClient`] 读盘。
-    fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_html(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         debug_assert!(!self.source.is_remote());
         let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
@@ -3797,9 +4086,10 @@ impl FileViewer {
                             .child(t("fileViewer", "htmlPreviewNote")),
                     )
                     .child(
-                        TextView::html("file-viewer-html-body", source, window, cx)
+                        TextView::html("file-viewer-html-body", source)
                             .style(style)
-                            .selectable(true),
+                            .selectable(true)
+                            .on_link_click(self.preview_link_handler(cx)),
                     ),
             );
         self.preview_scroll_shell("file-viewer-html-scrollbar", content)
@@ -3863,10 +4153,9 @@ impl FileViewer {
                         // (fontManager.ts:8-18),这里同样让它优先。Input 与行号列
                         // 都吃 window.text_style(),包一层即全部生效。
                         let mut wrap = div().size_full();
-                        let ts = wrap.text_style().get_or_insert_default();
-                        ts.font_family = Some(
-                            ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into()),
-                        );
+                        let ts = wrap.text_style();
+                        ts.font_family =
+                            Some(ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into()));
                         ts.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
                             "Cascadia Mono".into(),
                             "Consolas".into(),
@@ -3876,8 +4165,13 @@ impl FileViewer {
                         ]));
                         ts.font_size = Some(px(13.0).into());
                         ts.line_height = Some(gpui::relative(1.6).into());
-                        wrap.child(Input::new(editor).h_full().appearance(false).bordered(false))
-                            .into_any_element()
+                        wrap.child(
+                            Editor::new(editor)
+                                .h_full()
+                                .appearance(false)
+                                .bordered(false),
+                        )
+                        .into_any_element()
                     }
                     None => div().into_any_element(),
                 }
