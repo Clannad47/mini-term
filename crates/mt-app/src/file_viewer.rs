@@ -3945,8 +3945,12 @@ impl FileViewer {
             // 按它的尺寸把占位撑到同高;失败过的直接照旧画退回的代码块(排版与
             // 配色无关,新一轮结论必然相同)。首次渲染没有旧图,照旧一张卡片。
             None => {
-                let placeholder =
-                    md_image_placeholder(id.clone(), t("fileViewer", "mermaidRendering").into(), None, None);
+                let placeholder = md_image_placeholder(
+                    id.clone(),
+                    t("fileViewer", "mermaidRendering").into(),
+                    None,
+                    None,
+                );
                 match self.mermaid_sibling_result(&key, cx) {
                     Some(Ok(data)) => {
                         let width = image_display_width(&data, true, avail_w);
