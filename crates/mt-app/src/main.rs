@@ -2227,7 +2227,7 @@ fn main() {
         //
         // 只在 macOS 挂:另外两家 gpui 自己就会退,多这一道只会在主力平台上引入变数。
         #[cfg(target_os = "macos")]
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _closed| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
