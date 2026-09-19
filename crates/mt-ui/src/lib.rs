@@ -111,8 +111,8 @@ pub use terminal::{
     is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
 };
 pub use theme_bridge::{
-    AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, switch_to_builtin,
-    switch_to_theme_pack,
+    AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, ThemeTokens,
+    switch_to_builtin, switch_to_theme_pack,
 };
 pub use truncated_text::TruncatedText;
 

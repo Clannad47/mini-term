@@ -2087,7 +2087,17 @@ fn main() {
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
-    gpui_platform::application().run(|cx: &mut App| {
+    // 组件库的图标资产源。gpui 的 `svg()` 一律经 `AssetSource` 取字节,没挂资产源时
+    // 上游组件里每一枚 `Icon::new(IconName::..)` 都画成**空白**(只在日志里留一行,
+    // 编译期与运行期界面上都毫无提示)—— 0.5.1 时代 crate 包里根本不带 svg,于是
+    // 全仓有十来处「只能自绘」的记档按着这条前提写;0.6.2 把图标拆进了
+    // `gpui-kit-assets` 并给出现成的 `AssetSource`,前提不再成立。
+    //
+    // 用 `Assets`(组件库默认那 101 枚,约 44 KB)而不是 `AllAssets`(Lucide 全集
+    // 1830 枚,约 731 KB):组件库自己只按名字取这 101 枚,全集是给应用画自己的
+    // 图标用的,本仓的图标基建是 `mt_ui::icons` 那套自绘矢量(要多色,svg 单色
+    // alpha 掩膜画不了),用不上。
+    gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
         // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。

@@ -40,7 +40,7 @@ use gpui::{App, Window, WindowAppearance};
 use mt_config::AppConfig;
 use mt_ui::TerminalTheme;
 use mt_ui::theme_bridge::{
-    self, Appearance, BackgroundArt, ThemePackListing, builtin_dark_terminal_theme,
+    self, Appearance, BackgroundArt, ThemePackListing, ThemeTokens, builtin_dark_terminal_theme,
     builtin_terminal_theme, switch_to_builtin, switch_to_theme_pack,
 };
 
@@ -103,27 +103,27 @@ pub fn list_packs() -> Vec<ThemePackListing> {
 ///   (读包 → 校验 → 装进 gpui-component 主题层,一步到位);
 /// - 无皮肤 / 皮肤读不出来 → [`switch_to_builtin`](mt_ui::theme_bridge::switch_to_builtin)
 ///   (**内含**把 `Theme::dark_theme`/`light_theme` 从 `ThemeRegistry` 恢复回内置基线
-///   这一步 —— 少了它「退出皮肤」只切 mode,浮层会原地停在皮肤配色上)。
+///   这一步 —— 少了它「退出皮肤」只切 mode,浮层会原地停在皮肤配色上;恢复完再叠
+///   [`builtin_tokens`] 这份内置调色板的映射,上游组件才与自绘面板同色)。
 pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
     let applied = apply_inner(config, window, cx);
     // 代码高亮配色跟着壳配色走(见 [`install_highlight_theme`])。放在这里而不是
     // 三个 return 分支里各写一遍 —— 装配入口只有一个,高亮表也只在这一处装。
     install_highlight_theme(&applied.palette, applied.appearance, cx);
-    // 弹窗遮罩:gpui-component 内置主题的 `overlay` 是 #ffffff08 / #0000000d
-    // (≈3%,肉眼等于没有),而原版所有 Modal 统一压 `bg-black/50`
-    // (`Modal.tsx:171`,亮暗两套同值)。Dialog/Sheet 渲染时读的是
+    // 弹窗遮罩:两条路的 token 映射给的都是「背景色 55% alpha」,而原版所有 Modal
+    // 统一压 `bg-black/50`(`Modal.tsx:171`,亮暗两套同值)—— 亮色下尤其差得远
+    // (白底 55% 根本压不住底下的内容)。Dialog/Sheet 渲染时读的是
     // `cx.theme().overlay`,必须放在 apply_inner **之后** ——
     // switch_to_builtin/switch_to_theme_pack 都会从基线重置整套 colors。
+    //
+    // 这里曾经还补一条 `theme.colors.link`:内置主题那条路当时把全局主题恢复成
+    // 组件库出厂值,link 是它自己的蓝。现在内置也走 [`builtin_tokens`] → token
+    // 映射(`put("link", accent)`),与皮肤路径同源,补丁已无事可做,删掉。
+    // md 行内 code 的字与底由 `file_viewer` / `session_panel` 两处
+    // `preview_text_style` 经 `TextViewStyle.inline_code` 直接给(0.6.2 起有此钩子)。
     {
         let theme = gpui_component::Theme::global_mut(cx);
         theme.colors.overlay = gpui::hsla(0.0, 0.0, 0.0, 0.5);
-        // md 行内 code 的字与底(原版 `.md-preview code` 的 --accent / --bg-elevated)
-        // 由 `file_viewer` 与 `session_panel` 两处 `preview_text_style` 经
-        // `TextViewStyle.inline_code` 直接给(0.6.2 起有此钩子),这里不再把
-        // 全局 `colors.accent` 改成 bg_elevated 借位换底 —— accent 回到
-        // theme_bridge 装配时的值。
-        // md 链接色:TextView 取 `theme().link`,原版 `.md-preview a` 是 --accent
-        theme.colors.link = applied.palette.accent;
     }
     applied
 }
@@ -151,12 +151,13 @@ fn apply_inner(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App
             Err(err) => {
                 eprintln!("[theme] 自定义主题 {theme_id} 加载失败,回落内置外观: {err:#}");
                 let appearance = resolve_appearance(&config.theme, cx);
+                let palette = builtin_palette(appearance);
                 // 返回值就是该明暗的内置终端配色;`terminalFollowTheme` 那道闸
                 // 在 builtin_terminal 里(关掉时固定暗色),所以这里不直接用它
-                let _ = switch_to_builtin(appearance, window, cx);
+                let _ = switch_to_builtin(appearance, &builtin_tokens(&palette), window, cx);
                 return AppliedTheme {
                     appearance,
-                    palette: builtin_palette(appearance),
+                    palette,
                     terminal: builtin_terminal(appearance, follow),
                     background: None,
                     failed_pack: Some(theme_id.to_string()),
@@ -166,13 +167,50 @@ fn apply_inner(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App
     }
 
     let appearance = resolve_appearance(&config.theme, cx);
-    let _ = switch_to_builtin(appearance, window, cx);
+    let palette = builtin_palette(appearance);
+    let _ = switch_to_builtin(appearance, &builtin_tokens(&palette), window, cx);
     AppliedTheme {
         appearance,
-        palette: builtin_palette(appearance),
+        palette,
         terminal: builtin_terminal(appearance, follow),
         background: None,
         failed_pack: None,
+    }
+}
+
+/// 内置调色板 → gpui-component 的十个语义色。
+///
+/// **内置配色的唯一来源仍是 [`Palette::dark`] / [`Palette::light`]**（`ui.rs` 里
+/// 逐值抄 `styles.css` 的那份表）—— 这里一个色值都不新造，只做「壳语义 → 主题包
+/// 语义」的改名。改名表与 [`Palette::from_pack`] 严格互逆：
+///
+/// | 壳（`ui::Palette`） | 主题包语义 | 组件库那头拿去画什么 |
+/// |---|---|---|
+/// | `bg_base` | `background` | 窗口底、`tiles`、按钮上的字（primary.foreground）、**Dialog 的面板本体**（`dialog.rs:613` 画的是 `tokens.background`） |
+/// | `bg_surface` | `panel` | `secondary` / `list` / `table` / `sidebar` / `title_bar` / 活动 tab |
+/// | `bg_elevated` | `panelAlt` | `popover`（PopupMenu / Select / HoverCard 的外壳）、`muted`、`accent`、滚动条轨道、switch / slider 槽 |
+/// | `accent` | `accent` | `primary` / `ring`（聚焦圈）/ `caret` / `link` / 选区 / 拖放高亮 |
+/// | `text_primary` | `text` | `foreground` 与各处前景 |
+/// | `text_muted` | `muted` | `muted.foreground` / 表头 / 非活动 tab |
+/// | `border_default` | `line` | `border` / `input.border` / `window.border` / 滚动条 thumb |
+/// | `color_warning` | `accentAlt` | `warning.*` |
+/// | `color_info` | `secondary` | `info.*` |
+/// | `color_success` | `highlight` | `success.*` |
+///
+/// 后三个在皮肤那头是**可选**槽位（不写就不覆盖组件库基线），内置这头总是给 ——
+/// 壳本来就有这三个语义色，留着组件库的绿/黄/蓝只会和状态灯对不上。
+fn builtin_tokens(palette: &Palette) -> ThemeTokens {
+    ThemeTokens {
+        background: palette.bg_base,
+        panel: palette.bg_surface,
+        panel_alt: palette.bg_elevated,
+        accent: palette.accent,
+        text: palette.text_primary,
+        muted: palette.text_muted,
+        line: palette.border_default,
+        accent_alt: Some(palette.color_warning),
+        secondary: Some(palette.color_info),
+        highlight: Some(palette.color_success),
     }
 }
 
@@ -376,6 +414,63 @@ mod tests {
         assert_ne!(dark, light);
         assert_ne!(dark.bg_base, light.bg_base);
         assert_ne!(dark.text_primary, light.text_primary);
+    }
+
+    /// 内置明/暗两套都必须经同一份 token 映射装进 gpui-component 主题层 ——
+    /// 上游组件（Dialog 外壳 / Input / Scrollbar / PopupMenu / TextView）的颜色
+    /// 与壳自绘面板同源就靠这一步。此前内置那条路只调 `restore_builtin_gpui_theme`
+    /// 把组件库主题恢复成出厂中性灰，于是暖棕面板里套一个灰底弹窗。
+    ///
+    /// 这条同时是 [`builtin_tokens`] 那张改名表的对账：写反一格（比如
+    /// `panel` 填成 `bg_elevated`）这里立刻红。
+    #[test]
+    fn 内置调色板经_token_映射装进组件库主题() {
+        fn hex8(c: gpui::Hsla) -> String {
+            let rgba = gpui::Rgba::from(c);
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            format!(
+                "#{:02x}{:02x}{:02x}{:02x}",
+                b(rgba.r),
+                b(rgba.g),
+                b(rgba.b),
+                b(rgba.a)
+            )
+        }
+        fn slot(value: &Option<gpui::SharedString>) -> &str {
+            value.as_ref().map(|s| s.as_ref()).unwrap_or("<未映射>")
+        }
+
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let p = builtin_palette(appearance);
+            // 装配时 mt-ui 那头就是这么调的（内置没有背景图，面板恒不透明）
+            let config = theme_bridge::build_theme_config(
+                "mini-term",
+                appearance,
+                &builtin_tokens(&p),
+                1.0,
+            );
+            let c = &config.colors;
+            let what = format!("{appearance:?}");
+            // Dialog 的面板本体画 `tokens.background`；TextView / 主区同源
+            assert_eq!(slot(&c.background), hex8(p.bg_base), "{what} background");
+            assert_eq!(slot(&c.foreground), hex8(p.text_primary), "{what} foreground");
+            // 聚焦圈 / 光标 / 链接：原版 `.md-preview a` 就是 --accent
+            assert_eq!(slot(&c.ring), hex8(p.accent), "{what} ring");
+            assert_eq!(slot(&c.caret), hex8(p.accent), "{what} caret");
+            assert_eq!(slot(&c.link), hex8(p.accent), "{what} link");
+            // 边框：Input / Dialog / 分隔线三处同源
+            assert_eq!(slot(&c.border), hex8(p.border_default), "{what} border");
+            assert_eq!(slot(&c.input), hex8(p.border_default), "{what} input.border");
+            // 浮层外壳（PopupMenu / Select / HoverCard）= 壳的 bg_elevated
+            assert_eq!(slot(&c.popover), hex8(p.bg_elevated), "{what} popover");
+            // 面板类（list / table / sidebar / title_bar / 活动 tab）= 壳的 bg_surface
+            assert_eq!(slot(&c.secondary), hex8(p.bg_surface), "{what} secondary");
+            assert_eq!(slot(&c.list), hex8(p.bg_surface), "{what} list");
+            // 语义三色跟壳走，别留组件库自己的绿/黄/蓝
+            assert_eq!(slot(&c.warning), hex8(p.color_warning), "{what} warning");
+            assert_eq!(slot(&c.info), hex8(p.color_info), "{what} info");
+            assert_eq!(slot(&c.success), hex8(p.color_success), "{what} success");
+        }
     }
 
     fn minimal_pack_json(extra: &str) -> String {
