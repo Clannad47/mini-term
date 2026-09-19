@@ -2156,7 +2156,11 @@ fn main() {
         // 「减少动画」也必须在**任何视图建出来之前**定下来:动画消费方读的是
         // 进程级闸(`mt_ui::motion`),晚一步的话首帧会按「允许动画」画出来 ——
         // 状态灯闪一下再停,正是这条设置想避免的东西。
-        motion::install();
+        //
+        // ⚠️ 顺序:必须排在上面那句 `gpui_component::init` **之后** —— 它还要
+        // 接管 gpui 自己那道「一刀切停掉所有 `with_animation`」的闸,而接管的
+        // 前提是组件库已经把系统值写过一遍(见 `motion::gate_values` 的注释)。
+        motion::install(cx);
 
         // 键位表的唯一事实来源在 [`hotkeys`](crate::hotkeys) —— 它同时喂给
         // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`
