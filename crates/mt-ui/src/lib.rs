@@ -49,15 +49,23 @@
 //! ## 4.6 tooltip([`tooltip`])
 //!
 //! 全仓 tooltip 的**唯一入口**(mt-app 也从这里取)。上游 gpui-component 那款
-//! 字号写死、gpui 的 500ms 停留时长是私有常量,两个都调不动,所以自己包一层:
-//! 字号降一档 + 在 gpui 那 500ms 后再接一段延迟。理由与做法见该模块注释。
+//! 字号是在 `refine_style` 之前钉的 `text_sm`,想降一档就得每个调用点都记得
+//! 挂一次样式,所以气泡仍自绘;停留时长则由上游 API 给足(gpui-pre 0.3.5 的
+//! `tooltip_show_delay`),挂 [`tooltip::TooltipExt`] 的方法即是全仓统一档
+//! [`tooltip::SHOW_DELAY`]。曾经那套「二段延迟」已退役,记档见该模块注释。
 //!
-//! ## 4.7 单行省略文本([`truncated_text`])
+//! ## 4.7 单行省略文本 —— 已退役,用 `div().truncate()`
 //!
-//! `div().truncate()` 在**宽度随内容走**的 flex 项上画不出「…」(gpui 文本测量
-//! 的缓存按 `wrap_width` 命中,nowrap 时第一次 MaxContent 测量一锤定音),
-//! [`TruncatedText`] 改在 prepaint 拿到最终 bounds 后再截断整形。胶囊 / 徽章 /
-//! 标题这类自然宽度的文字用它;`flex_1` 的项 `truncate()` 照旧能用。
+//! 曾有一个自绘的 `TruncatedText`:gpui 0.2.2 的 `truncate()` 在**宽度随内容走**
+//! 的 flex 项上只裁剪、画不出「…」(文本测量缓存按 `wrap_width` 命中,nowrap 时
+//! 第一次 MaxContent 测量一锤定音),另有高 DPI 下「放得下也出…」的取整坑。
+//! 这三条 gpui-pre 0.3.5 全部修在上游(`elements/text.rs:679-694` 的缓存判据
+//! 新增 `truncate_width.is_none() && text_layout.truncate_width.is_none()`、
+//! `:709-723` 的「老实整形后放得下就不截断」、`taffy.rs:45` 改 `disable_rounding()`
+//! 且 `:412` 把测量宽度 ceil 到整设备像素),故整块删除。
+//!
+//! 现在一律 `div().truncate().child(text)`;需要保留头部/中段时还有
+//! `text_ellipsis_start()` / `text_ellipsis_middle()`(0.2.2 时代没有)。
 //!
 //! ## 5. 布局复用件(尽量用 gpui-component,别自己造)
 //!
@@ -92,7 +100,6 @@ pub mod motion;
 pub mod terminal;
 pub mod theme_bridge;
 pub mod tooltip;
-pub mod truncated_text;
 
 pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
 pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};
@@ -111,10 +118,9 @@ pub use terminal::{
     is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
 };
 pub use theme_bridge::{
-    AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, switch_to_builtin,
-    switch_to_theme_pack,
+    AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, ThemeTokens,
+    switch_to_builtin, switch_to_theme_pack,
 };
-pub use truncated_text::TruncatedText;
 
 /// OSC 调色板查询的应答色(`TermEvent::ColorRequest` 的处理)。
 ///

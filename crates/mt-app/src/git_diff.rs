@@ -48,8 +48,7 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
-use mt_ui::TruncatedText;
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{kind, open_guarded};
@@ -924,7 +923,7 @@ fn jump_button(
         .text_color(ui::text_muted())
         .cursor_pointer()
         .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .tip(tip)
         .child(glyph)
         .on_click(move |_: &ClickEvent, _window, cx| {
             state.update(cx, |s, cx| {
@@ -1141,7 +1140,8 @@ pub fn open_file_diff(
                             .max_w(px(300.0))
                             .text_size(ui::font_px(13.0))
                             .text_color(ui::text_muted())
-                            .child(TruncatedText::new(file_path.clone())),
+                            .truncate()
+                            .child(file_path.clone()),
                     )
                     .child(
                         div()
@@ -1174,9 +1174,11 @@ pub fn open_file_diff(
             .w(width)
             // 见 [`modal_size`]:不清零内边距的话面板会比统计弹窗高出 48px
             .p_0()
-            // `Dialog` 自带的 ✕ 画 `IconName::Close`,0.5.1 没有 svg 资产 →
-            // 渲染成空白,等于在右上角埋一块看不见的可点区(`p_0()` 之下它更是
-            // 贴到 8,8,正压着工具栏这边自绘的 ✕ 与视图切换)。与设置面板同一取舍
+            // `Dialog` 自带的 ✕ 是绝对定位的,`p_0()` 之下贴到 8,8,正压着工具栏
+            // 这边自绘的 ✕ 与视图切换。与设置面板同一取舍。(2026-09-19 补记:
+            // 原先记的是「0.5.1 没有 svg 资产 → 渲染成空白,等于埋一块看不见的
+            // 可点区」—— 入口已挂 `gpui_kit_assets::Assets`,它现在画得出来了,
+            // 于是从「看不见的可点区」变成「看得见的第二颗 ✕」,照样得关掉)
             .close_button(false)
             .child(
                 div()
@@ -1305,7 +1307,7 @@ pub fn open_commit_diff(
                                 .text_color(color)
                                 .child(letter),
                         )
-                        .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
+                        .child(div().min_w(px(0.0)).truncate().child(name))
                         .on_click(move |_: &ClickEvent, _window, cx| {
                             if pick.read(cx).selected == path {
                                 return;
@@ -1401,7 +1403,8 @@ pub fn open_commit_diff(
                                 .max_w(px(400.0))
                                 .text_size(ui::font_px(13.0))
                                 .text_color(ui::text_primary())
-                                .child(TruncatedText::new(selected.clone())),
+                                .truncate()
+                                .child(selected.clone()),
                         )
                         .child(view_toggle(
                             &state,

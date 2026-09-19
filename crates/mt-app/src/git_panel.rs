@@ -40,7 +40,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 use mt_project::git::{BranchInfo, GitRepoInfo};
-use mt_ui::TruncatedText;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
@@ -762,21 +762,21 @@ impl GitPanel {
                             .max_w(px(90.0))
                             .text_size(ui::font_px(12.0))
                             .text_color(ui::text_muted())
-                            .child(TruncatedText::new(format!("{detail}/"))),
+                            .truncate()
+                            .child(format!("{detail}/")),
                     )
                 })
                 .child(
                     div()
                         .min_w(px(0.0))
                         .text_size(ui::font_px(13.0))
-                        .child(TruncatedText::new(repo_name)),
+                        .truncate()
+                        .child(repo_name),
                 )
                 .when(is_worktree, |el| {
                     el.child(div().text_size(ui::font_px(13.0)).text_color(ui::text_muted()).child("⎇"))
                 })
-                .tooltip(move |window, cx| {
-                    mt_ui::tooltip::Tooltip::new(repo_path_tip.clone()).build(window, cx)
-                })
+                .tip(repo_path_tip)
                 .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     let entries = this.repo_menu(cx);
                     menu::show(event.position(), entries, window, cx);
@@ -795,7 +795,8 @@ impl GitPanel {
         // 一起收缩(两边都 `min_w(0)` + 省略截断),右侧三个按钮永不让位。
         // 徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,分支名
         // 通常比仓库名长得多,等权会把仓库名先挤成「re…」。截断时全名挂 tooltip。
-        // 截断不能用 `truncate()`,理由见 `mt_ui::truncated_text` 模块注释。
+        // 分支名单独套一层 `min_w_0().truncate()`:徽章行里还有「▾」,`truncate()`
+        // 直接挂徽章上会把那个箭头也卷进 nowrap/省略的文本流。
         if let Some(branch) = display_branch {
             let (bg, fg) = if viewing_other {
                 (
@@ -821,7 +822,7 @@ impl GitPanel {
                     .bg(bg)
                     .text_color(fg)
                     .text_size(ui::font_px(13.0))
-                    .child(TruncatedText::new(branch))
+                    .child(div().min_w_0().truncate().child(branch))
                     .child(
                         div()
                             .flex_none()
@@ -829,9 +830,7 @@ impl GitPanel {
                             .opacity(0.7)
                             .child("▾"),
                     )
-                    .tooltip(move |window, cx| {
-                        mt_ui::tooltip::Tooltip::new(branch_tip.clone()).build(window, cx)
-                    })
+                    .tip(branch_tip)
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
                         if this.branches.is_empty() {
@@ -910,9 +909,7 @@ impl GitPanel {
                 el.cursor_pointer().hover(|el| el.text_color(ui::text_primary()))
             })
             .child(glyph)
-            .tooltip(move |window, cx| {
-                mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-            })
+            .tip(tip)
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.run_sync(pull, cx)
             }))

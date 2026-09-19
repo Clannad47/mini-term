@@ -2,12 +2,18 @@
 //!
 //! # 为什么不用 `gpui_component::time::DatePicker`
 //!
-//! 与 [`crate::menu`] 拒绝 `PopupMenu` 是同一个坑,而且这次是全盲的:
-//! `date_picker.rs:426` 的触发钮画 `Icon::new(IconName::Calendar)`、`calendar.rs`
-//! 的翻月钮画 `IconName::ArrowLeft/ArrowRight`,三者都走 `AssetSource` 取 svg,
-//! **0.5.1 的 crate 包里一个 svg 都没有**(上游把 lucide 放在示例程序的资产目录),
-//! 宿主也没注册 `AssetSource` —— 渲染出来是三块空白,且编译期无感。
-//! 图标改走 [`mt_ui::icons::vector`] 自绘,浮层壳照抄 `menu.rs` 那套。
+//! 当初的判据是图标全盲:`date_picker.rs:426` 的触发钮画
+//! `Icon::new(IconName::Calendar)`、`calendar.rs` 的翻月钮画
+//! `IconName::ArrowLeft/ArrowRight`,三者都走 `AssetSource` 取 svg,而 0.5.1 的
+//! crate 包里一个 svg 都没有、宿主也没注册。**2026-09-19 补记**:入口已挂
+//! `gpui_kit_assets::Assets`(见 `main.rs` 的 `with_assets`),这条判据作废 ——
+//! 上游那三枚图标现在画得出来。
+//!
+//! 仍然自绘的理由:上游 `DatePicker` 的文字走 `input_text_size` → `text_sm`,
+//! 是 **rem 定死的 14px**,不跟 [`crate::ui::font_px`] 的 UI 字号缩放走
+//! (0.6.2 仍如此,见 `docs/gpui-migration-progress.md` 的日期框记档);配色也取
+//! `cx.theme()` 而不是壳的 [`crate::ui`]。换回上游得先 spike 这两条。
+//! 现状:图标走 [`mt_ui::icons::vector`] 自绘,浮层壳照抄 `menu.rs` 那套。
 //!
 //! # 层级与定位
 //!
@@ -37,6 +43,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::overlay;
@@ -257,9 +264,7 @@ impl DatePicker {
             .cursor_pointer()
             .text_color(ui::text_muted())
             .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-            .tooltip(move |window, cx| {
-                mt_ui::tooltip::Tooltip::new(tip).build(window, cx)
-            })
+            .tip(tip)
             .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
                 this.step_month(delta, cx);
             }))
@@ -462,7 +467,7 @@ pub fn trigger_button(
         .cursor_pointer()
         .text_color(ui::text_muted())
         .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-        .tooltip(move |window, cx| mt_ui::tooltip::Tooltip::new(tip).build(window, cx))
+        .tip(tip)
         .on_click(move |event: &gpui::ClickEvent, window, cx| {
             let at = event.position();
             on_open(point(at.x - px(24.0), at.y + px(14.0)), window, cx);

@@ -25,21 +25,22 @@
 //!    ripgrep 级别的重活,边打字边搜会把磁盘打满)。这里照此,不加去抖。
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, Global, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, Global, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::search::{
     SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
 };
-use mt_ui::TruncatedText;
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::menu;
@@ -103,6 +104,11 @@ pub struct SearchModal {
     /// 单击结果后短暂保留浮层，让同一行的第二击仍能到达。替换或丢弃句柄即取消。
     _close_task: Option<Task<()>>,
     close_generation: u64,
+    /// 结果虚拟列表的滚动位置。**必须存在视图上**:`v_virtual_list` 内部给
+    /// `base` 挂的是 `track_scroll`,而 gpui 一旦 track 了句柄就以句柄里的
+    /// offset 为准、不再读元素自己的跨帧状态(`elements/div.rs:2267`)——
+    /// 每帧新建一个句柄等于每帧把滚动位置清零。
+    results_scroll: VirtualListScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -178,8 +184,10 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
             let height = viewport.height * 0.7;
             dialog
                 .p_0()
-                // 头部有自己的 ✕;`close_button` 画的是 `IconName::Close`,
-                // 而 0.5.1 不带 svg 资产(渲染成空白且编译期无感)
+                // 头部有自己的 ✕;上游 `close_button` 是绝对定位到面板右上角的一颗,
+                // `p_0()` 满幅布局下会压住自绘头部,两颗都开就是两个 ×。
+                // (2026-09-19 前的理由「0.5.1 不带 svg 资产、画出来是空白」已随
+                // 入口挂上 `gpui_kit_assets::Assets` 作废。)
                 .close_button(false)
                 // 输了半天的查询词,误点遮罩就没了 —— 原版 `closeOnOverlay={false}`
                 .overlay_closable(false)
@@ -224,6 +232,7 @@ impl SearchModal {
             _pump: None,
             _close_task: None,
             close_generation: 0,
+            results_scroll: VirtualListScrollHandle::new(),
             _subs: vec![sub, project_sub],
         }
     }
@@ -478,6 +487,92 @@ pub fn group_by_file(results: &[SearchResultItem]) -> Vec<(String, Vec<usize>)> 
     groups
 }
 
+/// 结果区展平成的一维行表。虚拟列表按**下标**取行,分组头与命中行因此要摊在
+/// 同一张表上(原来是 `for 分组 { 头; for 命中 { 行 } }` 的嵌套建元素)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultRow {
+    /// 内容搜索的分组头:文件名 / 相对路径 / 该文件下的命中数。
+    Group {
+        name: SharedString,
+        path: SharedString,
+        count: usize,
+    },
+    /// 文件名搜索的一行(下标指向 `results`)。
+    File(usize),
+    /// 内容搜索的一条命中(下标指向 `results`)。
+    Hit(usize),
+    /// 末尾那条「结果已截断」提示条 —— 它本来就在滚动区里,跟着一起虚拟化。
+    Truncated,
+}
+
+/// 结果集 → 行表。文件名模式一行一条;内容模式按 [`group_by_file`] 的顺序
+/// 摊平成「头 + 若干命中」;满 `cap` 时末尾补一条截断提示。
+pub fn result_rows(results: &[SearchResultItem], mode: SearchMode, cap: usize) -> Vec<ResultRow> {
+    let mut rows = Vec::new();
+    if !results.is_empty() {
+        match mode {
+            SearchMode::FileName => rows.extend((0..results.len()).map(ResultRow::File)),
+            SearchMode::FileContent => {
+                for (path, indices) in group_by_file(results) {
+                    rows.push(ResultRow::Group {
+                        name: results[indices[0]].file_name.clone().into(),
+                        path: path.into(),
+                        count: indices.len(),
+                    });
+                    rows.extend(indices.into_iter().map(ResultRow::Hit));
+                }
+            }
+        }
+    }
+    if results.len() >= cap {
+        rows.push(ResultRow::Truncated);
+    }
+    rows
+}
+
+/// 每种行有多高。虚拟列表要在**不建元素**的前提下拿到每行高度
+/// (`v_virtual_list` 的 `item_sizes`),所以行高不能由内容撑起来 —— 每种行
+/// 都钉成「上下留白 + 一行文字」,行元素本身也写同一个高度值,与
+/// `git_diff` 里 uniform_list 那套是同一个口径(高度对不上就会裁字或留缝)。
+///
+/// 一行文字有多高按窗口当下的口径现算:`TextStyle::line_height` 是相对量
+/// (默认 φ),跟着**行内最大字号**走,再按设备像素对齐 —— 与 gpui 画文本时
+/// (`elements/text.rs`)算的是同一个数,因此换 UI 字号 / 换 DPI 都不用改常量。
+#[derive(Clone, Copy)]
+struct RowMetrics {
+    group: Pixels,
+    file: Pixels,
+    hit: Pixels,
+    truncated: Pixels,
+}
+
+impl RowMetrics {
+    fn measure(window: &Window) -> Self {
+        let style = window.text_style();
+        let rem = window.rem_size();
+        let line = |font: f32| {
+            window.pixel_snap(style.line_height.to_pixels(ui::font_px(font).into(), rem))
+        };
+        Self {
+            // 分组头 py(6)、文件名行 py(6)(行内最大字号 12)、
+            // 命中行 py(4)、截断条 py(8)
+            group: line(10.0) + px(12.0),
+            file: line(12.0) + px(12.0),
+            hit: line(10.0) + px(8.0),
+            truncated: line(10.0) + px(16.0),
+        }
+    }
+
+    fn of(&self, row: &ResultRow) -> Pixels {
+        match row {
+            ResultRow::Group { .. } => self.group,
+            ResultRow::File(_) => self.file,
+            ResultRow::Hit(_) => self.hit,
+            ResultRow::Truncated => self.truncated,
+        }
+    }
+}
+
 /// 底部状态条那一句。四个分支逐条对照原版。
 fn status_text(status: Status, mode: SearchMode, shown: usize, total: u32) -> String {
     match status {
@@ -660,9 +755,7 @@ impl SearchModal {
                             .border_color(ui::border_default())
                             .hover(|el| el.text_color(ui::text_primary()))
                     })
-                    .tooltip(|window, cx| {
-                        Tooltip::new(t("search", "regexTitle")).build(window, cx)
-                    })
+                    .tip(t("search", "regexTitle"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.use_regex = !this.use_regex;
                         cx.notify();
@@ -708,7 +801,11 @@ impl SearchModal {
         menu::show(position, entries, window, cx);
     }
 
-    fn render_result_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    /// ⚠️ 行根必须 `w_full` + 钉死 `h`:虚拟列表把每一行当根元素单量
+    /// (`layout_as_root(Definite(列宽) × Definite(行高))`),不给 `w_full`
+    /// 时 flex 行按 fit-content 收窄、hover 底色只盖住文字那一截;高度与
+    /// `RowMetrics` 对不上则裁字或留缝。
+    fn render_result_row(&self, index: usize, h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let item = &self.results[index];
         let line_no = item.line_number.map(|n| n.to_string()).unwrap_or_default();
         let content = item.line_content.clone().unwrap_or_default();
@@ -719,8 +816,9 @@ impl SearchModal {
             .flex()
             .items_center()
             .gap(px(8.0))
+            .w_full()
+            .h(h)
             .px(px(16.0))
-            .py(px(4.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
             .on_click(
@@ -750,9 +848,11 @@ impl SearchModal {
                     .child(line_no),
             )
             .child(highlighted(&content, &ranges, 10.0))
+            .into_any_element()
     }
 
-    fn render_filename_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 见 [`Self::render_result_row`] 的 `w_full` / `h` 注释。
+    fn render_filename_row(&self, index: usize, h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let item = &self.results[index];
         let name = item.file_name.clone();
         let path = item.file_path.display().to_string();
@@ -769,8 +869,9 @@ impl SearchModal {
             .flex()
             .items_center()
             .gap(px(8.0))
+            .w_full()
+            .h(h)
             .px(px(16.0))
-            .py(px(6.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
             .on_click(
@@ -797,30 +898,78 @@ impl SearchModal {
                     .min_w(px(0.0))
                     .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
-                    .child(TruncatedText::new(path))
+                    .truncate()
+                    .child(path)
                     .into_any_element()
             } else {
                 highlighted_on(&path, &path_ranges, 10.0, ui::text_muted()).into_any_element()
             })
+            .into_any_element()
     }
-}
 
-impl Render for SearchModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div()
-            .id("search-results")
-            .flex_1()
-            .overflow_y_scroll()
-            .bg(ui::bg_base());
+    /// 分组头。原版是 `sticky top-0`,gpui 没有 sticky,画成普通行(见模块注释)。
+    fn render_group_row(
+        &self,
+        name: &SharedString,
+        path: &SharedString,
+        count: usize,
+        h: Pixels,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .w_full()
+            .h(h)
+            .px(px(16.0))
+            .bg(ui::bg_elevated())
+            .text_size(ui::font_px(10.0))
+            .text_color(ui::accent())
+            .child(div().flex_none().child(name.clone()))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .text_color(ui::text_muted())
+                    .truncate()
+                    .child(path.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(ui::text_muted())
+                    .child(format!("({count})")),
+            )
+            .into_any_element()
+    }
 
+    /// 「只显示前 N 条」提示条。
+    fn render_truncated_row(&self, h: Pixels) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(h)
+            .px(px(16.0))
+            .bg(ui::bg_elevated())
+            .text_size(ui::font_px(10.0))
+            .text_color(ui::color_warning())
+            .child(t("search", "truncated"))
+            .into_any_element()
+    }
+
+    /// 结果区。最多 [`MAX_RESULTS`] 条,**只建可见的那几行**:
+    /// `v_virtual_list` 支持逐行不同高(分组头 / 命中行 / 文件名行 / 截断条
+    /// 四种),行高由 [`RowMetrics`] 预先算出,定位走前缀和 + 二分。
+    fn render_results(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.results.is_empty() {
             let hint = match self.status {
                 Status::Searching => Some(t("search", "searching")),
                 Status::Idle => Some(t("search", "idleHint")),
                 Status::Done => None,
             };
+            let mut body = div().size_full();
             if let Some(hint) = hint {
-                list = list.child(
+                body = body.child(
                     div()
                         .flex()
                         .items_center()
@@ -831,55 +980,58 @@ impl Render for SearchModal {
                         .child(hint),
                 );
             }
-        } else if self.mode == SearchMode::FileName {
-            for index in 0..self.results.len() {
-                list = list.child(self.render_filename_row(index, cx));
-            }
-        } else {
-            for (file, indices) in group_by_file(&self.results) {
-                let head = self.results[indices[0]].file_name.clone();
-                let count = indices.len();
-                list = list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .px(px(16.0))
-                        .py(px(6.0))
-                        .bg(ui::bg_elevated())
-                        .text_size(ui::font_px(10.0))
-                        .text_color(ui::accent())
-                        .child(div().flex_none().child(head))
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .text_color(ui::text_muted())
-                                .child(TruncatedText::new(file.clone())),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(ui::text_muted())
-                                .child(format!("({count})")),
-                        ),
-                );
-                for index in indices {
-                    list = list.child(self.render_result_row(index, cx));
-                }
-            }
+            return body.into_any_element();
         }
 
-        if self.results.len() >= MAX_RESULTS {
-            list = list.child(
-                div()
-                    .px(px(16.0))
-                    .py(px(8.0))
-                    .bg(ui::bg_elevated())
-                    .text_size(ui::font_px(10.0))
-                    .text_color(ui::color_warning())
-                    .child(t("search", "truncated")),
-            );
-        }
+        let metrics = RowMetrics::measure(window);
+        let rows = Rc::new(result_rows(&self.results, self.mode, MAX_RESULTS));
+        let sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
+            rows.iter()
+                .map(|row| size(px(0.0), metrics.of(row)))
+                .collect(),
+        );
+        v_virtual_list(cx.entity(), "search-results", sizes, {
+            let rows = rows.clone();
+            move |this, range, _window, cx| {
+                range
+                    .filter_map(|ix| {
+                        let row = rows.get(ix)?;
+                        Some(match row {
+                            ResultRow::Group { name, path, count } => {
+                                this.render_group_row(name, path, *count, metrics.group)
+                            }
+                            ResultRow::File(index) => {
+                                this.render_filename_row(*index, metrics.file, cx)
+                            }
+                            ResultRow::Hit(index) => {
+                                this.render_result_row(*index, metrics.hit, cx)
+                            }
+                            ResultRow::Truncated => this.render_truncated_row(metrics.truncated),
+                        })
+                    })
+                    .collect()
+            }
+        })
+        .track_scroll(&self.results_scroll)
+        // 组件库给 base 挂的是双轴 `overflow_scroll`,这里关掉横轴,与换掉的
+        // `overflow_y_scroll()` 一致:横向内容宽是拿**第一行**量出来的,首帧还
+        // 没有列宽可量时量的是 min-content(一整行不回绕的命中文本),会凭空
+        // 多出一段横向可滚范围
+        .overflow_x_hidden()
+        .into_any_element()
+    }
+}
+
+impl Render for SearchModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 虚拟列表自带 `size_full`,撑开那一格交给外面这层 `flex_1`
+        // (原来是滚动容器自己 `flex_1`);`overflow_hidden` 顺带把 flex 项的
+        // 自动最小高度压成 0,不然 1000 行的内容高会把这一格顶出弹窗。
+        let list = div()
+            .flex_1()
+            .overflow_hidden()
+            .bg(ui::bg_base())
+            .child(self.render_results(window, cx));
 
         div()
             .size_full()
@@ -1010,6 +1162,50 @@ mod tests {
     #[test]
     fn 空结果集分组为空() {
         assert!(group_by_file(&[]).is_empty());
+    }
+
+    /// 虚拟列表按下标取行,所以分组头与命中行要摊在同一张表上:内容模式是
+    /// 「头 + 该文件的命中」按分组顺序铺开,文件名模式一行一条,没有分组头。
+    #[test]
+    fn 结果行表按分组摊平() {
+        let results = vec![
+            item("src/a.rs", 1),
+            item("src/b.rs", 7),
+            item("src/a.rs", 9),
+        ];
+        assert_eq!(
+            result_rows(&results, SearchMode::FileContent, MAX_RESULTS),
+            vec![
+                ResultRow::Group {
+                    name: "a.rs".into(),
+                    path: "src/a.rs".into(),
+                    count: 2,
+                },
+                ResultRow::Hit(0),
+                ResultRow::Hit(2),
+                ResultRow::Group {
+                    name: "b.rs".into(),
+                    path: "src/b.rs".into(),
+                    count: 1,
+                },
+                ResultRow::Hit(1),
+            ]
+        );
+        assert_eq!(
+            result_rows(&results, SearchMode::FileName, MAX_RESULTS),
+            vec![ResultRow::File(0), ResultRow::File(1), ResultRow::File(2)]
+        );
+        // 空结果没有任何行(空态另画,不进虚拟列表)
+        assert!(result_rows(&[], SearchMode::FileContent, MAX_RESULTS).is_empty());
+        // 满了才在末尾补截断条,它也是一行(原来挂在滚动容器末尾)
+        assert_eq!(
+            result_rows(&results, SearchMode::FileName, 3).last(),
+            Some(&ResultRow::Truncated)
+        );
+        assert!(
+            !result_rows(&results, SearchMode::FileName, 4).contains(&ResultRow::Truncated),
+            "没满不挂截断条"
+        );
     }
 
     /// 状态条四个分支:搜索中报**已显示条数**、结束报后端的**完整总数**、

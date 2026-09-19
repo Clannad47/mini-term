@@ -28,8 +28,10 @@
 //!    互相错开,notify 频率 = N × 62Hz,等于每个 vsync 都撞上一次 dirty。
 //! 2. **降频**:前台 [`ACTIVE_PERIOD`](30fps)。终端 30fps 与 60fps 肉眼无差,
 //!    帧数直接减半。
-//! 3. **后台大幅降频**:窗口失焦/最小化时 [`IDLE_PERIOD`](5fps)。挂着 AI 跑、
+//! 3. **失焦降频**:窗口失焦(但仍看得见)时 [`IDLE_PERIOD`](5fps)。挂着 AI 跑、
 //!    人切去浏览器是常态,那时按满帧重绘整窗是纯浪费。
+//! 4. **不可见即停**:窗口最小化 / 被系统判为不呈现时**一帧都不画**,泵连同
+//!    定时器一起收摊(见 [`set_window_visible`])。
 //!
 //! # 手感:leading edge 不欠债
 //!
@@ -55,7 +57,7 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use gpui::{App, WeakEntity};
+use gpui::{App, Subscription, WeakEntity};
 
 use crate::pane::TerminalPane;
 
@@ -67,9 +69,13 @@ const ACTIVE_PERIOD: Duration = Duration::from_millis(33);
 
 /// 后台节拍:5fps。
 ///
-/// 窗口失焦/最小化时用。**不取 0(彻底停)** 是刻意的:切回来那一瞬间要是还在等
-/// 下一次输出才重绘,用户会看见一段陈旧画面;5fps 保证最坏情况下也就落后 200ms,
-/// 而 [`set_window_active`] 在切回前台时还会再当场 flush 一次兜住。
+/// 窗口**失焦但仍看得见**时用(另一扇窗口盖在上面、多屏摆在旁边)。
+/// **不取 0(彻底停)** 是刻意的:画面还在人眼前,要是等下一次输出才重绘,
+/// 用户会看见一段陈旧画面;5fps 保证最坏情况下也就落后 200ms,而
+/// [`set_window_active`] 在切回前台时还会再当场 flush 一次兜住。
+///
+/// ⚠️ 别把这一档与「不可见」混为一谈:最小化走的是 [`set_window_visible`]
+/// 那条**真·0 帧**的路,两者互不干扰。
 const IDLE_PERIOD: Duration = Duration::from_millis(200);
 
 thread_local! {
@@ -77,20 +83,15 @@ thread_local! {
 }
 
 /// 节拍器本体。
+#[derive(Default)]
 struct Pump {
     /// 这一拍攒下来、等着 `notify` 的 pane。**按 `EntityId` 去重** ——
     /// 一个 pane 在一拍里刷了一百次屏,也只该画一帧。
     pending: Vec<WeakEntity<TerminalPane>>,
     schedule: Schedule,
-}
-
-impl Default for Pump {
-    fn default() -> Self {
-        Self {
-            pending: Vec::new(),
-            schedule: Schedule::default(),
-        }
-    }
+    /// 「窗口可见性」订阅句柄。一 drop 就退订,所以必须存住;
+    /// `Some` 同时充当「已经挂过了」的标记。见 [`ensure_visibility_observer`]。
+    visibility: Option<Subscription>,
 }
 
 /// 泵的调度状态机。**刻意不含任何 gpui 类型** —— 节拍与停泵的判断全在这里,
@@ -99,15 +100,20 @@ impl Default for Pump {
 struct Schedule {
     /// 窗口在前台吗。见 [`set_window_active`]。
     active: bool,
+    /// 窗口的画面**在被呈现**吗。最小化 / 显示器休眠时为 `false`,
+    /// 见 [`set_window_visible`]。
+    visible: bool,
     /// 泵正在跑吗。同一时刻只该有一条。
     running: bool,
 }
 
 impl Default for Schedule {
     fn default() -> Self {
-        // 窗口起来就是前台的;真实状态随后由 `set_window_active` 校正
+        // 窗口起来就是前台且可见的;真实状态随后由 `set_window_active` /
+        // `set_window_visible` 校正
         Self {
             active: true,
+            visible: true,
             running: false,
         }
     }
@@ -124,8 +130,11 @@ impl Schedule {
     }
 
     /// 登记了一次重绘请求。返回**是否需要起泵**(泵已经在跑就不重复起)。
+    ///
+    /// 窗口不可见时恒 `false`:请求只在 `pending` 里攒着,一帧都不画,
+    /// 等 [`set_window_visible`] 把它们一次性兑现。
     fn arm(&mut self) -> bool {
-        if self.running {
+        if self.running || !self.visible {
             return false;
         }
         self.running = true;
@@ -135,9 +144,10 @@ impl Schedule {
     /// 一拍走完。`had_work` = 这一拍有没有 flush 到东西。
     ///
     /// 返回**是否该停泵**:空跑一拍就收摊,别让一条 33ms 的定时器在没人用的时候
-    /// 一直转下去(那正是这个模块要消灭的东西)。
+    /// 一直转下去(那正是这个模块要消灭的东西)。窗口不可见时同样收摊 ——
+    /// 那一拍压根没 flush,连定时器都不该留着。
     fn tick(&mut self, had_work: bool) -> bool {
-        if had_work {
+        if had_work && self.visible {
             return false;
         }
         self.running = false;
@@ -149,6 +159,8 @@ impl Schedule {
 ///
 /// 同一拍里同一个 pane 登记多次只画一帧;多个 pane 一起登记也只画一帧。
 pub fn request(pane: WeakEntity<TerminalPane>, cx: &mut App) {
+    ensure_visibility_observer(cx);
+
     let start = PUMP.with(|pump| {
         let mut pump = pump.borrow_mut();
         let id = pane.entity_id();
@@ -162,7 +174,7 @@ pub fn request(pane: WeakEntity<TerminalPane>, cx: &mut App) {
     }
 
     // 前沿:空闲时的第一次请求当场兑现,不欠用户一拍的回显延迟
-    flush(cx);
+    flush_visible(cx);
 
     // gpui-pre 的 `AsyncApp::update` 不再会失败:App 退出时这个任务连同循环一起
     // 被丢弃,不必再有「App 没了就收 running」的尾巴。
@@ -170,7 +182,7 @@ pub fn request(pane: WeakEntity<TerminalPane>, cx: &mut App) {
         loop {
             let period = PUMP.with(|pump| pump.borrow().schedule.period());
             cx.background_executor().timer(period).await;
-            let had_work = cx.update(flush);
+            let had_work = cx.update(flush_visible);
             if PUMP.with(|pump| pump.borrow_mut().schedule.tick(had_work)) {
                 return;
             }
@@ -193,8 +205,88 @@ pub fn set_window_active(active: bool, cx: &mut App) {
         true
     });
     if changed && active {
-        flush(cx);
+        flush_visible(cx);
     }
+}
+
+/// 窗口的画面是否在被呈现(gpui-pre 的 [`gpui::WindowVisibility`])。
+///
+/// # 为什么它与「激活态」是两件事
+///
+/// 失焦但看得见 → 画面还在人眼前,只能降频([`IDLE_PERIOD`]);
+/// **最小化 / 显示器休眠** → 一个像素都没人看,画多少帧都是纯浪费。
+/// gpui 在这种状态下本来就不再向平台要帧了(`platform.rs` 的
+/// `WindowVisibility::Hidden` 文档原文:「The platform will not request frames
+/// for it until it becomes visible again」),但**我们的泵会把它叫醒** ——
+/// `cx.notify` 一路走到 `WindowInvalidator::wake_platform`(`window.rs:229-237`,
+/// 由 `invalidate_view`(`window.rs:166-191`)在 `became_dirty` 时调起,
+/// 注释写明「so a frame request is delivered even if the platform stops
+/// requesting frames for idle windows」)。所以「彻底停泵」这件事只能由这里做。
+///
+/// 停的方式是**连定时器一起收**:不可见时 `arm` 不起泵、在跑的那条下一拍自停
+/// (见 [`Schedule::tick`]),期间的重绘请求照旧攒在 `pending` 里。
+/// 恢复可见时当场 flush 一次补上 —— 与 [`set_window_active`] 同款前沿语义,
+/// 否则最小化期间 AI 状态变了,还原后徽章会停在旧样子直到下一次输出。
+pub fn set_window_visible(visible: bool, cx: &mut App) {
+    let changed = PUMP.with(|pump| {
+        let mut pump = pump.borrow_mut();
+        if pump.schedule.visible == visible {
+            return false;
+        }
+        pump.schedule.visible = visible;
+        true
+    });
+    if changed && visible {
+        // 此刻 `visible` 已置位,`flush_visible` 必然放行
+        flush_visible(cx);
+    }
+}
+
+/// 惰性挂上「窗口可见性」订阅,只挂一次(句柄存在泵上,一 drop 就退订)。
+///
+/// # 为什么挂在这里而不是宿主里
+///
+/// `set_window_active` 那条是宿主挂的,因为它顺带还要改 store 的「窗口聚焦」态;
+/// 可见性**只有这条泵关心**,挂进来就不必让 `Workspace` 多背一个字段。
+/// 时机上也安全:第一次 PTY 有输出时窗口必然已经建好,而本函数的唯一调用点
+/// [`request`] 是从 pane 的唤醒循环(异步任务)进来的,窗口不在更新中 ——
+/// 万一撞上,`AnyWindowHandle::update` 返回 `Err` 而不是 panic
+/// (`app.rs:1919-1924` 里那句 `windows.get_mut(id)?.take()?`),下一次输出再试。
+///
+/// 本程序是单窗(`main.rs` 只 `open_window` 一次),取第一扇即可。
+fn ensure_visibility_observer(cx: &mut App) {
+    if PUMP.with(|pump| pump.borrow().visibility.is_some()) {
+        return;
+    }
+    let Some(handle) = cx.windows().first().copied() else {
+        return;
+    };
+    let installed = handle.update(cx, |_, window, _| {
+        let visible = window.is_visible();
+        let subscription = window.observe_window_visibility(|visibility, _window, cx| {
+            set_window_visible(visibility.is_visible(), cx);
+        });
+        (visible, subscription)
+    });
+    if let Ok((visible, subscription)) = installed {
+        PUMP.with(|pump| {
+            let mut pump = pump.borrow_mut();
+            // 订阅只报**变化**,当前值在这里对齐一次
+            pump.schedule.visible = visible;
+            pump.visibility = Some(subscription);
+        });
+    }
+}
+
+/// 可见时才画。**所有 flush 调用点统一走这道闸** —— 不可见时一帧都不画,
+/// `pending` 原样攒着,等 [`set_window_visible`] 一次性兑现。
+///
+/// 返回值同 [`flush`],不可见时恒 `false`:泵的 [`Schedule::tick`] 据此收摊。
+fn flush_visible(cx: &mut App) -> bool {
+    if !PUMP.with(|pump| pump.borrow().schedule.visible) {
+        return false;
+    }
+    flush(cx)
 }
 
 /// 把这一拍攒下的 pane 一次画完。返回**这一拍有没有活干**。
@@ -274,5 +366,48 @@ mod tests {
         s.active = false;
         assert!(s.running);
         assert_eq!(s.period(), IDLE_PERIOD);
+    }
+
+    #[test]
+    fn 不可见时一拍都不起() {
+        // 最小化:请求照收(攒在 pending 里),但一帧都不画
+        let mut s = Schedule::default();
+        s.visible = false;
+        assert!(!s.arm(), "不可见时不许起泵");
+        assert!(!s.running);
+        assert!(!s.arm());
+    }
+
+    #[test]
+    fn 跑着的泵在窗口不可见时自停() {
+        // 有活也停 —— 那一拍压根没 flush,留着定时器就是白转
+        let mut s = Schedule::default();
+        s.arm();
+        s.visible = false;
+        assert!(s.tick(false), "不可见时即便上一拍有活也该收摊");
+        assert!(!s.running);
+    }
+
+    #[test]
+    fn 恢复可见后泵能重新起来() {
+        let mut s = Schedule::default();
+        s.visible = false;
+        assert!(!s.arm());
+        s.visible = true;
+        assert!(s.arm(), "恢复可见后下一次输出要能把泵重新起起来");
+        assert!(s.running);
+    }
+
+    #[test]
+    fn 失焦与不可见是两档互不干扰() {
+        // 失焦但看得见:降频到 5fps,照常起泵
+        let mut s = Schedule::default();
+        s.active = false;
+        assert!(s.arm());
+        assert_eq!(s.period(), IDLE_PERIOD);
+        // 再最小化:这一档才是真的 0 帧
+        s.visible = false;
+        assert!(s.tick(true));
+        assert!(!s.arm());
     }
 }

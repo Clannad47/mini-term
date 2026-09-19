@@ -73,9 +73,9 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Corners, DispatchPhase, Element, ElementId, FocusHandle,
-    FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    App, Bounds, ClipboardItem, ContentMask, Corners, DispatchPhase, Element, ElementId, EntityId,
+    FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, Style, StrikethroughStyle,
     TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
@@ -686,7 +686,31 @@ impl TerminalElement {
         }
     }
 
+    /// # 为什么这一整套监听器里一个 `window.refresh()` 都没有
+    ///
+    /// `refresh()` 置的是 `Window::refreshing` 位(gpui-pre `window.rs:2248-2253`),
+    /// 而 view 级缓存的复用判据里就有 `&& !window.refreshing`
+    /// (`view.rs:386-392`)—— 一置位,**全窗所有 `.cached(style)` 的 view 当帧全部作废**。
+    /// 宿主那边 `main.rs::cached_panel` 套着项目列表 / 文件树 / 面板竖条三块,
+    /// 于是「拖选一次 = 每个 mouse-move 把那三块整套重跑一遍 render」。
+    ///
+    /// 换成 `cx.notify(view_id)`:`App::notify` 走 `invalidate_view`
+    /// (`window.rs:166-191`)把窗口标脏 + 唤醒平台帧源,绘制时
+    /// `mark_view_dirty`(`window.rs:2140-2152`)只沿**这个 view 到根**那条路径
+    /// 标脏,旁支的 cached 面板照走缓存。语义与上游 `request_animation_frame`
+    /// (`window.rs:2606-2609`,同样是 `cx.notify(current_view())`)一致 ——
+    /// 滚动条淡出本来就走那条路,这里只是把鼠标交互也并过去。
+    /// 本模块自己量过这个倍率:见 `crate::motion` 的「refresh 路单帧 CPU
+    /// ≈ notify 路 4.6 倍」。
+    ///
+    /// 这些回调改的**全是终端元素自己的画面**(回看位置、选区、滚动条滑块),
+    /// 没有一处会改别的面板要读的状态,所以逐处核对下来一个都不必保留 refresh。
+    /// 唯一的例外是宿主主动关心的「停留复制」——那条另有 `on_selection_copied`
+    /// 回调让宿主自己 notify(`pane.rs` 里弹「已复制」气泡的那段)。
     fn paint_mouse_listeners(&self, prepared: &PreparedFrame, window: &mut Window, _cx: &mut App) {
+        // paint 阶段取当前视图 id(`current_view` 断言必须在 prepaint/paint 里),
+        // move 进下面每个闭包 —— 闭包跑的时候已经不在绘制期,取不到了
+        let view_id = window.current_view();
         let hitbox = prepared.hitbox.clone();
         let origin = prepared.origin;
         let cell_size = prepared.cell_size;
@@ -773,7 +797,8 @@ impl TerminalElement {
                 emulator.with_term_mut(|term| term.scroll_display(Scroll::Delta(whole as i32)));
                 // 滚了就把滚动条亮起来(淡出重新计时)
                 touched.set(Some(Instant::now()));
-                window.refresh();
+                // 变的只有本元素的回看位置与滚动条,不必用 refresh 把别的面板一起作废
+                cx.notify(view_id);
             });
         }
 
@@ -814,7 +839,8 @@ impl TerminalElement {
                                 hovered: true,
                             });
                             touched.set(Some(Instant::now()));
-                            window.refresh();
+                            // 滑块按下只改本元素的滚动条外观
+                            cx.notify(view_id);
                             return;
                         }
                         ScrollbarHit::Track => {
@@ -829,7 +855,8 @@ impl TerminalElement {
                                 hovered: true,
                             });
                             touched.set(Some(Instant::now()));
-                            window.refresh();
+                            // 轨道点击 = 本元素跳一段回看位置,同上
+                            cx.notify(view_id);
                             return;
                         }
                         ScrollbarHit::Miss => {}
@@ -855,7 +882,8 @@ impl TerminalElement {
                     // 程序接管鼠标了,残留的本地高亮只会让人误以为还能复制
                     emulator.with_term_mut(|term| term.selection = None);
                     selecting.set(false);
-                    window.refresh();
+                    // 抹掉的是本元素的高亮,别的面板没读过选区
+                    cx.notify(view_id);
                     return;
                 }
 
@@ -921,11 +949,13 @@ impl TerminalElement {
                         this_emulator.clone(),
                         on_copied.clone(),
                         element_size,
+                        view_id,
                         window,
                         cx,
                     ));
                 }
-                window.refresh();
+                // 起了个新选区,重画的只有本元素
+                cx.notify(view_id);
             });
         }
 
@@ -960,7 +990,9 @@ impl TerminalElement {
                             this_emulator.with_term_mut(|t| t.scroll_display(Scroll::Delta(delta)));
                         }
                         touched.set(Some(Instant::now()));
-                        window.refresh();
+                        // 拖滑块是最热的一条路(每个 mouse-move 一发),
+                        // 更不能让三块 cached 面板跟着重排
+                        cx.notify(view_id);
                         return;
                     }
                     let hovered = hitbox.is_hovered(window)
@@ -968,7 +1000,8 @@ impl TerminalElement {
                     if hovered != drag.hovered {
                         bar_drag.set(ScrollbarDrag { hovered, ..drag });
                         touched.set(Some(Instant::now()));
-                        window.refresh();
+                        // 滑块 hover 态是本元素自己的,不是全局 hover
+                        cx.notify(view_id);
                     }
                     // 悬在条上时不要顺手延伸选区;已经在拖选的除外(选区拖过条子底下)
                     if hovered && !selecting.get() {
@@ -994,6 +1027,7 @@ impl TerminalElement {
                         this_emulator.clone(),
                         on_copied.clone(),
                         element_size,
+                        view_id,
                         window,
                         cx,
                     ));
@@ -1044,7 +1078,10 @@ impl TerminalElement {
                         sel.update(Self::grid_point(col, row, display_offset), side);
                     }
                 });
-                window.refresh();
+                // ⚠️ 这是最热的一处:拖选一次 = 每个 mouse-move 一发。
+                // 原来的 refresh 会让三块 cached 面板逐帧重排,改用 notify 之后
+                // 只有这个终端视图重画
+                cx.notify(view_id);
             });
         }
 
@@ -1075,7 +1112,8 @@ impl TerminalElement {
                         ..drag
                     });
                     touched.set(Some(Instant::now()));
-                    window.refresh();
+                    // 松开滑块只改本元素的滑块态与淡出计时
+                    cx.notify(view_id);
                     return;
                 }
                 // 按下时上报过的键,松开必须配对上报 —— 否则 TUI 会一直以为鼠标还按着。
@@ -1147,6 +1185,9 @@ impl TerminalElement {
 ///
 /// 代号(`generation`)是第二道闸:定时器已经飞出去、句柄又被覆盖不掉的竞态下,
 /// 回来的那一发靠代号自己认赔。
+///
+/// `view_id` 由调用方在 paint 期取好传进来:定时器回来时已经不在绘制期,
+/// `window.current_view()` 那条断言过不去。
 #[allow(clippy::too_many_arguments)]
 fn arm_dwell(
     generation: u64,
@@ -1155,6 +1196,7 @@ fn arm_dwell(
     emulator: Arc<TerminalEmulator>,
     on_copied: Option<OnSelectionCopied>,
     element_size: (f32, f32),
+    view_id: EntityId,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Task<()> {
@@ -1179,7 +1221,9 @@ fn arm_dwell(
                 // 宿主把气泡 absolute 放在终端容器里就地对得上
                 cb(&text, origin, window, cx);
             }
-            window.refresh();
+            // 宿主那条回调自己会 notify 它的视图(「已复制」气泡挂在 pane 上),
+            // 这里只管本元素:选区高亮与停留态变了
+            cx.notify(view_id);
         });
     })
 }

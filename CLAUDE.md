@@ -23,6 +23,11 @@ MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 # 全工作区测试（27 个目标 1500+ 例）
 cargo test --workspace
 
+# 量化每帧 CPU / 帧时间 p50·p99 / 一帧合并了几次 invalidation（dev-only 度量工具，
+# 默认不编译；档位与读数解释见 crates/mt-app/src/frame_profiler.rs 的模块注释）
+cargo build -p mt-app --features frame-profiler
+MT_FRAME_OVERLAY=1 MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" ./target/debug/mini-term
+
 # 中转服务端协议边界测试 / sidecar 工作区
 cd relay-server && cargo test
 cargo build --manifest-path sidecars/Cargo.toml

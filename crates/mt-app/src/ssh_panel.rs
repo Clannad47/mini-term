@@ -47,7 +47,6 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
-use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -186,6 +185,7 @@ pub(crate) fn bucket_header(
     count: usize,
     collapsed: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
     div()
         .id(id)
         .w_full()
@@ -203,7 +203,7 @@ pub(crate) fn bucket_header(
                 .text_size(ui::font_px(10.0))
                 .child(if collapsed { "▸" } else { "▾" }),
         )
-        .child(div().min_w(px(0.0)).child(TruncatedText::new(label)))
+        .child(div().min_w(px(0.0)).truncate().child(label))
         .child(div().flex_none().child(format!("({count})")))
 }
 
@@ -212,8 +212,10 @@ pub(crate) fn bucket_header(
 /// **为什么不用 `Dialog::title` / `close_button`**:
 /// - 三个 SSH 弹窗的正文是「左栏 + 右栏」的**满幅**布局,Dialog 默认 24px 内边距
 ///   会把分隔线切断,所以一律 `.p_0()`,标题也就得自己画;
-/// - `Dialog::close_button` 画的是 `IconName::Close`,而 0.5.1 不带 svg 资产
-///   → 渲染成空白(见 `activity_bar` 模块注释),照原版画一个 `✕` 文本。
+/// - `Dialog::close_button` 那颗是**绝对定位**在面板右上角的独立 Button,`p_0()`
+///   之下落到 8,8,正压在这条自绘顶栏上 —— 一律关掉,照原版画一个 `✕` 文本。
+///   (2026-09-19 补记:入口已挂 `gpui_kit_assets::Assets`,原先记的
+///   「0.5.1 不带 svg 资产 → 渲染成空白」已作废,但满幅布局这条取舍不变。)
 ///
 /// `closable = false`(保存中)时 ✕ 置灰且点不动 —— 与原版 `disabled` 同。
 pub(crate) fn panel_header(
@@ -334,9 +336,7 @@ pub(crate) fn conn_card(
 /// 卡片里那两行字(名称 + 摘要)。`suffix` 接在摘要后面(「· 已存密码」)。
 pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
     conn_text_with_name(
-        name_line()
-            .child(TruncatedText::new(conn.name.clone()))
-            .into_any_element(),
+        name_line().child(conn.name.clone()).into_any_element(),
         conn,
         suffix,
     )
@@ -347,6 +347,7 @@ pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
 fn name_line() -> gpui::Div {
     div()
         .min_w(px(0.0))
+        .truncate()
         .text_size(ui::font_px(13.0))
         .text_color(ui::text_primary())
 }
@@ -788,10 +789,11 @@ fn text_field(
 
 /// 「显示 / 隐藏」密码:翻转表单的明文态,并同步给输入框的 `masked`。
 ///
-/// **不用 gpui-component 自带的 `Input::mask_toggle`**:① 它画 `IconName::Eye`,
-/// 0.5.1 不带 svg 资产、本仓也没注册 `AssetSource`,渲染出来是空白且编译期无感
-/// (见 `menu` 模块注释);② 它是「按住才显示、松手即掩」,与常见表单的点击切换
-/// 语义不同 —— 编辑已存密码时用户要的是能看清整串再改,按住看不方便。
+/// **不用 gpui-component 自带的 `Input::mask_toggle`**:它是「按住才显示、
+/// 松手即掩」,与常见表单的点击切换语义不同 —— 编辑已存密码时用户要的是能看清
+/// 整串再改,按住看不方便。(2026-09-19 补记:原先还记着「它画 `IconName::Eye`,
+/// 0.5.1 不带 svg 资产、本仓没注册 `AssetSource` → 空白」,入口挂上
+/// `gpui_kit_assets::Assets` 后这条作废;交互语义这条仍是决定性的。)
 fn toggle_password_reveal(
     state: &Entity<SshPanel>,
     password: &Entity<InputState>,
@@ -1459,7 +1461,7 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
                 .cursor_pointer()
                 .when(just_copied, |el| el.text_color(ui::accent()))
                 .hover(|el| el.text_color(ui::accent()))
-                .child(TruncatedText::new(conn.name.clone()))
+                .child(conn.name.clone())
                 .on_click({
                     let state = state.clone();
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {

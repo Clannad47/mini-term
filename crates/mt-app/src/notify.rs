@@ -95,7 +95,9 @@ pub enum ToastKind {
 
 impl ToastKind {
     /// 圆形图标里那个字符。**原版就是文本字符**(`ToastContainer.tsx:53`),
-    /// 不是 svg —— 照抄反而与原版一字不差,也绕开本仓没注册 `AssetSource` 的坑。
+    /// 不是 svg —— 照抄反而与原版一字不差。(2026-09-19 补记:入口已挂
+    /// `gpui_kit_assets::Assets`,「绕开本仓没注册 `AssetSource`」那条附带理由
+    /// 作废;原版本来就没有图标资产,这里照旧用文本。)
     pub fn icon_char(self) -> &'static str {
         match self {
             Self::Completion => "✓",

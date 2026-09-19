@@ -641,22 +641,39 @@ fn mermaid_渲染_合法图表出_svg_且底色跟主题() {
     let dark = render_mermaid_svg(&mermaid_key("sequenceDiagram\n    A->>B: hi", true)).unwrap();
     assert!(dark.contains("fill=\"#1E1E2E\""));
 
-    // 同一份图表栅格化后尺寸 = SVG 标称尺寸 × 2(与 gpui 的 svg 图片同倍率,
-    // image_display_width 按 is_svg 除回去才是逻辑宽)
-    let image = render_mermaid_image(&key).unwrap();
+    // 同一份图表经 gpui 的 SvgRenderer 栅格化后,尺寸 = SVG 标称尺寸 ×
+    // SMOOTH_SVG_SCALE_FACTOR(与 gpui 的 svg 图片同倍率,image_display_width
+    // 按 is_svg 除回去才是逻辑宽)。栅格器在这里自己建一个:它只要一个
+    // `AssetSource`,`()` 就是一个(打包字体取不到时只记一行日志,系统字体照旧),
+    // 因此无窗口的单测环境也能跑。
+    let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(()));
+    let image = render_mermaid_image(&key, &renderer).unwrap();
     let size = image.size(0);
     assert!(size.width.0 > 32 && size.height.0 > 32, "{size:?}");
     let nominal =
         mermaid_rs_renderer::measure(&key.code, mermaid_rs_renderer::RenderOptions::default())
             .unwrap();
-    assert_eq!(size.width.0, (nominal.width * MERMAID_RASTER_SCALE) as i32);
+    assert_eq!(
+        size.width.0,
+        (nominal.width * gpui::SMOOTH_SVG_SCALE_FACTOR) as i32
+    );
     assert_eq!(
         size.height.0,
-        (nominal.height * MERMAID_RASTER_SCALE) as i32
+        (nominal.height * gpui::SMOOTH_SVG_SCALE_FACTOR) as i32
     );
-    // 底色像素:直通 BGRA(不透明底不受去预乘影响),B 在前
+    // 底色像素:直通 BGRA(不透明底不受去预乘影响),B 在前 —— 去预乘 + 换通道
+    // 这一步现在由 gpui 的 `swap_rgba_pa_to_bgra` 做,靶子不变
     let bytes = image.as_bytes(0).unwrap();
     assert_eq!(&bytes[..4], &[0x2E, 0x1E, 0x1E, 0xFF]);
+    // 画布不是空的:底色之外还得有线条/文字的像素
+    assert!(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [0x2E, 0x1E, 0x1E, 0xFF]),
+        "整张图不能只有底色"
+    );
 }
 
 #[test]
@@ -675,21 +692,10 @@ fn mermaid_渲染_残缺与空图退回失败() {
 }
 
 #[test]
-fn mermaid_像素_去预乘并交换红蓝() {
-    // 半透明红(预乘后 R=128,A=128)→ 直通 BGRA:B=0,G=0,R≈255,A=128
-    // (除法后截断而不是四舍五入,与 gpui 原函数一致,差 1 不算错)
-    let mut pixel = [128u8, 0, 0, 128];
-    unpremultiply_rgba_to_bgra(&mut pixel);
-    assert!(matches!(pixel, [0, 0, 254..=255, 128]), "{pixel:?}");
-    // 全透明不动通道值(除零)
-    let mut clear = [10u8, 20, 30, 0];
-    unpremultiply_rgba_to_bgra(&mut clear);
-    assert_eq!(clear, [30, 20, 10, 0]);
-    // 不透明只交换
-    let mut opaque = [0x11u8, 0x22, 0x33, 0xFF];
-    unpremultiply_rgba_to_bgra(&mut opaque);
-    assert_eq!(opaque, [0x33, 0x22, 0x11, 0xFF]);
-
+fn mermaid_画布底色_丢掉_alpha() {
+    // 去预乘 + RGBA→BGRA 那一步已交还给 gpui 的 `swap_rgba_pa_to_bgra`
+    // (`SvgRenderer::render_parsed` 内部做,上游自带单测),这里只剩本仓
+    // 自己那段「主题色 → 画布底色」的换算
     assert_eq!(rgb_u32(gpui::rgb(0x1E1E2E).into()), 0x1E1E2E);
     assert_eq!(
         rgb_u32(gpui::rgba(0xFFFFFF80).into()),

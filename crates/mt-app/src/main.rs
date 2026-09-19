@@ -59,6 +59,11 @@ mod file_tree;
 mod file_viewer;
 mod first_run;
 mod focus_nav;
+// dev-only 度量工具(gpui-pre 内置帧剖析叠层)。默认不编译:整个模块连同
+// `open_window` 之后那唯一一处调用都挂在 `frame-profiler` feature 下,
+// 正式版零代码零依赖。用法见该模块的注释。
+#[cfg(feature = "frame-profiler")]
+mod frame_profiler;
 mod frost;
 mod fs_ops;
 mod git_changes;
@@ -133,7 +138,7 @@ use gpui::{
 use gpui::StyledImage as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::{Root, WindowExt as _};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
@@ -716,11 +721,13 @@ impl Workspace {
 
     /// 兑现一次提醒:提示音 / 任务栏闪烁 / toast。
     ///
-    /// toast 走自建的 [`toast`] 层。gpui-component 的 `Notification` 有四条
-    /// **结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且图标走
-    /// `IconName` 渲染成空白、去重是「替换」而原版是「忽略」),外加右上角 448px
-    /// 的位置尺寸 —— 都不是宿主能绕过去的,见 `toast.rs` 模块注释。跳转与去重
-    /// 语义一并搬进那一层,这里只剩「推一条」。
+    /// toast 走自建的 [`toast`] 层。当初记的是 gpui-component `Notification` 的
+    /// 四条**结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且
+    /// 图标走 `IconName` 渲染成空白、去重是「替换」而原版是「忽略」)外加右上角
+    /// 448px 的位置尺寸;**2026-09-19 对照 0.6.2 复核后只剩两条** —— 去重仍是
+    /// 「替换」、× 仍靠 `group_hover`(悬停暂停 / 条数 / 位置尺寸都已可配,图标
+    /// 那条随入口挂上 `gpui_kit_assets::Assets` 作废),逐条见 `toast.rs` 模块
+    /// 注释。跳转与去重语义一并搬进那一层,这里只剩「推一条」。
     fn deliver_alert(
         &mut self,
         alert: PendingAlert,
@@ -1188,9 +1195,7 @@ impl Workspace {
                     .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(t("app", "activityBar.closeDrawer")).build(window, cx)
-                    })
+                    .tip(t("app", "activityBar.closeDrawer"))
                     .child("✕")
                     .on_click(cx.listener(|this, _event, _window, cx| this.set_drawer(None, cx))),
             )
@@ -2087,7 +2092,17 @@ fn main() {
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
-    gpui_platform::application().run(|cx: &mut App| {
+    // 组件库的图标资产源。gpui 的 `svg()` 一律经 `AssetSource` 取字节,没挂资产源时
+    // 上游组件里每一枚 `Icon::new(IconName::..)` 都画成**空白**(只在日志里留一行,
+    // 编译期与运行期界面上都毫无提示)—— 0.5.1 时代 crate 包里根本不带 svg,于是
+    // 全仓有十来处「只能自绘」的记档按着这条前提写;0.6.2 把图标拆进了
+    // `gpui-kit-assets` 并给出现成的 `AssetSource`,前提不再成立。
+    //
+    // 用 `Assets`(组件库默认那 101 枚,约 44 KB)而不是 `AllAssets`(Lucide 全集
+    // 1830 枚,约 731 KB):组件库自己只按名字取这 101 枚,全集是给应用画自己的
+    // 图标用的,本仓的图标基建是 `mt_ui::icons` 那套自绘矢量(要多色,svg 单色
+    // alpha 掩膜画不了),用不上。
+    gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
         // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。
@@ -2146,7 +2161,11 @@ fn main() {
         // 「减少动画」也必须在**任何视图建出来之前**定下来:动画消费方读的是
         // 进程级闸(`mt_ui::motion`),晚一步的话首帧会按「允许动画」画出来 ——
         // 状态灯闪一下再停,正是这条设置想避免的东西。
-        motion::install();
+        //
+        // ⚠️ 顺序:必须排在上面那句 `gpui_component::init` **之后** —— 它还要
+        // 接管 gpui 自己那道「一刀切停掉所有 `with_animation`」的闸,而接管的
+        // 前提是组件库已经把系统值写过一遍(见 `motion::gate_values` 的注释)。
+        motion::install(cx);
 
         // 键位表的唯一事实来源在 [`hotkeys`](crate::hotkeys) —— 它同时喂给
         // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`
@@ -2288,6 +2307,11 @@ fn main() {
         // GPUI 侧窗口一建出来元素树就已经构造完(`Workspace::new` 是同步的),
         // 差的只有 GPU 那一帧,于是收在这里。
         startup_trace::mark("setup exit (window opened)");
+
+        // 帧剖析叠层(度量工具)。挂在窗口建好之后:叠层状态住在 `Window` 上,
+        // 不是 App 级的。`MT_FRAME_OVERLAY` 没设时这一行什么都不做。
+        #[cfg(feature = "frame-profiler")]
+        frame_profiler::install(&window, cx);
 
         // 启动补 PTY,排在**首帧呈现之后**。
         //

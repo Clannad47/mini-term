@@ -6,8 +6,10 @@
 //!
 //! | 路子 | 挡在哪 |
 //! |---|---|
-//! | `gpui::svg()` | 走 `AssetSource` 取文件。宿主(mt-app)现在**没有注册任何 asset source**,
-//!   而且它渲染出来的是 **alpha 掩膜**,整枚图标只有一个颜色 —— 品牌多色 logo 直接没了 |
+//! | `gpui::svg()` | 走 `AssetSource` 取文件,而它渲染出来的是 **alpha 掩膜**,
+//!   整枚图标只有一个颜色 —— 品牌多色 logo 直接没了。(2026-09-19 补记:宿主 mt-app 的入口
+//!   已挂 `gpui_kit_assets::Assets`,原先记的「没有注册任何 asset source」作废;
+//!   单色掩膜这条与资产无关,照旧挡路,且本模块这些形状表也不在那 101 枚里) |
 //! | `img(Image::from_bytes(ImageFormat::Svg, …))` | gpui 0.2.2 在这条路上**漏了 RGBA→BGRA 那步**
 //!   (`platform.rs` 的 `to_image_data`:PNG/JPEG 分支都 `pixel.swap(0, 2)`,SVG 分支没有),
 //!   红蓝互换;而且 tiny-skia 给的是预乘 alpha,抗锯齿边缘也对不上。上游修好之前不能用 |

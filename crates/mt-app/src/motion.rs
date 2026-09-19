@@ -24,6 +24,32 @@
 //! ([`refresh`])—— 用户去系统设置里改这个开关,回到本窗口时就生效了,
 //! 不必重启。gpui 没有 `WM_SETTINGCHANGE` 的转发口,而这次探测是一次
 //! 纯内存的系统调用(微秒级),挂在激活事件上比自建消息窗划算得多。
+//!
+//! # 还有第二道闸:gpui 自己那个,必须由我们顶住(见 [`gate_values`])
+//!
+//! gpui 0.2.2 时代没有「减弱动效」这个概念,一次性过渡该不该播**全由本仓
+//! 决定**。gpui-pre 0.3.5 给 `App` 加了 [`gpui::App::reduce_motion`],并让
+//! `AnimationElement` **无条件**读它:置位时 oneshot 动画直接按终态渲染一帧、
+//! 一帧都不再请求(`gpui-pre-0.3.5/src/elements/animation.rs:407-414`)。
+//! 而 `gpui_component::init` → `gpui_base::init` → `reduce_motion::init`
+//! (`gpui-base-0.6.2/src/reduce_motion.rs:48-50,125-139`)启动时就拿
+//! `SPI_GETCLIENTAREAANIMATION` 把系统口径写了进去 —— **与本模块问的是同一个
+//! 系统开关**。于是在「动画效果」关着的机器上,全仓所有 `with_animation`
+//! (抽屉滑入滑出 / 面板换场 / 抽屉页签指示条 / 切终端的整幅推移)一律瞬间跳变,
+//! 与本仓「转场照播、闪烁全停」的口径正相反。
+//!
+//! 上游给了应用接管这道闸的正式口子:「An application owns the flag once it
+//! sets it」(同文件 :24-28)—— `apply_preference` 发现闸里的值不是 Base 上次
+//! 写进去的那个就原样退出(:89-101)。所以启动时把它顶成 `false` 即可一劳永逸,
+//! 此后系统口径只落在本模块这道闸上,豁免与否逐条由
+//! [`mt_ui::motion::TransitionSpec::respects_reduce`] 说了算
+//! (走 [`mt_ui::motion::Transition`] 的那些由 spec 兜住;toast 走
+//! `with_animation`,它自己在调用点判 [`mt_ui::motion::reduce_motion`],
+//! reduce 时连动画元素都不挂 —— 见 `toast.rs` 的注释)。
+//!
+//! ⚠️ 这不是「无视用户的无障碍设置」:豁免面本来就是原版
+//! `styles.css:415-421` 逐条点名的,理由也在那儿 —— 把视觉效果调成
+//! 「最佳性能」的人要的是别卡,不是「界面凭空跳变」。
 
 /// 探测系统当前是否要求减少动画。
 pub fn probe() -> bool {
@@ -55,15 +81,38 @@ pub fn probe() -> bool {
     }
 }
 
-/// 启动时探测一次并写进闸。返回探测结果。
-pub fn install() -> bool {
-    let reduce = probe();
+/// 一次探测该写进**两道闸**的值:`(mt-ui 那道, gpui 那道)`。
+///
+/// - mt-ui 那道跟随系统:它是逐条动画的判据,豁免与否由各自的
+///   `respects_reduce` 说了算;
+/// - gpui 那道恒 `false`:它是个「所有 `with_animation` 一刀切按终态画一帧」
+///   的总开关(`gpui-pre-0.3.5/src/elements/animation.rs:407-414`),粒度粗到
+///   无法表达本仓的豁免面 —— 系统口径进它一次,转场就全没了。理由详见模块注释。
+///
+/// 单独拎成纯函数是为了钉住这条口径:日后谁把系统值顺手转发给 gpui 那道闸,
+/// 下面那个用例会红。
+pub(crate) fn gate_values(system_reduce: bool) -> (bool, bool) {
+    (system_reduce, false)
+}
+
+/// 启动时探测一次并写进两道闸。返回系统口径(= mt-ui 那道闸的值)。
+///
+/// **必须排在 `gpui_component::init` 之后**:接管 gpui 那道闸的前提是
+/// Base 已经把系统值写过一遍(`apply_preference` 靠「闸里还是不是我上次写的值」
+/// 判断应用有没有接管,反过来会被它随后的 init 覆盖回去)。
+pub fn install(cx: &mut gpui::App) -> bool {
+    let (reduce, gpui_reduce) = gate_values(probe());
     mt_ui::motion::set_reduce_motion(reduce);
+    cx.set_reduce_motion(gpui_reduce);
     reduce
 }
 
 /// 重新探测。**返回是否发生了变化** —— 变了的话调用方要刷一遍窗口,
 /// 否则已经画出来的那一帧不会自己更新。
+///
+/// 只动 mt-ui 那道闸:gpui 那道在 [`install`] 里被顶成 `false` 之后不会有人
+/// 再写它(Base 只在自己的 `init` 里读一次系统,且已经认了我们的接管),
+/// 所以不必每次激活都重按一遍。
 pub fn refresh() -> bool {
     mt_ui::motion::set_reduce_motion(probe())
 }
@@ -104,5 +153,41 @@ mod tests {
     #[cfg(not(windows))]
     fn 非_windows_平台恒不减少() {
         assert!(!probe());
+    }
+
+    /// 系统口径只许落在 mt-ui 那道闸上;gpui 那道恒 `false`。
+    ///
+    /// 把系统值转发给 gpui 的后果不是「少播几个动画」,而是**所有**
+    /// `with_animation` 一刀切按终态画一帧(抽屉、面板换场、页签指示条、
+    /// 切终端的整幅推移全部瞬间跳变)—— 本仓的豁免面在那道闸上无从表达。
+    #[test]
+    fn gpui_那道闸恒不减少() {
+        assert_eq!(gate_values(true), (true, false), "系统要求减少时转场仍须照播");
+        assert_eq!(gate_values(false), (false, false));
+    }
+
+    /// 两道闸的语义必须对得上:mt-ui 那道置位时,**豁免类**过渡照跑不误 ——
+    /// 这正是 gpui 那道闸不能跟着系统走的原因(它对豁免面一视同仁)。
+    #[test]
+    fn 减弱动效下豁免类过渡仍在跑() {
+        use std::time::Duration;
+        with_reduce(true, || {
+            let half = Duration::from_millis(100);
+            for exempt in [
+                mt_ui::motion::OVERLAY_IN,
+                mt_ui::motion::TERMINAL_SWAP,
+                mt_ui::motion::TAB_INDICATOR,
+                mt_ui::motion::PANE_ENTER,
+                mt_ui::motion::TOAST_SLIDE_IN,
+            ] {
+                assert!(
+                    exempt.running_at(half, mt_ui::motion::reduce_motion()),
+                    "{exempt:?} 在减弱动效下也该继续跑"
+                );
+                assert!(exempt.progress_at(half, mt_ui::motion::reduce_motion()) < 1.0);
+            }
+            // 对照组:不在豁免名单里的照旧直达终态
+            assert!(!mt_ui::motion::TAG_FADE_IN.running_at(half, mt_ui::motion::reduce_motion()));
+        });
     }
 }

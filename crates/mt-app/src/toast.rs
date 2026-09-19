@@ -3,8 +3,9 @@
 //!
 //! # 为什么不用 `gpui_component::notification::Notification`
 //!
-//! 读过 0.5.1 的 `notification.rs` 全文,**四条缺口是结构性的**(组件库里改不了,
-//! 宿主也绕不过去),外加两条与 M/P/S 批同源的老问题:
+//! 当初(0.5.1)读过 `notification.rs` 全文,四条缺口在那一版是结构性的
+//! (组件库里改不了,宿主也绕不过去),外加两条与 M/P/S 批同源的老问题 ——
+//! 逐条如下,**0.6.2 的复核见表后那段**:
 //!
 //! | 缺口 | 组件库现状 |
 //! |---|---|
@@ -15,8 +16,23 @@
 //! | 图标 | 四个 `NotificationType` 图标全走 `IconName` → SVG 资产,本仓没注册 `AssetSource`,渲染出来是空白且编译期无感 |
 //! | 位置 / 尺寸 | 右**上**角、448px 宽;原版是右下角 16/16、280px |
 //!
-//! 自建代价可控:原版 toast 一共 80 行 TSX + 78 行 CSS,而且**没有任何图标资产**
-//! —— 圆形徽标里就是 `✓` / `!` / `i` 三个文本字符(`ToastContainer.tsx:53`)。
+//! **2026-09-19 对照 gpui-base 0.6.2 复核**,上表六条现在是这样:
+//!
+//! - **悬停暂停** —— 已修:`NotificationList::advance` 把 `is_expanded()`(悬停态)
+//!   当 `paused` 交给 gpui-base 的 `toast.rs::advance(now, paused)`,不再是死字段;
+//! - **条数** —— 已可配:`NotificationSettings.max_items`(默认 10),不再写死;
+//! - **位置 / 尺寸** —— 已可配:`NotificationSettings` 的 `placement` / `margins` /
+//!   `width`,单条还能 `Notification::placement` 覆盖;
+//! - **图标** —— 判据作废:入口已挂 `gpui_kit_assets::Assets`(见 `main.rs` 的
+//!   `with_assets`),上游 `IconName` 画得出来了;
+//! - **去重语义** —— **仍缺**:同 id 再推还是**替换**,原版要的是「同项目已有就忽略」;
+//! - **× 常驻** —— **仍缺**:还是 `invisible()` + `group_hover("")` 才显形。
+//!
+//! 也就是说这层现在是「两条仍缺 + 一堆已经对齐的形态差」,不再是当初那种结构性
+//! 封死。要换上游得先把这两条与原版语义对齐,**先 spike 再动**;在那之前自建这
+//! 一层照旧,代价也可控:原版 toast 一共 80 行 TSX + 78 行 CSS,而且**没有任何
+//! 图标资产** —— 圆形徽标里就是 `✓` / `!` / `i` 三个文本字符
+//! (`ToastContainer.tsx:53`)。
 //!
 //! `Root::render_notification_layer` **保留不动**(组件库内部别处可能还用它),
 //! 只是 mt-app 不再 `push_notification`。
@@ -44,7 +60,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::notify::ToastKind;
@@ -505,9 +521,7 @@ impl Render for ToastLayer {
                                 // 原版这颗按钮带 `aria-label` / `title`
                                 // (`ToastContainer.tsx:69-70`);GPUI 没有无障碍树,
                                 // tooltip 是它唯一的等价物
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(t("toast", "dismiss")).build(window, cx)
-                                })
+                                .tip(t("toast", "dismiss"))
                                 .child("×")
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
                                     // 关按钮吃掉这次点击 —— 不然会连带触发卡片的「跳项目」
@@ -527,20 +541,20 @@ impl Render for ToastLayer {
             // gpui 没有 transform,用相对定位的 `left` 补一条等效位移
             // (容器宽度就是卡片宽度,所以 100% = CARD_WIDTH)。
             //
-            // ⚠️ 过减弱动效的闸:`.toast-card` **不在**原版 reduce 的豁免名单里
-            // (豁免的是浮层进出场、切终端、用量面板那几类),通配规则把它压成
-            // 瞬时 —— 这里等价成「直接上终态,连动画元素都不挂」。
-            stack = stack.child(if mt_ui::motion::reduce_motion() {
-                card.into_any_element()
-            } else {
+            // 减弱动效下**照播**:原版 `.toast-card` 不在 reduce 豁免名单里,曾按
+            // 通配规则压成瞬时(此处不挂动画元素);2026-09-19 用户拍板改为豁免
+            // (`mt_ui::motion::TOAST_SLIDE_IN` 已是 exempt 规格),口径与浮层进出场
+            // 同类。gpui 自己那道 `App::reduce_motion` 闸由 `motion::install` 钉成
+            // false,所以这里的 `with_animation` 在系统 reduce 下也会真的动。
+            stack = stack.child(
                 card.with_animation(
                     SharedString::from(format!("toast-slide-{id}")),
                     gpui::Animation::new(Duration::from_millis(SLIDE_IN_MS))
                         .with_easing(ui::cubic_bezier(0.0, 0.0, 0.58, 1.0)),
                     |el, delta| el.opacity(delta).left(px(CARD_WIDTH * (1.0 - delta))),
                 )
-                .into_any_element()
-            });
+                .into_any_element(),
+            );
         }
         stack
     }

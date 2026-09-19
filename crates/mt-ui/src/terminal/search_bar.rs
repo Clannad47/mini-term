@@ -133,14 +133,14 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
+    Styled, Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex};
 use mt_terminal::TerminalEmulator;
 
-use crate::tooltip::Tooltip;
+use crate::tooltip::TooltipExt as _;
 
 use super::search::{SearchDirection, SearchOptions, TerminalSearch};
 
@@ -421,7 +421,7 @@ fn with_tip(id: &'static str, tip: SharedString, button: Button) -> impl IntoEle
     div()
         .id(id)
         .flex_none()
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .tip(tip)
         .child(button)
 }
 

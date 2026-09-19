@@ -20,12 +20,27 @@
 //! 2. **文字不进元素**。gpui 的自绘元素要画字得自己 shape,而轴刻度的字号/字族
 //!    是壳的主题量(`ui::font_px`)。所以本元素只画几何,刻度文本由宿主用普通
 //!    `div` 绝对定位摆在两侧 —— 位置就是「第 i 条刻度线」,等距,宿主自己能算。
-//! 3. **渐变靠分段**。`paint_path` 只吃单色(V 批拓扑图同款约束),面积的竖向
-//!    渐变切成 [`ChartStyle::gradient_bands`] 条横带,每条取该带中点的插值色。
-//!    ⚠️ 与 V 批**相反**:那边是不透明描边,段间要留 2% 重叠防缝;这里是
-//!    **半透明**填充,重叠区会二次混合出一条更深的横线(0.3 alpha 叠一次就到
-//!    0.48,肉眼可见),所以这里**严格相邻不重叠** —— 抗锯齿在共享边上留下的
-//!    是 a·b/4 ≈ 0.02 量级的淡缝,比重叠的深线小一个数量级。
+//! 3. **渐变就是一条 path**。面积填充是**一次** `paint_path` + 一条
+//!    `gpui::linear_gradient(180°, 顶色, 底色)`。
+//!
+//!    此前这里切成 16 条横带逐条 tessellate,理由记的是「`paint_path` 只吃单色」
+//!    —— **那是误判**:`Window::paint_path(path, color: impl Into<Background>)`
+//!    吃的是 `Background`(gpui-pre `window.rs:4457`,0.2.2 同签名),DX11 的
+//!    path 光栅化片元着色器真的对它调 `gradient_color`
+//!    (`gpui-pre-windows-0.3.5/src/shaders.hlsl:996-1020`)。改回一条之后
+//!    每帧从 16 次 lyon tessellation + 16 个图元降到 1 次 1 个,顺带消掉
+//!    16 级色阶台阶与带间抗锯齿淡缝(着色器还自带抖动压 8bit 色带)。
+//!
+//!    ⚠️ **两处口径差异,改这段前先读懂**:
+//!    - 渐变**上限 2 个 stop**(`color.rs:784` 的 `colors: [LinearColorStop; 2]`)。
+//!      图表只有 top/bottom 两色正好够;`icons/brand.rs` 那些三 stop 以上的
+//!      品牌渐变仍得降级,别顺手一起改。
+//!    - 渐变的参考框是 **path 自己的 bounds**(着色器拿的是 `sprite.bounds`,
+//!      而 `Path::bounds` 是各顶点的并集,`scene.rs:876-900`),不是绘图区。
+//!      而横带方案是按**绘图区高度**插值的:曲线峰值没顶到轴顶时两者不等价。
+//!      这里按峰值把顶端 stop 的颜色**反推**回去([`ChartCanvas::area_peak_color`]),
+//!      于是「同一屏幕高度 = 同一颜色」与旧实现逐点一致,肉眼差异只剩
+//!      「台阶没了」。底端 stop 不必折算 —— 面积底边本来就钉在绘图区底。
 
 use std::rc::Rc;
 
@@ -175,67 +190,6 @@ pub fn label_step(count: usize, width: f32, label_width: f32, min_gap: f32) -> u
     ((need / band).ceil() as usize).max(1)
 }
 
-/// 面积在某条渐变横带里的**上沿**点列(归一化坐标)。
-///
-/// 曲线大多数时候只穿过一两条带,其余带的上沿是一整条贴边直线 —— 一条直线上的
-/// 中间点全部压掉,别把几百个共线顶点白喂给 tessellator(面积是每帧重画的,
-/// 这里省下来的是实打实的每帧开销)。
-///
-/// 结果为空或整条贴在 `lo` 上,说明这条带里没有面积,调用方应当整带跳过。
-///
-/// ⚠️ **逐顶点钳位是不够的,必须在穿带处插交点** —— 折线先钳顶点再连线 ≠ 折线
-/// 被钳出来的形状。陡坡上两个相邻采样点跨了好几条带时,每条带都会把「本该只占
-/// 一小截 x」的斜边摊到整段 x 上:各带在同一列各填自己下半截,拼出来是十几条
-/// 横纹而不是一块实心面积(总面积还是对的,所以肉眼看着就是「曲线下方一排锯齿」,
-/// 且色块会溢到曲线上方去)。修这条锯齿的关键就是下面这轮 `t ∈ (0,1)` 的插点。
-pub fn band_top_edge(area: &[(f32, f32)], lo: f32, hi: f32) -> Vec<(f32, f32)> {
-    if area.is_empty() {
-        return Vec::new();
-    }
-    let clamp = |y: f32| y.clamp(lo, hi);
-
-    // ① 把折线裁进 [lo, hi] 这条横带:穿过带边界处插交点,其余顶点钳位
-    let mut clipped: Vec<(f32, f32)> = Vec::with_capacity(area.len() + 4);
-    clipped.push((area[0].0, clamp(area[0].1)));
-    for seg in area.windows(2) {
-        let ((x0, y0), (x1, y1)) = (seg[0], seg[1]);
-        let dy = y1 - y0;
-        if dy.abs() > f32::EPSILON {
-            // 两条边界各求一个交点。`t` 严格落在开区间内才算穿越 ——
-            // 端点恰好压在边界上时它自己钳位后就在边界上,不必重复插一个点
-            let mut cuts: [(f32, f32); 2] = [(0.0, 0.0); 2];
-            let mut n = 0;
-            for bound in [lo, hi] {
-                let t = (bound - y0) / dy;
-                if t > 0.0 && t < 1.0 {
-                    cuts[n] = (t, bound);
-                    n += 1;
-                }
-            }
-            // 一升一降两条边界的先后由 t 定(降序段先遇到 hi,升序段先遇到 lo)
-            if n == 2 && cuts[1].0 < cuts[0].0 {
-                cuts.swap(0, 1);
-            }
-            for (t, bound) in &cuts[..n] {
-                clipped.push((x0 + (x1 - x0) * t, *bound));
-            }
-        }
-        clipped.push((x1, clamp(y1)));
-    }
-
-    // ② 压掉水平直线段的中间点(判据与裁剪前同:前后都与自己等高)
-    let mut out: Vec<(f32, f32)> = Vec::with_capacity(8);
-    for (i, (x, y)) in clipped.iter().enumerate() {
-        let prev_same = i > 0 && clipped[i - 1].1 == *y;
-        let next_same = i + 1 < clipped.len() && clipped[i + 1].1 == *y;
-        if prev_same && next_same {
-            continue;
-        }
-        out.push((*x, *y));
-    }
-    out
-}
-
 // ─── 图表模型 ────────────────────────────────────────────────
 
 /// 数据指纹。宿主拿它判「数据没变 → 直接复用上一份 [`ChartModel`]」,
@@ -367,8 +321,6 @@ pub struct ChartStyle {
     pub bar_radius: f32,
     /// 网格虚线(实线段长, 间隔),原版 `strokeDasharray="3 4"`。
     pub grid_dash: (f32, f32),
-    /// 面积渐变切几条横带。
-    pub gradient_bands: usize,
 }
 
 impl Default for ChartStyle {
@@ -379,9 +331,6 @@ impl Default for ChartStyle {
             bar_ratio: 0.8,
             bar_radius: 2.0,
             grid_dash: (3.0, 4.0),
-            // V 批拓扑图用 8 条,那是 48px 行高;这里面积有 190px 高,
-            // 8 条的 alpha 台阶(0.035/条)在大块色面上能看出来,加倍到 16
-            gradient_bands: 16,
         }
     }
 }
@@ -426,10 +375,15 @@ impl ChartCanvas {
         self
     }
 
-    /// 面积渐变的第 k 条横带的颜色(带中点处的线性插值)。
-    fn band_color(&self, k: usize) -> Hsla {
-        let bands = self.style.gradient_bands.max(1);
-        let t = (k as f32 + 0.5) / bands as f32;
+    /// 面积渐变**顶端 stop** 的颜色。
+    ///
+    /// 渐变的参考框是 path 自己的 bounds(见模块注释第 3 条),而配色给的
+    /// `area_top` 是「**绘图区顶边**处的颜色」。曲线峰值 `peak`(归一化,
+    /// 1 = 轴顶)没顶到轴顶时,面积的上沿落在插值进度 `1 - peak` 处 ——
+    /// 把这一点的颜色算出来当顶端 stop,同一屏幕高度的颜色就与按绘图区
+    /// 插值的老实现逐点一致。`peak = 1` 时退化成 `area_top` 本身。
+    fn area_peak_color(&self, peak: f32) -> Hsla {
+        let t = 1.0 - peak.clamp(0.0, 1.0);
         lerp_hsla(self.colors.area_top, self.colors.area_bottom, t)
     }
 }
@@ -553,28 +507,37 @@ impl Element for ChartCanvas {
             );
         }
 
-        // ③ 面积(竖向渐变 → 分段横带,严格相邻不重叠,见模块注释)
-        let bands = self.style.gradient_bands.max(1);
-        for k in 0..bands {
-            // 带的上下边界(归一化,1=顶)
-            let hi = 1.0 - k as f32 / bands as f32;
-            let lo = 1.0 - (k + 1) as f32 / bands as f32;
-            let top = band_top_edge(&self.model.area, lo, hi);
-            // 上沿整条压在带底 → 这带没有面积(曲线还在下面)
-            if top.len() < 2 || top.iter().all(|(_, y)| *y <= lo + 1e-6) {
-                continue;
-            }
+        // ③ 面积:一条 path 吃一条竖向 linear_gradient(见模块注释第 3 条)
+        let peak = self
+            .model
+            .area
+            .iter()
+            .fold(0.0f32, |acc, (_, y)| acc.max(y.clamp(0.0, 1.0)));
+        // 曲线整条贴底(数据全 0)时没有面积可画 —— 零高度的多边形
+        // tessellate 出来是空的,渐变参考框也会退化成 0 高
+        if self.model.area.len() >= 2 && peak > 0.0 {
+            let first = self.model.area[0];
+            let last = self.model.area[self.model.area.len() - 1];
             let mut builder = PathBuilder::fill();
-            builder.move_to(map(top[0].0, top[0].1));
-            for (x, y) in &top[1..] {
+            builder.move_to(map(first.0, first.1));
+            for (x, y) in &self.model.area[1..] {
                 builder.line_to(map(*x, *y));
             }
-            // 回程是带底那条直线,两个端点就够(逐点画等于白喂 tessellator)
-            builder.line_to(map(top[top.len() - 1].0, lo));
-            builder.line_to(map(top[0].0, lo));
+            // 回程是贴绘图区底边那条直线,两个端点就够(逐点画等于白喂 tessellator)
+            builder.line_to(map(last.0, 0.0));
+            builder.line_to(map(first.0, 0.0));
             builder.close();
             if let Ok(path) = builder.build() {
-                window.paint_path(path, self.band_color(k));
+                // 180° = CSS 的「从上往下」(着色器里 `angle - 90°` 再取
+                // `(cos, sin)`,屏幕 y 向下 → 正好是 0 在顶、1 在底)
+                window.paint_path(
+                    path,
+                    gpui::linear_gradient(
+                        180.0,
+                        gpui::linear_color_stop(self.area_peak_color(peak), 0.0),
+                        gpui::linear_color_stop(self.colors.area_bottom, 1.0),
+                    ),
+                );
             }
         }
 
@@ -761,91 +724,55 @@ mod tests {
         assert_eq!(m.bars.len(), 1);
     }
 
-    #[test]
-    fn 渐变横带的上沿压掉共线中间点() {
-        // 一条从底爬到顶再回来的折线,取中间那条带 [0.4, 0.6]
-        let area = vec![
-            (0.0, 0.0),
-            (0.1, 0.0),
-            (0.2, 0.0),
-            (0.3, 0.5),
-            (0.4, 1.0),
-            (0.5, 1.0),
-            (0.6, 1.0),
-            (0.7, 0.5),
-            (0.8, 0.0),
-            (0.9, 0.0),
-        ];
-        let edge = band_top_edge(&area, 0.4, 0.6);
-        // 首尾必须在(带底那条回程线要靠它们定端点)
-        assert_eq!(edge.first().map(|p| p.0), Some(0.0));
-        assert_eq!(edge.last().map(|p| p.0), Some(0.9));
-        // 贴带底/带顶的那几段各自只留端点:0.1 / 0.5 / 0.8 这些中间点都该没了
-        for dropped in [0.1f32, 0.5, 0.8] {
-            assert!(
-                !edge.iter().any(|(x, _)| (*x - dropped).abs() < 1e-6),
-                "共线中间点 x={dropped} 没压掉:{edge:?}"
-            );
-        }
-        // 值全被钳进带内
-        for (_, y) in &edge {
-            assert!((0.4..=0.6).contains(y), "{y} 越出带外");
-        }
-        // 曲线整段在带下 → 上沿贴底,调用方据此跳过
-        let flat = band_top_edge(&[(0.0, 0.0), (0.5, 0.0), (1.0, 0.0)], 0.4, 0.6);
-        assert!(flat.iter().all(|(_, y)| (*y - 0.4).abs() < 1e-6));
-        // 退化输入
-        assert!(band_top_edge(&[], 0.0, 1.0).is_empty());
-        assert_eq!(band_top_edge(&[(0.5, 0.5)], 0.0, 1.0).len(), 1);
-    }
-
-    /// 穿带处必须插交点 —— 这是「面积锯齿」的判据。
+    /// 渐变顶端 stop 的折算:同一屏幕高度的颜色必须与「按绘图区插值」一致。
     ///
-    /// 一条从 y=1 直落到 y=0 的陡边,逐顶点钳位的老实现会让**每条带**都在整段 x
-    /// 上摊一条斜边,于是同一列上各带只填自己下半截,拼出来是一排横纹;正确裁剪
-    /// 后每条带只在自己那一小截 x 里有斜边,各带首尾相接拼成实心面积。
+    /// 渐变参考框是 path 自己的 bounds(顶 = 曲线峰值,底 = 绘图区底),而配色
+    /// 给的 `area_top` 说的是绘图区**顶边**的颜色。峰值没顶到轴顶时这两个框不
+    /// 重合,顶端 stop 必须按峰值反推回去,否则整块面积会整体偏浓。
     #[test]
-    fn 陡坡上各带首尾相接不留横纹() {
-        let area = [(0.0, 1.0), (1.0, 0.0)];
-        let bands = 16;
-        // 取正中那一列:真实曲线高度 0.5,各带填出来的区间应当恰好铺满 [0, 0.5]
-        let x = 0.5;
-        let mut filled: Vec<(f32, f32)> = Vec::new();
-        for k in 0..bands {
-            let hi = 1.0 - k as f32 / bands as f32;
-            let lo = 1.0 - (k + 1) as f32 / bands as f32;
-            let top = band_top_edge(&area, lo, hi);
-            if top.len() < 2 || top.iter().all(|(_, y)| *y <= lo + 1e-6) {
-                continue;
+    fn 渐变顶色按峰值折算回绘图区口径() {
+        let colors = ChartColors {
+            area_top: gpui::Rgba {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
             }
-            // 线性插出该列的上沿
-            let Some(seg) = top.windows(2).find(|s| s[0].0 <= x && x <= s[1].0) else {
-                continue;
-            };
-            let (x0, y0) = seg[0];
-            let (x1, y1) = seg[1];
-            let y = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
-            if y > lo + 1e-6 {
-                filled.push((lo, y));
+            .into(),
+            area_bottom: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                a: 0.0,
             }
-        }
-        filled.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert!(!filled.is_empty(), "该列一条带都没填");
-        // 从 0 起、到 0.5 止,且相邻两条严丝合缝(上一条的顶 = 下一条的底)
-        assert!(filled[0].0.abs() < 1e-6, "没从底填起:{filled:?}");
-        let top_most = filled.last().unwrap().1;
-        assert!(
-            (top_most - 0.5).abs() < 1e-4,
-            "填到了 {top_most},应当止于曲线高度 0.5:{filled:?}"
+            .into(),
+            line: gpui::black(),
+            bar: gpui::black(),
+            grid: gpui::black(),
+            dot: gpui::black(),
+        };
+        let canvas = ChartCanvas::new(
+            Rc::new(ChartModel::build(&[1.0], &[1.0], 5)),
+            colors,
+            px(100.0),
         );
-        for pair in filled.windows(2) {
-            assert!(
-                (pair[0].1 - pair[1].0).abs() < 1e-4,
-                "带间留了横纹:{:?} 之后跳到 {:?}",
-                pair[0],
-                pair[1]
-            );
-        }
+        // 峰值顶到轴顶 → 顶端 stop 就是 area_top 本身
+        let full = gpui::Rgba::from(canvas.area_peak_color(1.0));
+        assert!((full.r - 1.0).abs() < 1e-4 && (full.a - 1.0).abs() < 1e-4, "{full:?}");
+        // 峰值只有半高 → 顶端 stop 应当是「绘图区半高处」那个颜色
+        let half = gpui::Rgba::from(canvas.area_peak_color(0.5));
+        assert!((half.r - 0.5).abs() < 1e-3 && (half.a - 0.5).abs() < 1e-3, "{half:?}");
+        // 峰值贴底(全零数据)→ 退化成底色;越界一律钳住
+        let flat = gpui::Rgba::from(canvas.area_peak_color(0.0));
+        assert!(flat.a.abs() < 1e-4, "{flat:?}");
+        assert_eq!(
+            gpui::Rgba::from(canvas.area_peak_color(5.0)),
+            gpui::Rgba::from(canvas.area_peak_color(1.0))
+        );
+        assert_eq!(
+            gpui::Rgba::from(canvas.area_peak_color(-1.0)),
+            gpui::Rgba::from(canvas.area_peak_color(0.0))
+        );
     }
 
     #[test]

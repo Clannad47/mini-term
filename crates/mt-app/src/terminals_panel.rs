@@ -32,7 +32,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::activity_bar;
 use crate::i18n::{t, tr};
@@ -206,7 +206,7 @@ impl TerminalsPanel {
                         .bg(ui::accent()),
                 )
             })
-            .tooltip(move |window, cx| Tooltip::new(title_tip.clone()).build(window, cx))
+            .tip(title_tip)
             // 单击切换,双击改名 —— 与 tab 同手感
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
@@ -249,9 +249,7 @@ impl TerminalsPanel {
             .text_size(ui::font_px(16.0))
             .text_color(ui::text_muted())
             .hover(|el| el.bg(ui::border_subtle()).text_color(ui::accent()))
-            .tooltip(move |window, cx| {
-                Tooltip::new(t("terminalArea", "newPanel")).build(window, cx)
-            })
+            .tip(t("terminalArea", "newPanel"))
             .child("+")
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();

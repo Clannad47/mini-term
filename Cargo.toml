@@ -44,6 +44,14 @@ gpui_platform = { package = "gpui-pre-platform", version = "0.3.5" }
 # 组件库:Resizable(替 Allotment) / Tree(替 FileTree) / TabBar / Modal / Input /
 # Table，以及 JSON 驱动的主题层 + 运行时主题注册表(替自研 theme_packs 的一部分)。
 gpui-component = "0.6.2"
+# 组件库的图标资产(`AssetSource`)。0.6.2 把图标本体从 gpui-component 拆进了这个
+# crate,**它本来就在依赖树里**(gpui-component 的直接依赖),这里只是把传递依赖
+# 提成直接依赖好在 `main.rs` 挂上 —— 版本必须与 gpui-component 拉的那份**完全一致**,
+# 否则依赖树里会出现两份、`IconName` 的路径对不上。
+# `Assets` = 组件库默认用到的 101 枚 Lucide 线条图(约 44 KB);全集 `AllAssets`
+# 是 1830 枚(约 731 KB),本仓用不上。没有它时上游组件画 `IconName::*` 一律是
+# **空白且编译期无感**(svg 走 AssetSource 取,取不到只记一行日志)。
+gpui-kit-assets = "0.6.2"
 
 # ---------------------------------------------------------------------------
 # 终端

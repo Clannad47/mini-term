@@ -8,6 +8,11 @@
 //!  (mt_config::ThemePacks)└── gpui_component::ThemeConfig → Theme 全局（面板/按钮/边框/tab）
 //! ```
 //!
+//! **内置明暗两套走同一份映射**：mt-app 把 `ui::Palette`（`styles.css` 那份唯一
+//! 来源）改名成 [`ThemeTokens`] 传进 [`switch_to_builtin`]，与皮肤共用
+//! [`build_theme_config`]。否则内置主题下 `Theme` 停在 `ThemeRegistry` 的出厂
+//! 中性灰上，暖棕系的自绘面板里套一个灰底 Dialog / 灰边 Input / 灰滚动条。
+//!
 //! 原来这两条在 Web 侧是「CSS 变量」与「xterm setTheme」，各走各的；GPUI 侧
 //! 后者换成 gpui-component 自带的 JSON 主题层 + 运行时注册表，前者仍是我们自己的
 //! [`TerminalTheme`]。**语义映射逐条对齐 `src/utils/themePackManager.ts`** ——
@@ -590,13 +595,49 @@ pub fn to_terminal_theme(def: &ThemePackDef, with_background: bool) -> TerminalT
     theme
 }
 
+/// 装进 gpui-component 主题层的一组语义色 —— **内置调色板与外置主题包共用的输入**。
+///
+/// 十个字段与 theme.json 的十个语义色一一对应（前七必填、后三可选）。两条来源：
+///
+/// - **外置主题包**：[`to_gpui_theme_config`] 把 `colors` 原文解析出来填；
+/// - **内置明暗**：mt-app 拿 `ui::Palette`（逐值抄 `styles.css` 的那份表，也是
+///   壳自绘面板的唯一来源）改名填进来，经 [`switch_to_builtin`] 装配。
+///
+/// 两条路最终都落到 [`build_theme_config`] 那一份映射上 —— 这是「上游组件
+/// （Dialog 外壳 / Input / Scrollbar / PopupMenu / TextView …）与壳自绘面板同色」
+/// 的唯一保证。此前内置主题走的是 `ThemeRegistry` 的出厂**中性灰**，于是暖棕系
+/// 的面板里套一个灰底弹窗，同框可见（`modal.rs` 的确认框最扎眼）。
+///
+/// ⚠️ 这是**单向下发**：壳的 `ui::Palette` 不读 `cx.theme()`。两套是不同语义
+/// （壳有 `bg_overlay` / `border_strong` / diff 四色，组件库有 120+ 个 token），
+/// 反向打通会失控。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeTokens {
+    /// 窗口底色（壳的 `bg_base`）。
+    pub background: Hsla,
+    /// 面板底色（壳的 `bg_surface`）。
+    pub panel: Hsla,
+    /// 次级面板 / 浮层底色（壳的 `bg_elevated`）。
+    pub panel_alt: Hsla,
+    /// 强调色（壳的 `accent`）。
+    pub accent: Hsla,
+    /// 主文本（壳的 `text_primary`）。
+    pub text: Hsla,
+    /// 次要文本（壳的 `text_muted`）。
+    pub muted: Hsla,
+    /// 分隔线（壳的 `border_default`）。
+    pub line: Hsla,
+    /// 第二强调色 → `warning.*`。`None` = 不覆盖，保留组件库基线。
+    pub accent_alt: Option<Hsla>,
+    /// 辅助色 → `info.*`。
+    pub secondary: Option<Hsla>,
+    /// 高亮色 → `success.*`。
+    pub highlight: Option<Hsla>,
+}
+
 /// theme.json → gpui-component 的 [`ThemeConfig`]。
 ///
-/// 用 JSON 中转而不是直接填 `ThemeConfigColors` 的字段：那个结构有 120+ 个字段、
-/// 字段名与 JSON 键名各一套，gpui-component 升个版就可能改。走 JSON 键名等于
-/// 用它对外承诺的 schema，**没写到的键一律 `None`**，由
-/// `Theme::apply_config` 回落到内置 dark/light 基线 —— 我们只覆盖十个语义色
-/// 说得清归宿的那些，其余保持组件库自己的搭配。
+/// 只负责「十个语义色的取值与回落」，映射本体在 [`build_theme_config`]。
 pub fn to_gpui_theme_config(def: &ThemePackDef, with_background: bool) -> ThemeConfig {
     let c = &def.colors;
     let fallback = if def.appearance.is_dark() {
@@ -611,6 +652,7 @@ pub fn to_gpui_theme_config(def: &ThemePackDef, with_background: bool) -> ThemeC
     let text = color_or(&c.text, fallback.foreground);
     let muted = color_or(&c.muted, fallback.dim_foreground);
     let line = color_or(&c.line, muted);
+    let optional = |v: &Option<String>| v.as_deref().map(|s| color_or(s, accent));
 
     // 背景图模式下面板半透明，图才透得出来；浮层（popover / overlay）保持不透明 ——
     // 弹窗叠在任意内容上，半透明是拿可读性换观感
@@ -619,6 +661,53 @@ pub fn to_gpui_theme_config(def: &ThemePackDef, with_background: bool) -> ThemeC
     } else {
         1.0
     };
+    build_theme_config(
+        &def.name,
+        def.appearance,
+        &ThemeTokens {
+            background,
+            panel,
+            panel_alt,
+            accent,
+            text,
+            muted,
+            line,
+            accent_alt: optional(&c.accent_alt),
+            secondary: optional(&c.secondary),
+            highlight: optional(&c.highlight),
+        },
+        surface_alpha,
+    )
+}
+
+/// 一组语义色 → gpui-component 的 [`ThemeConfig`]（**那份 82 条 token 的映射**）。
+///
+/// `surface_alpha` 是面板不透明度：带背景图的皮肤 < 1（图要透上来），
+/// 外置纯色皮肤与内置明暗都是 1.0。
+///
+/// 用 JSON 中转而不是直接填 `ThemeConfigColors` 的字段：那个结构有 120+ 个字段、
+/// 字段名与 JSON 键名各一套，gpui-component 升个版就可能改。走 JSON 键名等于
+/// 用它对外承诺的 schema，**没写到的键一律 `None`**，由
+/// `Theme::apply_config` 回落到内置 dark/light 基线 —— 我们只覆盖十个语义色
+/// 说得清归宿的那些，其余保持组件库自己的搭配。
+pub fn build_theme_config(
+    name: &str,
+    appearance: Appearance,
+    tokens: &ThemeTokens,
+    surface_alpha: f32,
+) -> ThemeConfig {
+    let ThemeTokens {
+        background,
+        panel,
+        panel_alt,
+        accent,
+        text,
+        muted,
+        line,
+        accent_alt,
+        secondary,
+        highlight,
+    } = *tokens;
     let panel_surface = with_alpha(panel, surface_alpha);
     let panel_alt_surface = with_alpha(panel_alt, surface_alpha);
 
@@ -708,22 +797,19 @@ pub fn to_gpui_theme_config(def: &ThemePackDef, with_background: bool) -> ThemeC
     put("tiles.background", background);
 
     // 三个可选语义色的近似归宿，与前端 buildTokenMap 一一对应
-    if let Some(v) = &c.accent_alt {
-        let warning = color_or(v, accent);
+    if let Some(warning) = accent_alt {
         put("warning.background", warning);
         put("warning.hover.background", with_alpha(warning, 0.85));
         put("warning.active.background", with_alpha(warning, 0.7));
         put("warning.foreground", background);
     }
-    if let Some(v) = &c.secondary {
-        let info = color_or(v, accent);
+    if let Some(info) = secondary {
         put("info.background", info);
         put("info.hover.background", with_alpha(info, 0.85));
         put("info.active.background", with_alpha(info, 0.7));
         put("info.foreground", background);
     }
-    if let Some(v) = &c.highlight {
-        let success = color_or(v, accent);
+    if let Some(success) = highlight {
         put("success.background", success);
         put("success.hover.background", with_alpha(success, 0.85));
         put("success.active.background", with_alpha(success, 0.7));
@@ -731,8 +817,8 @@ pub fn to_gpui_theme_config(def: &ThemePackDef, with_background: bool) -> ThemeC
     }
 
     let value = serde_json::json!({
-        "name": def.name,
-        "mode": if def.appearance.is_dark() { "dark" } else { "light" },
+        "name": name,
+        "mode": if appearance.is_dark() { "dark" } else { "light" },
         "colors": serde_json::Value::Object(map),
     });
     // 这里的 unwrap 有 schema 保证：值全是我们自己塞的字符串。
@@ -795,12 +881,27 @@ pub fn resolve_theme_pack(def: &ThemePackDef, dir: Option<&Path>) -> AppliedThem
 /// 明暗跟着皮肤的 `appearance` 走，不跟随系统 —— 与旧版一致（皮肤的明暗由作者
 /// 定死，切明暗 = 退出皮肤回内置）。
 pub fn install_gpui_theme(applied: &AppliedThemePack, window: Option<&mut Window>, cx: &mut App) {
-    let mode = applied.appearance.theme_mode();
+    install_theme_config(applied.appearance, applied.gpui_theme.clone(), window, cx);
+}
+
+/// 把一份 [`ThemeConfig`] 装进全局主题对应明暗的那一槽并切过去。
+///
+/// `Theme::dark_theme` / `light_theme` 就是「这个明暗态长什么样」的唯一来源，
+/// `Theme::change` 每次都从它 `apply_config` 重算整套 colors —— 所以**先写槽、
+/// 再 change**，顺序反了这一帧还是旧配色。只写当前明暗那一槽：另一槽的值要等
+/// 用户真切过去时由 mt-app 再装一次（皮肤与内置都是一次只算一套）。
+fn install_theme_config(
+    appearance: Appearance,
+    config: ThemeConfig,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) {
+    let mode = appearance.theme_mode();
     // Theme 全局可能还没初始化（gpui_component::init 之前）：先建一个再改
     if !cx.has_global::<Theme>() {
         Theme::change(mode, None, cx);
     }
-    let config = Rc::new(applied.gpui_theme.clone());
+    let config = Rc::new(config);
     {
         let theme = Theme::global_mut(cx);
         if mode.is_dark() {
@@ -837,23 +938,47 @@ pub fn switch_to_theme_pack(
 
 /// 退出皮肤，回内置明暗态。返回该明暗的内置终端配色。
 ///
-/// ⚠️ **不能只调 `Theme::change`**。[`install_gpui_theme`] 是把皮肤的
-/// `ThemeConfig` **持久写进** `Theme::dark_theme` / `light_theme` 的
-/// —— 那两个字段就是「这个明暗态长什么样」的唯一来源。只切 mode 的话
-/// 全局主题仍然指着皮肤那份配置，面板/按钮/浮层会原地停在皮肤配色上，
-/// 用户会看到「退出皮肤了但界面没变」。所以这里必须先把两份配置从
-/// `ThemeRegistry` 的内置基线恢复回去，再切 mode。
+/// `tokens` 是**内置调色板**（mt-app 的 `ui::Palette`，逐值抄 `styles.css`）改名
+/// 来的十个语义色 —— mt-ui 不依赖 mt-app，所以由宿主传进来，内置配色的唯一来源
+/// 仍然只有 `ui.rs` 那一份。走的是与外置皮肤同一份 [`build_theme_config`]，于是
+/// 内置主题下 Dialog 外壳 / Input / Scrollbar / PopupMenu 这些上游组件也跟着壳
+/// 的暖棕系走，不再是 `ThemeRegistry` 的出厂中性灰。
+///
+/// # 两步不能合并
+///
+/// 1. ⚠️ **不能只调 `Theme::change`**。[`install_gpui_theme`] 是把皮肤的
+///    `ThemeConfig` **持久写进** `Theme::dark_theme` / `light_theme` 的
+///    —— 那两个字段就是「这个明暗态长什么样」的唯一来源。只切 mode 的话
+///    全局主题仍然指着皮肤那份配置，面板/按钮/浮层会原地停在皮肤配色上，
+///    用户会看到「退出皮肤了但界面没变」。所以必须先把两份配置从
+///    `ThemeRegistry` 的内置基线恢复回去（[`restore_builtin_gpui_theme`]）。
+/// 2. 恢复完**再叠内置映射**。顺序反过来的话，恢复基线会把刚装好的内置配色
+///    重新抹成中性灰；而少了第 1 步，皮肤在**另一个**明暗槽里的残留会留着
+///    （内置映射只写当前明暗那一槽）。
 pub fn switch_to_builtin(
     appearance: Appearance,
+    tokens: &ThemeTokens,
     window: Option<&mut Window>,
     cx: &mut App,
 ) -> TerminalTheme {
     restore_builtin_gpui_theme(cx);
-    Theme::change(appearance.theme_mode(), window, cx);
+    let config = build_theme_config(builtin_theme_name(appearance), appearance, tokens, 1.0);
+    install_theme_config(appearance, config, window, cx);
     builtin_terminal_theme(appearance)
 }
 
-/// 把 gpui-component 全局主题的明暗两份配置恢复成内置基线。
+/// 内置主题在 `ThemeConfig::name` 里的展示名（只用于标识，没有查表语义）。
+fn builtin_theme_name(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Dark => "mini-term Dark",
+        Appearance::Light => "mini-term Light",
+    }
+}
+
+/// 把 gpui-component 全局主题的明暗两份配置恢复成 `ThemeRegistry` 的出厂基线。
+///
+/// 只是**擦掉皮肤残留**的一步，不是终态：[`switch_to_builtin`] 擦完还要叠上
+/// 内置调色板那份映射，否则界面会停在组件库的出厂中性灰上。
 ///
 /// 单独暴露是给「只想撤掉皮肤、暂时不切明暗」的宿主用（比如主题包读取失败
 /// 要回退时）。调完记得 `Theme::change(mode, window, cx)` 让窗口重绘。
@@ -1024,6 +1149,77 @@ mod tests {
         assert!(config.colors.danger.is_none());
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    /// 内置调色板走的就是这条路（mt-app 的 `theme::builtin_tokens` 把
+    /// `ui::Palette` 改名成这十个语义色再喂进来），所以关键键位必须逐条钉住：
+    /// 少一条就是一处上游组件与自绘面板不同色。
+    ///
+    /// 这里用的正是内置暗色那几个值（`ui.rs` 的 `Palette::dark()`），
+    /// mt-app 侧另有一条「改名表没写反」的对账测试。
+    #[test]
+    fn 语义色经_token_映射落到关键键位() {
+        let tokens = ThemeTokens {
+            background: rgb8(0x08, 0x07, 0x06),
+            panel: rgb8(0x12, 0x11, 0x10),
+            panel_alt: rgb8(0x1c, 0x1a, 0x18),
+            accent: rgb8(0xc8, 0x80, 0x5a),
+            text: rgb8(0xf0, 0xec, 0xe6),
+            muted: rgb8(0x6a, 0x62, 0x58),
+            line: with_alpha(rgb8(0xff, 0xff, 0xff), 0.08),
+            accent_alt: Some(rgb8(0xd4, 0xa8, 0x4a)),
+            secondary: Some(rgb8(0x6a, 0x9f, 0xd4)),
+            highlight: Some(rgb8(0x6b, 0xb8, 0x7a)),
+        };
+        let config = build_theme_config("mini-term Dark", Appearance::Dark, &tokens, 1.0);
+
+        assert_eq!(config.name.as_ref(), "mini-term Dark");
+        assert_eq!(config.mode, ThemeMode::Dark);
+        // 窗口底 / 主文本：Dialog 的面板本体画的就是 `tokens.background`
+        assert_eq!(slot(&config.colors.background), Some("#080706ff"));
+        assert_eq!(slot(&config.colors.foreground), Some("#f0ece6ff"));
+        // 边框三处同源（半透明白照样落进去，不许被 to_hex 丢掉 alpha）
+        assert_eq!(slot(&config.colors.border), Some("#ffffff14"));
+        assert_eq!(slot(&config.colors.input), Some("#ffffff14"));
+        // 聚焦圈 / 光标 / 链接 = accent（theme.rs 那条 link 补丁因此可以删）
+        assert_eq!(slot(&config.colors.ring), Some("#c8805aff"));
+        assert_eq!(slot(&config.colors.caret), Some("#c8805aff"));
+        assert_eq!(slot(&config.colors.link), Some("#c8805aff"));
+        // 浮层（PopupMenu / Select 的外壳）= panelAlt
+        assert_eq!(slot(&config.colors.popover), Some("#1c1a18ff"));
+        assert_eq!(slot(&config.colors.secondary), Some("#121110ff"));
+        assert_eq!(slot(&config.colors.title_bar), Some("#121110ff"));
+        assert_eq!(slot(&config.colors.muted_foreground), Some("#6a6258ff"));
+        // 三个可选语义色：内置那头总是给，不留组件库自己的绿/黄/蓝
+        assert_eq!(slot(&config.colors.warning), Some("#d4a84aff"));
+        assert_eq!(slot(&config.colors.info), Some("#6a9fd4ff"));
+        assert_eq!(slot(&config.colors.success), Some("#6bb87aff"));
+    }
+
+    /// `surface_alpha` 只压面板类的键（背景图皮肤要透出图），浮层与窗口底不动。
+    #[test]
+    fn 面板不透明度只压面板类键位() {
+        let tokens = ThemeTokens {
+            background: rgb8(0x10, 0x10, 0x10),
+            panel: rgb8(0x20, 0x20, 0x20),
+            panel_alt: rgb8(0x30, 0x30, 0x30),
+            accent: rgb8(0x40, 0x80, 0xff),
+            text: rgb8(0xee, 0xee, 0xee),
+            muted: rgb8(0x88, 0x88, 0x88),
+            line: rgb8(0x40, 0x40, 0x40),
+            accent_alt: None,
+            secondary: None,
+            highlight: None,
+        };
+        let config = build_theme_config("t", Appearance::Dark, &tokens, 0.5);
+        assert_eq!(slot(&config.colors.secondary), Some("#20202080"));
+        assert_eq!(slot(&config.colors.background), Some("#101010ff"));
+        // 弹窗叠在任意内容上，半透明是拿可读性换观感 —— popover 恒不透明
+        assert_eq!(slot(&config.colors.popover), Some("#303030ff"));
+        // 可选槽位给 None 就不写键，由 gpui-component 回落自己的基线
+        assert!(config.colors.warning.is_none());
+        assert!(config.colors.info.is_none());
+        assert!(config.colors.success.is_none());
     }
 
     fn minimal_json(extra: &str) -> String {

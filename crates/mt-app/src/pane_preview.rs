@@ -36,7 +36,7 @@ use gpui::{
 };
 use mt_terminal::TerminalEmulator;
 use mt_ui::icons::{AiVendor, BrandIcon};
-use mt_ui::{MiniTerminalElement, TerminalStyle, TerminalTheme, TruncatedText};
+use mt_ui::{MiniTerminalElement, TerminalStyle, TerminalTheme};
 
 use crate::i18n::t;
 use crate::store::AppStore;
@@ -408,7 +408,8 @@ pub fn project_preview_card(
                         .min_w(px(0.0))
                         .text_size(ui::font_px(11.0))
                         .text_color(ui::text_muted())
-                        .child(TruncatedText::new(project_path.to_string())),
+                        .truncate()
+                        .child(project_path.to_string()),
                 ),
         )
         .child(

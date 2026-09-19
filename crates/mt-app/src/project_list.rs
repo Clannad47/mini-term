@@ -49,11 +49,11 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
-use mt_ui::TruncatedText;
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
     ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
 };
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::{
     self, DragProjectItem, DropPosition, ExternalDropKind, PreviewIcon,
@@ -248,18 +248,13 @@ fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
         .text_size(ui::font_px(9.75))
         .text_color(ui::text_muted())
         .bg(ui::border_subtle())
-        .tooltip({
-            let branch = branch.clone();
-            move |window, cx| {
-                mt_ui::tooltip::Tooltip::new(tr!(
-                    "projectList",
-                    "worktreeBadgeTitle",
-                    branch = branch.clone()
-                ))
-                .build(window, cx)
-            }
-        })
-        .child(TruncatedText::new(format!("⎇ {branch}")))
+        .tip(tr!(
+            "projectList",
+            "worktreeBadgeTitle",
+            branch = branch.clone()
+        ))
+        .truncate()
+        .child(format!("⎇ {branch}"))
 }
 
 /// 远程徽章:连接名(断链时「断链」两字 + error 配色)。
@@ -290,15 +285,13 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
         .text_size(ui::font_px(9.75))
         .text_color(fg)
         .bg(bg)
-        .tooltip(move |window, cx| {
-            mt_ui::tooltip::Tooltip::new(tip.clone())
-                .build(window, cx)
-        })
-        .child(TruncatedText::new(if remote.broken {
+        .tip(tip)
+        .truncate()
+        .child(if remote.broken {
             SharedString::from(t("projectList", "remoteBrokenBadge"))
         } else {
             SharedString::from(remote.name.clone())
-        }))
+        })
 }
 
 /// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
@@ -2303,23 +2296,14 @@ impl ProjectList {
             )
             .child(
                 dashed_button("add-remote-project", "SSH".into(), false)
-                    .tooltip(|window, cx| {
-                        mt_ui::tooltip::Tooltip::new(t(
-                            "projectList",
-                            "addRemoteProject",
-                        ))
-                        .build(window, cx)
-                    })
+                    .tip(t("projectList", "addRemoteProject"))
                     .on_click(cx.listener(|this, _event, window, cx| {
                         crate::remote_project::open(this.store.clone(), None, window, cx);
                     })),
             )
             .child(
                 dashed_button("new-group", "+".into(), false)
-                    .tooltip(|window, cx| {
-                        mt_ui::tooltip::Tooltip::new(t("projectList", "newGroup"))
-                            .build(window, cx)
-                    })
+                    .tip(t("projectList", "newGroup"))
                     .on_click(cx.listener(|this, _event, window, cx| {
                         let store = this.store.clone();
                         crate::prompt::show_prompt(
@@ -2353,14 +2337,15 @@ impl ProjectList {
                     .items_center()
                     .gap(px(6.0))
                     // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
-                    .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
+                    .child(div().min_w(px(0.0)).truncate().child(name))
                     .when_some(description, |el, desc| {
                         el.child(
                             div()
                                 .min_w(px(0.0))
                                 .text_size(ui::font_px(9.75))
                                 .text_color(ui::text_muted())
-                                .child(TruncatedText::new(desc)),
+                                .truncate()
+                                .child(desc),
                         )
                     })
                 .into_any_element()
@@ -2471,15 +2456,7 @@ impl ProjectList {
             // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
             // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
             // 原生 tooltip 会盖住那张卡。这里同款条件挂
-            .when(row.ai_vendors.is_empty(), |el| {
-                el.tooltip({
-                    let path = path.clone();
-                    move |window, cx| {
-                        mt_ui::tooltip::Tooltip::new(path.clone())
-                            .build(window, cx)
-                    }
-                })
-            })
+            .when(row.ai_vendors.is_empty(), |el| el.tip(path.clone()))
             // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
             // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
             // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行

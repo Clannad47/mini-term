@@ -184,8 +184,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
             cx,
         );
         dialog
-            // 面板没有底部按钮,右上角这颗 ✕ 是唯一看得见的出口 —— 必须自绘,
-            // `Dialog::close_button` 画的是空白(见 `prompt::dialog_title`)
+            // 面板没有底部按钮,右上角这颗 ✕ 是唯一看得见的出口 —— 自绘在标题行,
+            // 上游 `Dialog::close_button` 那颗保持关掉,否则两颗 ×(见 `prompt::dialog_title`)
             .title(dialog_title(kind::MOBILE_RELAY, t("mobileRelay", "modal.title")))
             .w(ui::clamp_dialog_width(px(PANEL_W), viewport))
             // 面板内有未保存的地址/密钥输入与配对操作,误点外侧关闭会丢内容;
