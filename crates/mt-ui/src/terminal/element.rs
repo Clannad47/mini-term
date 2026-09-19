@@ -75,9 +75,9 @@ use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Corners, DispatchPhase, Element, ElementId, EntityId,
     FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, Style, StrikethroughStyle,
-    TextRun, UnderlineStyle, Window, fill, point, px, size,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle,
+    Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 use mt_terminal::{TermSize, TerminalEmulator};
 

@@ -2102,7 +2102,8 @@ fn main() {
     // 1830 枚,约 731 KB):组件库自己只按名字取这 101 枚,全集是给应用画自己的
     // 图标用的,本仓的图标基建是 `mt_ui::icons` 那套自绘矢量(要多色,svg 单色
     // alpha 掩膜画不了),用不上。
-    gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(|cx: &mut App| {
+    let app = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
+    app.run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
         // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。

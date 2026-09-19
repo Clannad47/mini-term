@@ -65,9 +65,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, WindowControlArea, anchored, deferred, div, point,
     prelude::FluentBuilder, px, relative,
 };
-use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::rgb8;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::prompt::Confirm;

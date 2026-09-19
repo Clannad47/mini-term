@@ -132,8 +132,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
-    Styled, Subscription, Window, div, px,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled,
+    Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -418,11 +418,7 @@ pub fn counter_text(active: bool, index: usize, count: usize, no_results: &str) 
 /// 字号和停留时长都绕不过去(理由见 [`crate::tooltip`])。壳是个 `flex_none` 的裸
 /// div,在 `h_flex` 里既不撑也不缩,排布与之前一致。
 fn with_tip(id: &'static str, tip: SharedString, button: Button) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .tip(tip)
-        .child(button)
+    div().id(id).flex_none().tip(tip).child(button)
 }
 
 impl Render for TerminalSearchBar {

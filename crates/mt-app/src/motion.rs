@@ -162,7 +162,11 @@ mod tests {
     /// 切终端的整幅推移全部瞬间跳变)—— 本仓的豁免面在那道闸上无从表达。
     #[test]
     fn gpui_那道闸恒不减少() {
-        assert_eq!(gate_values(true), (true, false), "系统要求减少时转场仍须照播");
+        assert_eq!(
+            gate_values(true),
+            (true, false),
+            "系统要求减少时转场仍须照播"
+        );
         assert_eq!(gate_values(false), (false, false));
     }
 

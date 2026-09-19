@@ -443,24 +443,28 @@ mod tests {
         for appearance in [Appearance::Dark, Appearance::Light] {
             let p = builtin_palette(appearance);
             // 装配时 mt-ui 那头就是这么调的（内置没有背景图，面板恒不透明）
-            let config = theme_bridge::build_theme_config(
-                "mini-term",
-                appearance,
-                &builtin_tokens(&p),
-                1.0,
-            );
+            let config =
+                theme_bridge::build_theme_config("mini-term", appearance, &builtin_tokens(&p), 1.0);
             let c = &config.colors;
             let what = format!("{appearance:?}");
             // Dialog 的面板本体画 `tokens.background`；TextView / 主区同源
             assert_eq!(slot(&c.background), hex8(p.bg_base), "{what} background");
-            assert_eq!(slot(&c.foreground), hex8(p.text_primary), "{what} foreground");
+            assert_eq!(
+                slot(&c.foreground),
+                hex8(p.text_primary),
+                "{what} foreground"
+            );
             // 聚焦圈 / 光标 / 链接：原版 `.md-preview a` 就是 --accent
             assert_eq!(slot(&c.ring), hex8(p.accent), "{what} ring");
             assert_eq!(slot(&c.caret), hex8(p.accent), "{what} caret");
             assert_eq!(slot(&c.link), hex8(p.accent), "{what} link");
             // 边框：Input / Dialog / 分隔线三处同源
             assert_eq!(slot(&c.border), hex8(p.border_default), "{what} border");
-            assert_eq!(slot(&c.input), hex8(p.border_default), "{what} input.border");
+            assert_eq!(
+                slot(&c.input),
+                hex8(p.border_default),
+                "{what} input.border"
+            );
             // 浮层外壳（PopupMenu / Select / HoverCard）= 壳的 bg_elevated
             assert_eq!(slot(&c.popover), hex8(p.bg_elevated), "{what} popover");
             // 面板类（list / table / sidebar / title_bar / 活动 tab）= 壳的 bg_surface

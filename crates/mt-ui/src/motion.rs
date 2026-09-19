@@ -271,7 +271,14 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
     let id = handle.window_id();
     // 订阅要在借出 PULSE 之前建好:`observe_window_visibility` 只登记不回调,
     // 但把它塞进 borrow_mut 的作用域里徒增一层嵌套借用的风险
-    let fresh = PULSE.with(|pump| !pump.borrow().windows.iter().any(|w| w.handle.window_id() == id))
+    let fresh = PULSE
+        .with(|pump| {
+            !pump
+                .borrow()
+                .windows
+                .iter()
+                .any(|w| w.handle.window_id() == id)
+        })
         .then(|| window.observe_window_visibility(on_pulse_visibility));
     let start_pump = PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();

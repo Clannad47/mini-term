@@ -38,8 +38,8 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::branch_family;
 use crate::focus_nav::{self, Direction, PaneRect};

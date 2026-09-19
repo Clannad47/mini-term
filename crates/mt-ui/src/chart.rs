@@ -758,10 +758,16 @@ mod tests {
         );
         // 峰值顶到轴顶 → 顶端 stop 就是 area_top 本身
         let full = gpui::Rgba::from(canvas.area_peak_color(1.0));
-        assert!((full.r - 1.0).abs() < 1e-4 && (full.a - 1.0).abs() < 1e-4, "{full:?}");
+        assert!(
+            (full.r - 1.0).abs() < 1e-4 && (full.a - 1.0).abs() < 1e-4,
+            "{full:?}"
+        );
         // 峰值只有半高 → 顶端 stop 应当是「绘图区半高处」那个颜色
         let half = gpui::Rgba::from(canvas.area_peak_color(0.5));
-        assert!((half.r - 0.5).abs() < 1e-3 && (half.a - 0.5).abs() < 1e-3, "{half:?}");
+        assert!(
+            (half.r - 0.5).abs() < 1e-3 && (half.a - 0.5).abs() < 1e-3,
+            "{half:?}"
+        );
         // 峰值贴底(全零数据)→ 退化成底色;越界一律钳住
         let flat = gpui::Rgba::from(canvas.area_peak_color(0.0));
         assert!(flat.a.abs() < 1e-4, "{flat:?}");

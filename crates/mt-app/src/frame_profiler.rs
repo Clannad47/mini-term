@@ -261,7 +261,10 @@ impl Sample {
         let frames = self.draw.len();
         if frames == 0 {
             // 空闲也是结论:节拍器/动画泵停干净了才会一帧都没有。
-            return format!("[frame-profiler] {seconds:.1}s | 空闲(0 帧){}", lost_tail(lost));
+            return format!(
+                "[frame-profiler] {seconds:.1}s | 空闲(0 帧){}",
+                lost_tail(lost)
+            );
         }
 
         self.draw.sort_unstable();

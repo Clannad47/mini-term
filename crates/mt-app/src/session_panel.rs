@@ -52,9 +52,9 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
-use mt_ui::tooltip::TooltipExt as _;
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::menu;

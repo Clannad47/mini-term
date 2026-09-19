@@ -38,8 +38,8 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px, rems,
+    AnyElement, AnyView, App, AppContext, Context, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, text::Text};
 

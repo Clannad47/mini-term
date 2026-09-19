@@ -47,11 +47,11 @@ use gpui::{
     px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 use mt_ui::icons::usage_glyphs::{
     ICON_BOLT, ICON_CHAT, ICON_PULSE, ICON_REFRESH, ICON_STACK, ICON_WALLET,
 };
 use mt_ui::icons::vector::{Shape, VectorIcon};
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 use mt_usage::{
     AgentFilter, DailyStat, ModelPrice, SyncEvent, TopSessionStat, UsageStatsPayload,
     ledger_db_path, spawn_usage_ledger_sync, usage_ledger_query,

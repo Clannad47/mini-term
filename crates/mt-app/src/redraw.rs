@@ -371,8 +371,10 @@ mod tests {
     #[test]
     fn 不可见时一拍都不起() {
         // 最小化:请求照收(攒在 pending 里),但一帧都不画
-        let mut s = Schedule::default();
-        s.visible = false;
+        let mut s = Schedule {
+            visible: false,
+            ..Default::default()
+        };
         assert!(!s.arm(), "不可见时不许起泵");
         assert!(!s.running);
         assert!(!s.arm());
@@ -390,8 +392,10 @@ mod tests {
 
     #[test]
     fn 恢复可见后泵能重新起来() {
-        let mut s = Schedule::default();
-        s.visible = false;
+        let mut s = Schedule {
+            visible: false,
+            ..Default::default()
+        };
         assert!(!s.arm());
         s.visible = true;
         assert!(s.arm(), "恢复可见后下一次输出要能把泵重新起起来");
@@ -401,8 +405,10 @@ mod tests {
     #[test]
     fn 失焦与不可见是两档互不干扰() {
         // 失焦但看得见:降频到 5fps,照常起泵
-        let mut s = Schedule::default();
-        s.active = false;
+        let mut s = Schedule {
+            active: false,
+            ..Default::default()
+        };
         assert!(s.arm());
         assert_eq!(s.period(), IDLE_PERIOD);
         // 再最小化:这一档才是真的 0 帧

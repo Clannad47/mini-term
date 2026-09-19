@@ -47,9 +47,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, anchored, deferred, div,
-    prelude::FluentBuilder, px, relative,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, anchored, deferred,
+    div, prelude::FluentBuilder, px, relative,
 };
 use mt_config::SshConnection;
 use mt_project::fs::FileEntry;
@@ -572,8 +572,13 @@ mod tests {
     fn 展开深度不超过嵌套_deferred_预算() {
         /// gpui-pre-0.3.5 `window.rs:3594` 那句 assert 的上限。
         const GPUI_MAX_DEFERRED_DEPTH: usize = 10;
-        // 第 N 层面板占第 N+1 轮;它再开一层就是第 N+2 轮
-        assert!(MAX_PANEL_LEVEL + 2 <= GPUI_MAX_DEFERRED_DEPTH, "至少留一轮余量");
+        // 第 N 层面板占第 N+1 轮;它再开一层就是第 N+2 轮(常量关系,编译期就钉死)
+        const {
+            assert!(
+                MAX_PANEL_LEVEL + 2 <= GPUI_MAX_DEFERRED_DEPTH,
+                "至少留一轮余量"
+            );
+        }
 
         assert!(can_open_child(0), "根面板当然能展开");
         assert!(can_open_child(MAX_PANEL_LEVEL - 1));

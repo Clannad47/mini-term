@@ -37,9 +37,9 @@ use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
-use mt_ui::tooltip::TooltipExt as _;
 use mt_ai::sessions::{AiSession, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::menu;
