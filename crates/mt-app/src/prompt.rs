@@ -107,7 +107,7 @@ where
         let on_close = on_close.clone();
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
-        // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
+        // close_button 一律关掉,判据见 [`dialog_title`] 的注释。
         build(dialog, window, cx)
             .close_button(false)
             .on_close(move |_: &ClickEvent, window, cx| {
@@ -136,10 +136,15 @@ pub fn close_guarded(kind: &'static str, window: &mut Window, cx: &mut App) -> b
 /// 弹窗标题行:标题 + 右上角**自绘**的 ✕。
 ///
 /// **为什么不用 `Dialog::close_button`**:它画的是 `IconName::Close` → `svg()`
-/// → `AssetSource`,而本仓没注册任何 asset source(判据见
-/// `mt_ui::icons::vector` 模块注释),渲染出来是**空白但仍可点**的一块 ——
-/// 用户点得到、看不见。[`open_guarded`] 因此统一把它关掉,需要 ✕ 的弹窗
-/// 改用本函数。
+/// → `AssetSource`。**2026-09-19 补记**:入口已挂 `gpui_kit_assets::Assets`
+/// (见 `main.rs` 的 `with_assets`),原先记的「本仓没注册 asset source,渲染出来
+/// 是空白但仍可点」已作废 —— 它现在画得出来,而这恰恰是必须继续关掉的理由:
+/// 上游那颗是**绝对定位**在面板右上角的独立 Button(0.6.2 `dialog.rs:685`:
+/// `top = max(padding.top - 10, 8)`、`right` 同理),而本函数把 ✕ 画在标题行
+/// 右端并交给 `Dialog::title` —— 两颗都开就是两个 ×,且自绘这颗的配色与字号
+/// 走 [`crate::ui`] 那套(随 `font_px` 的 UI 字号缩放)、关窗走 [`close_guarded`]
+/// (自己摘覆盖物栈登记)。[`open_guarded`] 因此统一 `.close_button(false)`,
+/// 需要 ✕ 的弹窗改用本函数。
 ///
 /// 给**没有底部按钮**的弹窗用(移动端中转、worktree 这类):它们唯一的出口就是
 /// 右上角(Esc 也行,但那是看不见的知识)。带「取消」的确认框不必用 —— 底部

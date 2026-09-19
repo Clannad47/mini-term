@@ -5,11 +5,11 @@
 //! 组件库确实带了这两件(`menu/context_menu.rs`、`menu/popup_menu.rs`),四条硬伤
 //! 逐条挡在原版观感前面:
 //!
-//! 1. **图标要 SVG 资产**。`PopupMenu` 的勾选项画 `Icon::new(IconName::Check)`、
-//!    子菜单箭头画 `IconName::ChevronRight`,而 0.5.1 不带 svg 资产、宿主也没注册
-//!    `AssetSource` —— 渲染出来是**空白**且编译期无感(与 M 批边条图标同一个坑)。
-//!    原版的勾选恰恰是「`✓ ` / 全角空格前缀」文本方案,箭头是 CSS `::after` 的 `▸`,
-//!    照抄文本反而与原版一字不差。
+//! 1. **勾选与箭头是文本方案**。`PopupMenu` 的勾选项画 `Icon::new(IconName::Check)`、
+//!    子菜单箭头画 `IconName::ChevronRight`(**2026-09-19 补记**:入口已挂
+//!    `gpui_kit_assets::Assets`,原先记的「0.5.1 不带 svg 资产 → 渲染成空白」
+//!    已作废,这两枚现在画得出来)。但原版的勾选恰恰是「`✓ ` / 全角空格前缀」
+//!    文本方案,箭头是 CSS `::after` 的 `▸` —— 照抄文本才与原版一字不差。
 //! 2. **没有 danger 态**,也没有右对齐的快捷键标签。要补只能逐项走
 //!    `PopupMenuItem::element` 自绘,那时行渲染已经全是自己写的了。
 //! 3. **配色取 `cx.theme()`**(组件库自己那套 token),而壳里其它每一处都取

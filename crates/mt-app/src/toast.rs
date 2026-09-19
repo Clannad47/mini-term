@@ -3,8 +3,9 @@
 //!
 //! # 为什么不用 `gpui_component::notification::Notification`
 //!
-//! 读过 0.5.1 的 `notification.rs` 全文,**四条缺口是结构性的**(组件库里改不了,
-//! 宿主也绕不过去),外加两条与 M/P/S 批同源的老问题:
+//! 当初(0.5.1)读过 `notification.rs` 全文,四条缺口在那一版是结构性的
+//! (组件库里改不了,宿主也绕不过去),外加两条与 M/P/S 批同源的老问题 ——
+//! 逐条如下,**0.6.2 的复核见表后那段**:
 //!
 //! | 缺口 | 组件库现状 |
 //! |---|---|
@@ -15,8 +16,23 @@
 //! | 图标 | 四个 `NotificationType` 图标全走 `IconName` → SVG 资产,本仓没注册 `AssetSource`,渲染出来是空白且编译期无感 |
 //! | 位置 / 尺寸 | 右**上**角、448px 宽;原版是右下角 16/16、280px |
 //!
-//! 自建代价可控:原版 toast 一共 80 行 TSX + 78 行 CSS,而且**没有任何图标资产**
-//! —— 圆形徽标里就是 `✓` / `!` / `i` 三个文本字符(`ToastContainer.tsx:53`)。
+//! **2026-09-19 对照 gpui-base 0.6.2 复核**,上表六条现在是这样:
+//!
+//! - **悬停暂停** —— 已修:`NotificationList::advance` 把 `is_expanded()`(悬停态)
+//!   当 `paused` 交给 gpui-base 的 `toast.rs::advance(now, paused)`,不再是死字段;
+//! - **条数** —— 已可配:`NotificationSettings.max_items`(默认 10),不再写死;
+//! - **位置 / 尺寸** —— 已可配:`NotificationSettings` 的 `placement` / `margins` /
+//!   `width`,单条还能 `Notification::placement` 覆盖;
+//! - **图标** —— 判据作废:入口已挂 `gpui_kit_assets::Assets`(见 `main.rs` 的
+//!   `with_assets`),上游 `IconName` 画得出来了;
+//! - **去重语义** —— **仍缺**:同 id 再推还是**替换**,原版要的是「同项目已有就忽略」;
+//! - **× 常驻** —— **仍缺**:还是 `invisible()` + `group_hover("")` 才显形。
+//!
+//! 也就是说这层现在是「两条仍缺 + 一堆已经对齐的形态差」,不再是当初那种结构性
+//! 封死。要换上游得先把这两条与原版语义对齐,**先 spike 再动**;在那之前自建这
+//! 一层照旧,代价也可控:原版 toast 一共 80 行 TSX + 78 行 CSS,而且**没有任何
+//! 图标资产** —— 圆形徽标里就是 `✓` / `!` / `i` 三个文本字符
+//! (`ToastContainer.tsx:53`)。
 //!
 //! `Root::render_notification_layer` **保留不动**(组件库内部别处可能还用它),
 //! 只是 mt-app 不再 `push_notification`。

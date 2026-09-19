@@ -1469,8 +1469,13 @@ impl UsagePanel {
             ))
     }
 
-    /// 单项目下拉。**自绘**(走 `menu.rs`)—— `gpui_component::select` 的箭头
-    /// 走 `IconName::ChevronDown`,0.5.1 不带 svg 资产,渲染出来是空白。
+    /// 单项目下拉。**自绘**(走 `menu.rs`)。当初的判据是
+    /// `gpui_component::select` 的箭头走 `IconName::ChevronDown`、0.5.1 不带
+    /// svg 资产渲染成空白 —— **2026-09-19 补记**:入口已挂
+    /// `gpui_kit_assets::Assets`(见 `main.rs` 的 `with_assets`),**资产已就位,
+    /// 这条判据作废;此处自绘可回退为上游组件,待评估**(评估要覆盖:上游配色取
+    /// `cx.theme()` 而非壳的 [`crate::ui`],以及当前勾选态用的是 `menu.rs` 那套
+    /// 「`✓ ` / 全角空格」前缀)。
     ///
     /// 选项顺序**照项目表原样**(与项目列表同序,用户找得到);选项值是
     /// `ProjectConfig.path`(不是 id)—— `usage_ledger_query` 的 `project_path`

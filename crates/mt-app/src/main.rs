@@ -716,11 +716,13 @@ impl Workspace {
 
     /// 兑现一次提醒:提示音 / 任务栏闪烁 / toast。
     ///
-    /// toast 走自建的 [`toast`] 层。gpui-component 的 `Notification` 有四条
-    /// **结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且图标走
-    /// `IconName` 渲染成空白、去重是「替换」而原版是「忽略」),外加右上角 448px
-    /// 的位置尺寸 —— 都不是宿主能绕过去的,见 `toast.rs` 模块注释。跳转与去重
-    /// 语义一并搬进那一层,这里只剩「推一条」。
+    /// toast 走自建的 [`toast`] 层。当初记的是 gpui-component `Notification` 的
+    /// 四条**结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且
+    /// 图标走 `IconName` 渲染成空白、去重是「替换」而原版是「忽略」)外加右上角
+    /// 448px 的位置尺寸;**2026-09-19 对照 0.6.2 复核后只剩两条** —— 去重仍是
+    /// 「替换」、× 仍靠 `group_hover`(悬停暂停 / 条数 / 位置尺寸都已可配,图标
+    /// 那条随入口挂上 `gpui_kit_assets::Assets` 作废),逐条见 `toast.rs` 模块
+    /// 注释。跳转与去重语义一并搬进那一层,这里只剩「推一条」。
     fn deliver_alert(
         &mut self,
         alert: PendingAlert,
