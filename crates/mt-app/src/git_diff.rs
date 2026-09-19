@@ -48,7 +48,6 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
-use mt_ui::TruncatedText;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
@@ -1141,7 +1140,8 @@ pub fn open_file_diff(
                             .max_w(px(300.0))
                             .text_size(ui::font_px(13.0))
                             .text_color(ui::text_muted())
-                            .child(TruncatedText::new(file_path.clone())),
+                            .truncate()
+                            .child(file_path.clone()),
                     )
                     .child(
                         div()
@@ -1305,7 +1305,7 @@ pub fn open_commit_diff(
                                 .text_color(color)
                                 .child(letter),
                         )
-                        .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
+                        .child(div().min_w(px(0.0)).truncate().child(name))
                         .on_click(move |_: &ClickEvent, _window, cx| {
                             if pick.read(cx).selected == path {
                                 return;
@@ -1401,7 +1401,8 @@ pub fn open_commit_diff(
                                 .max_w(px(400.0))
                                 .text_size(ui::font_px(13.0))
                                 .text_color(ui::text_primary())
-                                .child(TruncatedText::new(selected.clone())),
+                                .truncate()
+                                .child(selected.clone()),
                         )
                         .child(view_toggle(
                             &state,

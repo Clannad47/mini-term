@@ -38,7 +38,6 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use mt_project::search::{
     SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
 };
-use mt_ui::TruncatedText;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
@@ -797,7 +796,8 @@ impl SearchModal {
                     .min_w(px(0.0))
                     .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
-                    .child(TruncatedText::new(path))
+                    .truncate()
+                    .child(path)
                     .into_any_element()
             } else {
                 highlighted_on(&path, &path_ranges, 10.0, ui::text_muted()).into_any_element()
@@ -854,7 +854,8 @@ impl Render for SearchModal {
                             div()
                                 .min_w(px(0.0))
                                 .text_color(ui::text_muted())
-                                .child(TruncatedText::new(file.clone())),
+                                .truncate()
+                                .child(file.clone()),
                         )
                         .child(
                             div()

@@ -65,7 +65,6 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 use mt_ai::hook_registry::HookRegistrationInfo;
-use mt_ui::TruncatedText;
 
 use crate::i18n::t;
 use crate::prompt::{kind, open_guarded};
@@ -867,7 +866,8 @@ impl SettingsView {
                         .child(
                             div()
                                 .min_w(px(0.0))
-                                .child(TruncatedText::new(t("settings", page.label_key()))),
+                                .truncate()
+                                .child(t("settings", page.label_key())),
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.page = page;

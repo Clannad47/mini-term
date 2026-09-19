@@ -36,7 +36,6 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputState};
 use mt_project::git::{BranchInfo, WorktreeInfo};
-use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -649,7 +648,8 @@ fn render_group(
                         .min_w(px(0.0))
                         .text_size(ui::font_px(11.0))
                         .text_color(ui::text_muted())
-                        .child(TruncatedText::new(group.main_path.clone())),
+                        .truncate()
+                        .child(group.main_path.clone()),
                 )
                 .on_click(move |_: &ClickEvent, _window, cx| {
                     state_for_click.update(cx, |s, cx| {
@@ -881,7 +881,8 @@ fn render_worktree_row(
                                 .min_w(px(0.0))
                                 .text_size(ui::font_px(13.0))
                                 .text_color(ui::text_primary())
-                                .child(TruncatedText::new(wt.name.clone())),
+                                .truncate()
+                                .child(wt.name.clone()),
                         )
                         .child(badges),
                 )
@@ -1214,7 +1215,7 @@ fn dropdown(
         .cursor_pointer()
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_primary())
-        .child(div().min_w(px(0.0)).child(TruncatedText::new(current)))
+        .child(div().min_w(px(0.0)).truncate().child(current))
         .child(div().text_color(ui::text_muted()).child("▾"))
         .on_click(move |event: &ClickEvent, window, cx| {
             let entries: Vec<menu::MenuEntry> = options
