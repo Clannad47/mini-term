@@ -451,7 +451,7 @@ pub struct PreparedFrame {
     flash: Option<(Bounds<Pixels>, Hsla)>,
 }
 
-/// 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
+/// 「这个字符在主字体里有字形、且步进正好是一列宽吗」的缓存。
 ///
 /// 每帧对每个格子问一次,不缓存就是每帧几千次 DirectWrite 往返。挂在
 /// [`TerminalElementState`] 上(跨帧存活),prepaint 开头借一次、整帧共用 ——
@@ -466,6 +466,19 @@ pub struct PreparedFrame {
 /// - **非 ASCII 走 HashMap**,键里带 font_id 与字号 —— 粗体 / 斜体是不同的
 ///   font_id,各自算各自的。列宽不进键:它本来就是 (font_id, 字号) 算出来的
 ///   ('M' 的 advance),同一个键对应的答案不会变。
+///
+/// # 为什么是真 shape 一次,而不是问 `TextSystem::advance`
+///
+/// `advance()` 走 `glyph_for_char`,而 DirectWrite 的 `GetGlyphIndices` 对**缺字**
+/// 返回的是 glyph 0(`.notdef`)而不是「没有」——等宽字体的 `.notdef` 步进恰好
+/// 一列宽,于是 ⚠ ✔ ⏺ ★ 箭头 框线这些主字体没有的符号被判成「可合并」、并进段里,
+/// shape 时却回退到别的字体拿到宽窄不一的字形,**段内其后每个字符都被顶歪**
+/// (2026-09-19 真机:40 个 `●○★☆→←↑↓─│┌┐└┘` 的行尾偏出两列,`[⚠]   1 列` 画成
+/// `1列`)。模块注释写的「主字体缺字要回退 → 不可合并」这条地基,在 Windows 上就此漏了。
+///
+/// 所以这里按真实路径 shape 这一个字符,看落下的 run **是不是主字体族**、总宽
+/// **是不是一列**;两条都成立才算可合并。回退到别的字族一律不合并 —— 单独定位,
+/// 字形宽窄只糊它自己那一格。
 struct AdvanceCache {
     /// ASCII 快表的有效性判据:四档变体的 FontId + 字号 + 列宽。
     key: Option<([FontId; 4], u32, u32)>,
@@ -494,9 +507,12 @@ impl AdvanceCache {
         }
     }
 
+    /// `base` 是主字体(含回退表),`slot` 选粗 / 斜变体;`font_id` 只当缓存键用。
+    #[allow(clippy::too_many_arguments)]
     fn fits(
         &mut self,
         window: &Window,
+        base: &gpui::Font,
         slot: usize,
         font_id: FontId,
         font_size: Pixels,
@@ -508,16 +524,19 @@ impl AdvanceCache {
             if let Some(hit) = self.ascii[slot][code] {
                 return hit;
             }
-            let fits = self.measure(window, font_id, font_size, ch, cell_width);
+            let fits = self.measure(window, base, slot, font_id, font_size, ch, cell_width);
             self.ascii[slot][code] = Some(fits);
             return fits;
         }
-        self.measure(window, font_id, font_size, ch, cell_width)
+        self.measure(window, base, slot, font_id, font_size, ch, cell_width)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn measure(
         &mut self,
         window: &Window,
+        base: &gpui::Font,
+        slot: usize,
         font_id: FontId,
         font_size: Pixels,
         ch: char,
@@ -527,14 +546,40 @@ impl AdvanceCache {
         if let Some(hit) = self.wide.get(&key).copied() {
             return hit;
         }
-        let fits = window
-            .text_system()
-            .advance(font_id, font_size, ch)
-            .map(|adv| (f(adv.width) - f(cell_width)).abs() < 0.01)
-            .unwrap_or(false);
+        let fits = shaped_by_primary_at_one_column(window, base, slot, font_size, ch, cell_width);
         self.wide.insert(key, fits);
         fits
     }
+}
+
+/// 按真实路径 shape 单个字符:落下的每个 run 都是主字体族、且总宽恰好一列,才算
+/// 「可合并」。回退字族按**族名**比,不比 `FontId` —— 同一张字面在 gpui 里会因
+/// features / fallbacks 不同注册成多个 id,而 `font_id_by_identifier` 只记最后一个。
+fn shaped_by_primary_at_one_column(
+    window: &Window,
+    base: &gpui::Font,
+    slot: usize,
+    font_size: Pixels,
+    ch: char,
+    cell_width: Pixels,
+) -> bool {
+    let text = SharedString::from(ch.to_string());
+    let run = TextRun {
+        len: text.len(),
+        font: VariantFonts::variant(base, slot),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text_system = window.text_system();
+    let shaped = text_system.shape_line(text, font_size, std::slice::from_ref(&run), None);
+    let primary_only = shaped.runs.iter().all(|r| {
+        text_system
+            .get_font_for_id(r.font_id)
+            .is_some_and(|font| font.family == base.family)
+    });
+    primary_only && (f(shaped.width) - f(cell_width)).abs() < 0.01
 }
 
 /// 参与「能否与相邻格子合并成一个 ShapedLine」判定的款式。
@@ -2039,11 +2084,19 @@ fn build_row(
         let slot = VariantFonts::slot(style_key.bold, style_key.italic);
         let run_font_id = variant_fonts.id_at(slot);
         // 可合并的条件:窄字符、无组合符号、不是光标格(光标格颜色单独)、
-        // 且主字体里这个字形的步进恰好一列宽。
+        // 且主字体里有这个字形、步进恰好一列宽。
         let mergeable = !cell.flags.contains(Flags::WIDE_CHAR)
             && !has_zerowidth
             && cell.cursor == 0
-            && advance.fits(window, slot, run_font_id, font_size, cell.ch, cell_width);
+            && advance.fits(
+                window,
+                font,
+                slot,
+                run_font_id,
+                font_size,
+                cell.ch,
+                cell_width,
+            );
 
         if mergeable {
             match text_run.as_mut() {
@@ -2277,14 +2330,9 @@ struct VariantFonts {
 impl VariantFonts {
     fn resolve(window: &Window, base: &gpui::Font) -> Self {
         let make = |bold: bool, italic: bool| {
-            let mut font = base.clone();
-            if bold {
-                font.weight = gpui::FontWeight::BOLD;
-            }
-            if italic {
-                font.style = gpui::FontStyle::Italic;
-            }
-            window.text_system().resolve_font(&font)
+            window
+                .text_system()
+                .resolve_font(&Self::variant(base, Self::slot(bold, italic)))
         };
         Self {
             ids: [
@@ -2294,6 +2342,18 @@ impl VariantFonts {
                 make(true, true),
             ],
         }
+    }
+
+    /// 按档位给 `base` 套上粗 / 斜。
+    fn variant(base: &gpui::Font, slot: usize) -> gpui::Font {
+        let mut font = base.clone();
+        if slot & 1 != 0 {
+            font.weight = gpui::FontWeight::BOLD;
+        }
+        if slot & 2 != 0 {
+            font.style = gpui::FontStyle::Italic;
+        }
+        font
     }
 
     /// 四档变体的下标。[`AsciiAdvance`] 的表也按它分层。
