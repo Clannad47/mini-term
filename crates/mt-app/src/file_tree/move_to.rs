@@ -23,11 +23,18 @@
 //! # 子面板挂在哪
 //!
 //! 列表区可滚(目录多的那一层不能溢出窗口),而 gpui 的 `overflow_y_scroll` 会把
-//! 两个轴一起裁 —— 子面板要是挂在行里(菜单基件那种 `absolute left:100%` 的挂法),
-//! 展开就被裁没。所以子面板挂在**面板根**上、与滚动容器平级,纵向位置取
-//! 行在上一帧记下的矩形(`row_bounds`,与 `terminal_area` 记 pane 矩形同一手法)。
-//! 不能用 `deferred` 逃出裁剪:菜单层自己就是一个 deferred 绘制,gpui 禁止在
-//! deferred 里再 defer(`prepaint_deferred_draws` 里那句 assert)。
+//! 两个轴一起裁 —— 子面板挂在行里(菜单基件那种 `absolute left:100%` 的挂法)会
+//! 被裁没,所以外头套一层 [`gpui::deferred`] 逃出去:`DeferredDraw` 不带
+//! `content_mask`(gpui-pre-0.3.5 `window.rs:4198-4229` 那个形参这里传 `None`),
+//! 浮层于是不吃任何祖先的裁剪域。位置因此是**当前帧**的行位置,行自己的布局说了算。
+//!
+//! ⚠️ **曾经不能这么干**:gpui 0.2.2 的 `prepaint_deferred_draws` 里有句
+//! `assert_eq!(deferred_draws.len(), 0, "cannot call defer_draw during deferred
+//! drawing")`,而菜单层自己就是一个 deferred 绘制。gpui-pre 0.3.5 把它改成了分轮
+//! 处理(`window.rs:3573-3640`,注释原文「Process deferred draws in multiple rounds
+//! to support nesting」),**每多一层嵌套多跑一轮**,上限是 `assert!(depth < 10)`。
+//! 这条预算就是 [`MAX_PANEL_LEVEL`] 的由来 —— 菜单层吃掉第一轮,本模块的第 N 层
+//! 面板在第 N+1 轮,越界会 panic 而不是画错位置。
 //!
 //! # 什么落点不接
 //!
@@ -40,9 +47,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window,
-    anchored, canvas, div, prelude::FluentBuilder, px, relative,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Task, Window, anchored, deferred, div,
+    prelude::FluentBuilder, px, relative,
 };
 use mt_config::SshConnection;
 use mt_project::fs::FileEntry;
@@ -58,6 +65,24 @@ use super::ops::start_move;
 
 /// 列表区最大高度;超过就滚(与 `branch_family` 同一档)。
 const MAX_LIST_HEIGHT: f32 = 320.0;
+
+/// 子面板浮层的 `deferred` 优先级。菜单层自己是 1(`menu.rs` 那句
+/// `.with_priority(1)`),浮在它之上要更大 —— `paint_deferred_draws` 按 priority
+/// **稳定**排序(`window.rs:3682-3687`),同级才轮到「后压入的在上」。
+const PANEL_PRIORITY: usize = 2;
+
+/// 最深能展开到第几层(根面板是第 0 层)。
+///
+/// 上限来自 gpui 的嵌套 deferred 预算:`prepaint_deferred_draws` 每轮处理一层、
+/// `assert!(depth < 10)`(见模块注释)。菜单层占掉第 1 轮,第 N 层面板在第 N+1 轮
+/// 被 prepaint,于是第 9 层展开子面板就会撞上那句 assert **panic**。留一轮余量
+/// 取 8:根目录往下 8 层足够挑落点,再深的目标走拖拽或先移到中间层。
+const MAX_PANEL_LEVEL: usize = 8;
+
+/// 第 `level` 层面板还能不能再展开一层子面板。
+fn can_open_child(level: usize) -> bool {
+    level < MAX_PANEL_LEVEL
+}
 
 /// 被移动的那一项。拖拽载荷([`crate::dnd::DragFilePath`])与右键行都能凑出来。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +159,7 @@ pub(super) fn move_to_menu_item(
                     source.clone(),
                 );
                 let root = context.root.clone();
-                cx.new(|cx| MoveToPanel::new(tree, context, connection, source, root, cx))
+                cx.new(|cx| MoveToPanel::new(tree, context, connection, source, root, 0, cx))
             });
             panel.clone().into_any_element()
         })
@@ -149,14 +174,14 @@ pub(super) struct MoveToPanel {
     source: MoveSource,
     /// 本面板列的目录。
     dir: PathBuf,
+    /// 本面板是第几层(根面板 0)。嵌套 deferred 的轮数预算按它算,见
+    /// [`MAX_PANEL_LEVEL`]。
+    level: usize,
     /// `None` = 还在列;`Some(Err)` = 列失败(那一层只剩「移动到此处」)。
     children: Option<Result<Vec<FileEntry>, String>>,
     /// 悬停展开的子目录下标。
     open_child: Option<usize>,
     child_panels: HashMap<PathBuf, Entity<MoveToPanel>>,
-    /// 面板根与各子目录行上一帧的矩形(子面板定位用,见模块注释)。
-    root_bounds: Option<Bounds<Pixels>>,
-    row_bounds: HashMap<usize, Bounds<Pixels>>,
     /// 列目录的任务。面板随菜单收起而 drop,没回来的列表跟着取消 —— 菜单都关了,
     /// 结果没人看。
     _task: Option<Task<()>>,
@@ -169,6 +194,7 @@ impl MoveToPanel {
         connection: Option<SshConnection>,
         source: MoveSource,
         dir: PathBuf,
+        level: usize,
         cx: &mut Context<Self>,
     ) -> Self {
         let root = context.root.clone();
@@ -194,11 +220,10 @@ impl MoveToPanel {
             connection,
             source,
             dir,
+            level,
             children: None,
             open_child: None,
             child_panels: HashMap::new(),
-            root_bounds: None,
-            row_bounds: HashMap::new(),
             _task: Some(task),
         }
     }
@@ -216,8 +241,14 @@ impl MoveToPanel {
 
     /// 悬停到第 `index` 个子目录:展开它(没建过面板就建,建即开始列)。
     /// `None` = 悬停到别的行,收起子面板。
+    ///
+    /// 到了 [`MAX_PANEL_LEVEL`] 那一层就不再往下展开 —— 再挂一层浮层会撞上 gpui
+    /// 的嵌套 deferred 轮数上限(见模块注释),那是 panic 不是画歪。
     fn set_open_child(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         if self.open_child == index {
+            return;
+        }
+        if index.is_some() && !can_open_child(self.level) {
             return;
         }
         if let Some(i) = index
@@ -231,7 +262,8 @@ impl MoveToPanel {
                 self.source.clone(),
             );
             let dir = entry.path.clone();
-            let panel = cx.new(|cx| Self::new(tree, context, connection, source, dir, cx));
+            let level = self.level + 1;
+            let panel = cx.new(|cx| Self::new(tree, context, connection, source, dir, level, cx));
             self.child_panels.insert(entry.path, panel);
         }
         self.open_child = index;
@@ -337,7 +369,10 @@ impl MoveToPanel {
         let enabled = self.source.accepts_target(&entry.path);
         let is_open = self.open_child == Some(index);
         let target = entry.path.clone();
-        let this = cx.entity();
+        // 展开中的那一层:子面板就挂在这一行里(位置随行走,不用跨帧记矩形)
+        let child = is_open
+            .then(|| self.child_panels.get(&entry.path).cloned())
+            .flatten();
         let icon = FileIcon::new(&entry.name, true, is_open).size(px(14.0));
         let icon = if entry.ignored {
             icon.color(ui::text_muted())
@@ -379,27 +414,27 @@ impl MoveToPanel {
                     .child("▸"),
             )
         })
-        // 记下这一行的矩形,子面板下一帧按它定位(见模块注释「子面板挂在哪」)
-        .child(
-            canvas(
-                move |bounds: Bounds<Pixels>, _window, cx| {
-                    this.update(cx, |panel: &mut Self, _cx| {
-                        panel.row_bounds.insert(index, bounds);
-                    });
-                },
-                |_, _, _, _| {},
+        // 子面板:与菜单基件的子菜单同一套坐标(父项右缘、上移 4px 对齐面板内边距),
+        // 外套 `anchored` 白拿贴边收拢;最外层 `deferred` 负责逃出列表那层
+        // `overflow_y_scroll` 的裁剪(见模块注释「子面板挂在哪」)
+        .when_some(child, |el, panel| {
+            el.child(
+                deferred(
+                    div()
+                        .absolute()
+                        .left(relative(1.0))
+                        .top(px(-4.0))
+                        .child(anchored().snap_to_window_with_margin(px(4.0)).child(panel)),
+                )
+                .with_priority(PANEL_PRIORITY),
             )
-            .absolute()
-            .size_full(),
-        )
+        })
         .into_any_element()
     }
 }
 
 impl Render for MoveToPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity();
-
         let mut list = div()
             .id(SharedString::from(format!(
                 "move-to-list-{}",
@@ -424,16 +459,6 @@ impl Render for MoveToPanel {
             }
         }
 
-        // 展开中的子面板:挂在面板根上(不在滚动容器里),纵向对齐到那一行。
-        // 行矩形是上一帧记的 —— 悬停到 notify 之后的这一帧,行早已画过至少一次
-        let child = self.open_child.and_then(|index| {
-            let entry = self.subdirs().get(index)?;
-            let panel = self.child_panels.get(&entry.path)?.clone();
-            let row = self.row_bounds.get(&index)?;
-            let root = self.root_bounds?;
-            Some((panel, row.origin.y - root.origin.y))
-        });
-
         div()
             .relative()
             .flex()
@@ -450,30 +475,7 @@ impl Render for MoveToPanel {
             // 面板挂在菜单项里,菜单面板已经 occlude 了;这里再挡一道,
             // 免得滚动条上的按下穿到底下去(与 branch_family 同)
             .occlude()
-            .child(
-                canvas(
-                    move |bounds: Bounds<Pixels>, _window, cx| {
-                        this.update(cx, |panel: &mut Self, _cx| {
-                            panel.root_bounds = Some(bounds);
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
             .child(list)
-            .when_some(child, |el, (panel, top)| {
-                // 与菜单基件的子菜单同一套坐标:父项右缘、上移 4px 对齐面板内边距,
-                // 外套 `anchored` 白拿贴边收拢
-                el.child(
-                    div()
-                        .absolute()
-                        .left(relative(1.0))
-                        .top(top - px(4.0))
-                        .child(anchored().snap_to_window_with_margin(px(4.0)).child(panel)),
-                )
-            })
     }
 }
 
@@ -561,6 +563,22 @@ mod tests {
         assert!(!file.accepts_target(Path::new("/home/u/proj/src")));
         assert!(file.accepts_target(Path::new("/home/u/proj/src/deep")));
         assert!(file.accepts_target(Path::new("/home/u/proj")));
+    }
+
+    /// 展开深度封在 gpui 的嵌套 deferred 预算之内:菜单层吃掉第 1 轮,第 N 层面板
+    /// 在第 N+1 轮被 prepaint,而 `prepaint_deferred_draws` 只肯跑 10 轮
+    /// (`assert!(depth < 10)`)。越界是 panic,所以这道闸门宁可早关一层。
+    #[test]
+    fn 展开深度不超过嵌套_deferred_预算() {
+        /// gpui-pre-0.3.5 `window.rs:3594` 那句 assert 的上限。
+        const GPUI_MAX_DEFERRED_DEPTH: usize = 10;
+        // 第 N 层面板占第 N+1 轮;它再开一层就是第 N+2 轮
+        assert!(MAX_PANEL_LEVEL + 2 <= GPUI_MAX_DEFERRED_DEPTH, "至少留一轮余量");
+
+        assert!(can_open_child(0), "根面板当然能展开");
+        assert!(can_open_child(MAX_PANEL_LEVEL - 1));
+        assert!(!can_open_child(MAX_PANEL_LEVEL), "最深那层不再往下");
+        assert!(!can_open_child(MAX_PANEL_LEVEL + 1));
     }
 
     #[test]
