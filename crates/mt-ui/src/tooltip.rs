@@ -1,46 +1,54 @@
 //! 全仓统一的 tooltip:比 gpui-component 默认款**字更小、要停得更久才弹**。
 //!
-//! # 为什么不直接用 `gpui_component::tooltip::Tooltip`
+//! # 字号:自绘气泡(仍然必要)
 //!
-//! 两个想调的量都被上游写死,且都不在可配置面上:
+//! gpui-component 的 `Tooltip::render` 把 `.text_sm()`(0.875rem)写在
+//! `.refine_style(&self.style)` **之前** —— 0.6.2 起调用点确实能用 `.text_size()`
+//! 盖过去,但那要求每个调用点都记得挂一次样式:全仓 50 多处,漏一处就花。
+//! 于是这里把那段气泡样式整份抄过来改成 [`TOOLTIP_FONT_SIZE`],
+//! **内容仍用它的 [`Text`]**,换行/富文本行为与上游逐字节一致。
 //!
-//! - **字号**:gpui-component 的 `Tooltip::render` 里把 `.text_sm()`(0.875rem)
-//!   钉死在气泡上。它虽然实现了 `Styled` + `refine_style`,但那要求每个调用点
-//!   都记得挂一次样式 —— 全仓 40 多处,漏一处就花。于是这里把那段气泡样式整份
-//!   抄过来改成 [`TOOLTIP_FONT_SIZE`],**内容仍用它的 [`Text`]**,换行/富文本
-//!   行为与之前逐字节一致。
-//! - **停留时长**:gpui 的 `TOOLTIP_SHOW_DELAY`(500ms)是 `elements/div.rs` 里的
-//!   **私有常量**,crates.io 版没有任何入口能改。
+//! # 停留时长:交给上游的 `tooltip_show_delay`
 //!
-//! # 「二段延迟」怎么做到的
+//! gpui-pre 0.3.5 把这个旋钮开成了公开面(`StatefulInteractiveElement::tooltip_show_delay`
+//! / `Interactivity::tooltip_show_delay`)。生效路径是:写进
+//! `Interactivity.tooltip_show_delay`(`Option<Duration>`)→ prepaint 里随
+//! `register_tooltip_mouse_handlers` 传给鼠标处理器 → `None` 才回落上游的
+//! `DEFAULT_TOOLTIP_SHOW_DELAY`(500ms)。计时本身是「鼠标进入排一个 timer,
+//! 到点才 `show_tooltip` 建视图」,中途离开当场取消,期间移动**不重排**计时。
 //!
-//! 不碰 gpui 那 500ms,而是在它后面再接一段:gpui 到点后照常把本视图建出来,
-//! 但视图**先渲染成一个空 div**(零尺寸、不画任何东西),再等
-//! [`EXTRA_SHOW_DELAY`] 才把气泡画出来。总停留 ≈ 500 + 700 = 1200ms。
+//! 所以气泡自己不必再懂延迟:用 [`TooltipExt`] 的方法一次挂上两件事
+//! (延迟 + 气泡闭包),别只挂裸的 `.tooltip()` —— 那是 500ms 档。
 //!
-//! 鼠标中途离开 → gpui 把视图整个收掉 → 计时 `Task` 随之 drop,不会补弹一下。
-//! 这是「延后」而不是「延后+补偿」,正是想要的语义。
+//! 个别调用点就是要「快弹」(用量统计弹窗工具栏的纯图标按钮 —— 不弹提示
+//! 就认不出是什么键),**故意**只挂裸 `.tooltip()` 回落到 500ms。
+//! 默认仍是 [`SHOW_DELAY`],别顺手全仓铺开快弹。
 //!
-//! 个别调用点想要「快弹」(如用量统计弹窗工具栏的图标按钮 —— 那里是纯图标,
-//! 不弹提示就认不出是什么键),挂 [`Tooltip::instant`] 即可把这段额外延迟归零,
-//! 手感回落到 gpui 原生的 500ms。**默认仍是 1200ms**,别顺手全仓铺开。
+//! # 退役记档:曾经的「二段延迟」
 //!
-//! 已知的小代价:气泡锚点取的是 gpui 建视图那一刻(第 500ms)的鼠标位置,
-//! 后面 700ms 里鼠标在同一元素内移动不会重新贴位。与上游非 hoverable tooltip
-//! 一贯的行为一致(它本来也只在建视图时取一次 `mouse_position`)。
+//! gpui 0.2.2 的 500ms 是 `elements/div.rs` 里的私有常量,当时只能在它后面
+//! 再接一段:视图先渲染成空 div,等 700ms 的 `Task` 到点再画,靠
+//! `cx.refresh_windows()` 唤醒重绘。两条代价随着换用上游 API 一并消失:
+//!
+//! - 每弹一次提示要**绕缓存全窗重绘一次**;
+//! - 气泡锚点取的是 gpui 建视图那一刻(第 500ms)的鼠标位置,后面 700ms 里
+//!   鼠标在同一元素内移动不会重新贴位。现在建视图发生在整个 [`SHOW_DELAY`]
+//!   之后,`show_tooltip` 当场取 `window.mouse_position()`,锚点即最新位置。
 
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, IntoElement, ParentElement, Render, Styled,
-    Task, Window, div, px, rems,
+    AnyElement, AnyView, App, AppContext, Context, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, text::Text};
 
-/// 在 gpui 自己那 500ms 之上**再**等多久才把气泡画出来。
+/// 鼠标要在元素上停多久才弹提示。
 ///
-/// 调这一个数就等于调「鼠标要停多久才弹提示」:实际总时长 = 500ms + 本值。
-pub const EXTRA_SHOW_DELAY: Duration = Duration::from_millis(700);
+/// **调这一个数就等于调全仓的停留时长**:它整个交给上游的
+/// `tooltip_show_delay`,不再有「上游 500ms + 自己再等一段」的叠加。
+/// 1200ms = 退役前那套二段延迟的总时长(gpui 的 500 + 自己的 700),手感不变。
+pub const SHOW_DELAY: Duration = Duration::from_millis(1200);
 
 /// 气泡字号。上游是 `text_sm`(0.875rem);这里降一档到 0.75rem。
 ///
@@ -49,25 +57,44 @@ pub const EXTRA_SHOW_DELAY: Duration = Duration::from_millis(700);
 /// 缩放,与上游同一套相对关系。
 const TOOLTIP_FONT_SIZE: f32 = 0.75;
 
+/// 给可交互元素挂全仓统一手感的 tooltip:[`SHOW_DELAY`] + 本模块的小字气泡。
+///
+/// ```ignore
+/// div().id("x").tip(t("app", "titleBar.settings"))          // 文本
+/// div().id("y").tip_with(move |window, cx| ...)             // 自造气泡视图
+/// ```
+///
+/// 两个方法都会把延迟挂在同一个 `Interactivity` 上,顺序无关。
+/// 想要 500ms 快弹的调用点**不要**用这里的方法,直接挂裸 `.tooltip()`。
+pub trait TooltipExt: StatefulInteractiveElement + Sized {
+    /// 纯文本提示。
+    fn tip(self, text: impl Into<SharedString>) -> Self {
+        let text: SharedString = text.into();
+        self.tip_with(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+    }
+
+    /// 自造气泡视图(富文本 / 自定义元素走这条,见 [`Tooltip::element`])。
+    fn tip_with(self, build: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.tooltip_show_delay(SHOW_DELAY).tooltip(build)
+    }
+}
+
+impl<T: StatefulInteractiveElement> TooltipExt for T {}
+
 enum TooltipContent {
     Text(Text),
     Element(Box<dyn Fn(&mut Window, &mut App) -> AnyElement>),
 }
 
-/// 一条 tooltip。用法与 `gpui_component::tooltip::Tooltip` 完全一致:
+/// 一条 tooltip 气泡。用法与 `gpui_component::tooltip::Tooltip` 完全一致:
 ///
 /// ```ignore
-/// .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+/// .tip_with(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
 /// ```
+///
+/// 停留时长不归它管 —— 那是元素侧的 [`TooltipExt`] / `tooltip_show_delay`。
 pub struct Tooltip {
     content: TooltipContent,
-    /// 这一条要在 gpui 那 500ms 之后再等多久。默认 [`EXTRA_SHOW_DELAY`],
-    /// 被 [`Tooltip::instant`] 归零。
-    extra_delay: Duration,
-    /// 额外停留时间到了没。false 期间 render 出的是空 div。
-    visible: bool,
-    /// 持有即计时;视图被 gpui 收掉时一起 drop,计时随之作废。
-    _delay: Option<Task<()>>,
 }
 
 impl Tooltip {
@@ -75,18 +102,7 @@ impl Tooltip {
     pub fn new(text: impl Into<Text>) -> Self {
         Self {
             content: TooltipContent::Text(text.into()),
-            extra_delay: EXTRA_SHOW_DELAY,
-            visible: false,
-            _delay: None,
         }
-    }
-
-    /// 免掉额外停留:总时长 = gpui 原生的 500ms。
-    ///
-    /// 只给「不弹提示就看不懂」的纯图标按钮用。
-    pub fn instant(mut self) -> Self {
-        self.extra_delay = Duration::ZERO;
-        self
     }
 
     /// 自定义元素气泡(用量面板的趋势图六行详情就是这条)。
@@ -99,52 +115,17 @@ impl Tooltip {
             content: TooltipContent::Element(Box::new(move |window, cx| {
                 builder(window, cx).into_any_element()
             })),
-            extra_delay: EXTRA_SHOW_DELAY,
-            visible: false,
-            _delay: None,
         }
     }
 
-    /// 建成 `AnyView` 交给 gpui。**额外的停留计时从这一刻起算**。
+    /// 建成 `AnyView` 交给 gpui。上游到这一刻已经等满了延迟,直接画。
     pub fn build(self, _: &mut Window, cx: &mut App) -> AnyView {
-        cx.new(|cx| {
-            if self.extra_delay.is_zero() {
-                // 不排计时:gpui 建视图那一刻就是该弹的一刻,首帧直接画出来
-                // (走 Task 的话至少要多等一帧,纯图标按钮上看得出来一顿)
-                return Self {
-                    visible: true,
-                    ..self
-                };
-            }
-            let extra_delay = self.extra_delay;
-            let delay = cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(extra_delay).await;
-                let _ = this.update(cx, |this: &mut Self, cx| {
-                    this.visible = true;
-                    cx.notify();
-                    // tooltip 视图挂在窗口的 tooltip 通道上而不是常规元素树里,
-                    // 这里再补一发全窗刷新兜底 —— 漏帧的后果是「提示再也不弹」,
-                    // 比多刷一帧难查得多。gpui 自己弹 tooltip 时也会 refresh 一次。
-                    cx.refresh_windows();
-                });
-            });
-            Self {
-                _delay: Some(delay),
-                ..self
-            }
-        })
-        .into()
+        cx.new(|_| self).into()
     }
 }
 
 impl Render for Tooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.visible {
-            // 还没停够:占位但不画。零尺寸空 div 既不出边框也不投影,
-            // 视觉上等同于「tooltip 还没出现」。
-            return div().into_any_element();
-        }
-
         let content = match &self.content {
             TooltipContent::Text(text) => div().child(text.clone()),
             TooltipContent::Element(builder) => div().child(builder(window, cx)),
@@ -178,26 +159,18 @@ impl Render for Tooltip {
 mod tests {
     use super::*;
 
-    /// 两段延迟加起来才是用户感知到的「停留时长」。gpui 那 500ms 改不了,
-    /// 这里守住自己这段别被顺手调回 0(调 0 就退化成上游默认手感)。
+    /// 停留时长必须明显长于 gpui 自己的 `DEFAULT_TOOLTIP_SHOW_DELAY`(500ms),
+    /// 否则挂这套扩展就没意义了(退化成上游默认手感)。
     #[test]
-    fn 额外延迟明显大于零() {
-        assert!(EXTRA_SHOW_DELAY >= Duration::from_millis(300));
+    fn 停留时长长于上游默认档() {
+        assert!(SHOW_DELAY > Duration::from_millis(500));
     }
 
-    /// 默认档不受 [`Tooltip::instant`] 那条支线影响 —— 新建的气泡照旧要等满。
+    /// 退役二段延迟时的换算:老口径是 gpui 的 500ms + 自己的 700ms。
+    /// 手感不该因为换实现而变,这里把那个总数钉住。
     #[test]
-    fn 默认仍走额外延迟() {
-        let t = Tooltip::new("x");
-        assert_eq!(t.extra_delay, EXTRA_SHOW_DELAY);
-        assert!(!t.visible);
-    }
-
-    /// `instant()` 必须真把额外那段归零(`build` 靠 `is_zero()` 走免计时分支)。
-    #[test]
-    fn instant_免掉额外延迟() {
-        assert!(Tooltip::new("x").instant().extra_delay.is_zero());
-        assert!(Tooltip::element(|_, _| div()).instant().extra_delay.is_zero());
+    fn 停留时长沿用二段延迟时代的总时长() {
+        assert_eq!(SHOW_DELAY, Duration::from_millis(1200));
     }
 
     /// 字号必须比上游的 0.875rem 小,否则这个模块就白抄了。

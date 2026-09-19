@@ -41,7 +41,10 @@ const BUTTON: f32 = 32.0;
 const ICON: f32 = 18.0;
 /// 一次新的边条悬停会话里,第一条文字提示要停多久才出现。
 ///
-/// 这是**完整延迟**,不再叠加全局 [`mt_ui::tooltip::Tooltip`] 的额外 700ms。
+/// 边条**不走** gpui 的 tooltip 通道:标签是自绘的 [`HoverLabel`],计时由
+/// [`HoverSession`] 的「热身」语义管(第一条等满,之后同一会话里横扫相邻按钮
+/// 即时切换)。`tooltip_show_delay` 是逐元素的、没有跨兄弟的热身概念,替不了。
+/// 所以这里刻意比全仓那档 [`mt_ui::tooltip::SHOW_DELAY`] 短。
 pub const HOVER_SHOW_DELAY: Duration = Duration::from_millis(500);
 /// 按钮在 44px 边条里左右各留 6px;提示从按钮右缘再跨过这 6px,
 /// 正好从边条右缘开始画。

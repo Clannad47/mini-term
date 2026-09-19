@@ -44,7 +44,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::notify::ToastKind;
@@ -505,9 +505,7 @@ impl Render for ToastLayer {
                                 // 原版这颗按钮带 `aria-label` / `title`
                                 // (`ToastContainer.tsx:69-70`);GPUI 没有无障碍树,
                                 // tooltip 是它唯一的等价物
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(t("toast", "dismiss")).build(window, cx)
-                                })
+                                .tip(t("toast", "dismiss"))
                                 .child("×")
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
                                     // 关按钮吃掉这次点击 —— 不然会连带触发卡片的「跳项目」

@@ -49,8 +49,10 @@
 //! ## 4.6 tooltip([`tooltip`])
 //!
 //! 全仓 tooltip 的**唯一入口**(mt-app 也从这里取)。上游 gpui-component 那款
-//! 字号写死、gpui 的 500ms 停留时长是私有常量,两个都调不动,所以自己包一层:
-//! 字号降一档 + 在 gpui 那 500ms 后再接一段延迟。理由与做法见该模块注释。
+//! 字号是在 `refine_style` 之前钉的 `text_sm`,想降一档就得每个调用点都记得
+//! 挂一次样式,所以气泡仍自绘;停留时长则由上游 API 给足(gpui-pre 0.3.5 的
+//! `tooltip_show_delay`),挂 [`tooltip::TooltipExt`] 的方法即是全仓统一档
+//! [`tooltip::SHOW_DELAY`]。曾经那套「二段延迟」已退役,记档见该模块注释。
 //!
 //! ## 4.7 单行省略文本 —— 已退役,用 `div().truncate()`
 //!

@@ -77,7 +77,7 @@ use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::prompt::{Confirm, show_alert};
@@ -2186,9 +2186,7 @@ fn md_image_placeholder(
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_muted())
         .child(div().min_w_0().truncate().child(label))
-        .when_some(hint, |el, hint| {
-            el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
-        })
+        .when_some(hint, |el, hint| el.tip(hint))
         .when_some(open, |el, url| {
             el.cursor_pointer()
                 .hover(|el| el.text_color(ui::text_primary()))
@@ -3348,9 +3346,7 @@ impl FileViewer {
                                 .flex_none()
                                 .rounded_full()
                                 .bg(ui::accent())
-                                .tooltip(|window, cx| {
-                                    Tooltip::new(t("fileViewer", "unsaved")).build(window, cx)
-                                }),
+                                .tip(t("fileViewer", "unsaved")),
                         )
                     })
                     .child(
@@ -3792,7 +3788,7 @@ impl FileViewer {
                         .max_w_full()
                         .min_w_0()
                         .cursor_pointer()
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .tip(tip)
                         .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(&url))
                         .child(el)
                         .into_any_element()

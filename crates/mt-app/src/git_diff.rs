@@ -48,7 +48,7 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{kind, open_guarded};
@@ -923,7 +923,7 @@ fn jump_button(
         .text_color(ui::text_muted())
         .cursor_pointer()
         .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .tip(tip)
         .child(glyph)
         .on_click(move |_: &ClickEvent, _window, cx| {
             state.update(cx, |s, cx| {

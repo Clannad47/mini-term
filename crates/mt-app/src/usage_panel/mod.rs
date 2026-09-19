@@ -47,7 +47,7 @@ use gpui::{
     px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 use mt_ui::icons::usage_glyphs::{
     ICON_BOLT, ICON_CHAT, ICON_PULSE, ICON_REFRESH, ICON_STACK, ICON_WALLET,
 };
@@ -1150,10 +1150,7 @@ fn state_hint(
                     .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     // 截断之后 hover 出全文(原版靠 `title=`)
-                    .tooltip({
-                        let d = d.clone();
-                        move |window, cx| Tooltip::new(d.clone()).build(window, cx)
-                    })
+                    .tip(d.clone())
                     .child(d),
             )
         })
@@ -1419,12 +1416,11 @@ impl UsagePanel {
                                 this.refresh(cx)
                             }))
                     })
-                    // 纯图标键,提示晚弹等于认不出来 → 免掉额外停留(见
-                    // `mt_ui::tooltip` 的二段延迟说明),回落到 gpui 的 500ms
+                    // 纯图标键,提示晚弹等于认不出来 → **刻意**不挂
+                    // `mt_ui::tooltip::SHOW_DELAY`(1200ms),裸 `.tooltip()`
+                    // 回落到 gpui 自己的 500ms
                     .tooltip(|window, cx| {
-                        Tooltip::new(t("usageStats", "refresh"))
-                            .instant()
-                            .build(window, cx)
+                        Tooltip::new(t("usageStats", "refresh")).build(window, cx)
                     })
                     .child(VectorIcon::new(ICON_REFRESH, px(14.0)).ink(ui::text_muted())),
             )
@@ -1555,7 +1551,7 @@ impl UsagePanel {
         let label = auto_refresh_label(current);
         let entity = cx.entity();
         dropdown("usage-auto-refresh", label, px(96.0))
-            .tooltip(|window, cx| Tooltip::new(t("usageStats", "autoRefresh")).build(window, cx))
+            .tip(t("usageStats", "autoRefresh"))
             .on_mouse_down(
                 MouseButton::Left,
                 move |event: &MouseDownEvent, window, cx| {
@@ -2033,15 +2029,13 @@ impl UsagePanel {
                     // 不是乘,给 0.5 会直接变成半透明白把曲线洗掉
                     .hover(|el| el.bg(ui::border_subtle()))
                     // 图表 hover 详情是「扫过去看数」的交互,不是「停下来问这
-                    // 是什么键」——默认那 1200ms 会让人以为图表没反应,横向扫
-                    // 过多个桶时每格还要重新等满。免掉额外停留(见
-                    // `mt_ui::tooltip` 的二段延迟说明),回落到 gpui 的 500ms;
-                    // 全仓其余 tooltip 不受影响
+                    // 是什么键」——全仓那档 1200ms 会让人以为图表没反应,横向扫
+                    // 过多个桶时每格还要重新等满。所以**刻意**不挂
+                    // `mt_ui::tooltip::SHOW_DELAY`,裸 `.tooltip()` 回落到 gpui
+                    // 自己的 500ms;全仓其余 tooltip 不受影响
                     .tooltip(move |window, cx| {
                         let tip = tip.clone();
-                        Tooltip::element(move |_window, _cx| tip.render())
-                            .instant()
-                            .build(window, cx)
+                        Tooltip::element(move |_window, _cx| tip.render()).build(window, cx)
                     }),
             );
         }

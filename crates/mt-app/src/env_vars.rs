@@ -32,6 +32,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputState};
 use mt_config::ProjectEnvVar;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
@@ -349,13 +350,10 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                         .gap(px(8.0))
                         .child(
                             ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled)
-                                .tooltip(move |window, cx| {
-                                    mt_ui::tooltip::Tooltip::new(if enabled {
-                                        t("envVars", "rowEnabled")
-                                    } else {
-                                        t("envVars", "rowDisabled")
-                                    })
-                                    .build(window, cx)
+                                .tip(if enabled {
+                                    t("envVars", "rowEnabled")
+                                } else {
+                                    t("envVars", "rowDisabled")
                                 })
                                 .on_click({
                                     let state = state.clone();
@@ -409,10 +407,7 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                                 .text_size(ui::font_px(11.0))
                                 .text_color(ui::text_muted())
                                 .hover(|el| el.text_color(ui::color_error()))
-                                .tooltip(|window, cx| {
-                                    mt_ui::tooltip::Tooltip::new(t("envVars", "removeRow"))
-                                        .build(window, cx)
-                                })
+                                .tip(t("envVars", "removeRow"))
                                 .child("✕")
                                 .on_click({
                                     let state = state.clone();

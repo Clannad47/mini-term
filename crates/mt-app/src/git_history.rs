@@ -28,6 +28,7 @@ use gpui::{
     point, px, uniform_list,
 };
 use mt_project::git::{BranchInfo, GitCommitInfo};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
@@ -451,9 +452,7 @@ impl GitHistoryContent {
                     .text_color(fg)
                     .truncate()
                     .child(branch.name.clone())
-                    .tooltip(move |window, cx| {
-                        mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                    }),
+                    .tip(tip),
             );
         }
         first_line = first_line.child(div().min_w_0().truncate().child(message));

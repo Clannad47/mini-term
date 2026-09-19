@@ -40,6 +40,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 use mt_project::git::{BranchInfo, GitRepoInfo};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
@@ -775,9 +776,7 @@ impl GitPanel {
                 .when(is_worktree, |el| {
                     el.child(div().text_size(ui::font_px(13.0)).text_color(ui::text_muted()).child("⎇"))
                 })
-                .tooltip(move |window, cx| {
-                    mt_ui::tooltip::Tooltip::new(repo_path_tip.clone()).build(window, cx)
-                })
+                .tip(repo_path_tip)
                 .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     let entries = this.repo_menu(cx);
                     menu::show(event.position(), entries, window, cx);
@@ -831,9 +830,7 @@ impl GitPanel {
                             .opacity(0.7)
                             .child("▾"),
                     )
-                    .tooltip(move |window, cx| {
-                        mt_ui::tooltip::Tooltip::new(branch_tip.clone()).build(window, cx)
-                    })
+                    .tip(branch_tip)
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
                         if this.branches.is_empty() {
@@ -912,9 +909,7 @@ impl GitPanel {
                 el.cursor_pointer().hover(|el| el.text_color(ui::text_primary()))
             })
             .child(glyph)
-            .tooltip(move |window, cx| {
-                mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-            })
+            .tip(tip)
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.run_sync(pull, cx)
             }))
