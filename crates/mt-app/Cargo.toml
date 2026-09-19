@@ -22,6 +22,11 @@ gpui_platform.workspace = true
 # **写在这里而不是根 `Cargo.toml`**:workspace 依赖允许成员 crate 在
 # `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+# 组件库的图标资产源,挂在 `main.rs` 的 `application().with_assets(..)` 上。
+# 不挂的话上游组件里所有 `Icon::new(IconName::..)` / `svg()` 都取不到字节 ——
+# 画出来是**空白**,而且编译期毫无提示(这条前提此前拖着全仓十来处「只能自绘」的记档)。
+# 与 gpui-component 同版本同源(见根 Cargo.toml 的说明),净新增 crate = 0。
+gpui-kit-assets.workspace = true
 # ---- 语法高亮补充语言包(`syntax_languages.rs`)----
 # 组件库那 30 余种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
 # 打开 .cs 整篇纯文本色;PowerShell / XML / Dart 这些常见类型它根本没有
