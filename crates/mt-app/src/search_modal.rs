@@ -184,8 +184,10 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
             let height = viewport.height * 0.7;
             dialog
                 .p_0()
-                // 头部有自己的 ✕;`close_button` 画的是 `IconName::Close`,
-                // 而 0.5.1 不带 svg 资产(渲染成空白且编译期无感)
+                // 头部有自己的 ✕;上游 `close_button` 是绝对定位到面板右上角的一颗,
+                // `p_0()` 满幅布局下会压住自绘头部,两颗都开就是两个 ×。
+                // (2026-09-19 前的理由「0.5.1 不带 svg 资产、画出来是空白」已随
+                // 入口挂上 `gpui_kit_assets::Assets` 作废。)
                 .close_button(false)
                 // 输了半天的查询词,误点遮罩就没了 —— 原版 `closeOnOverlay={false}`
                 .overlay_closable(false)
