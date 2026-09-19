@@ -178,6 +178,7 @@ mod tests {
                 mt_ui::motion::TERMINAL_SWAP,
                 mt_ui::motion::TAB_INDICATOR,
                 mt_ui::motion::PANE_ENTER,
+                mt_ui::motion::TOAST_SLIDE_IN,
             ] {
                 assert!(
                     exempt.running_at(half, mt_ui::motion::reduce_motion()),
@@ -186,7 +187,7 @@ mod tests {
                 assert!(exempt.progress_at(half, mt_ui::motion::reduce_motion()) < 1.0);
             }
             // 对照组:不在豁免名单里的照旧直达终态
-            assert!(!mt_ui::motion::TOAST_SLIDE_IN.running_at(half, mt_ui::motion::reduce_motion()));
+            assert!(!mt_ui::motion::TAG_FADE_IN.running_at(half, mt_ui::motion::reduce_motion()));
         });
     }
 }

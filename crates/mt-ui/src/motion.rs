@@ -23,7 +23,7 @@
 //! | `.animate-pulse`(骨架屏) | **停** | [`blinks`] |
 //! | `.animate-glow` | **停** | (GPUI 侧无消费方) |
 //! | `.done-tag` 的 `tagFadeIn` | **停**(压成瞬时) | [`TAG_FADE_IN`] |
-//! | `.toast-card` 的 `toastSlideIn` | **停**(压成瞬时) | [`TOAST_SLIDE_IN`] |
+//! | `.toast-card` 的 `toastSlideIn` | 原版**停**(压成瞬时);**2026-09-19 起豁免**,理由见常量注释 | [`TOAST_SLIDE_IN`] |
 //! | `.animate-status-spin` / `.animate-spin`(**进行中**指示器) | 继续转,周期放慢到 2.4s | [`spin_period`] |
 //! | 浮层进出场(`.overlay-*` / `.ctx-menu` / `.prompt-*`) | **豁免**,原速播完 | [`OVERLAY_IN`] 等 |
 //! | `.terminal-swap-in` / `.panel-swap-in` / `.pane-enter` | **豁免** | [`PANE_ENTER`] 等 |
@@ -530,10 +530,12 @@ pub const USAGE_FADE_IN: TransitionSpec =
 /// (**豁免**,`styles.css:475-477`)。
 pub const RANK_BAR: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(500), Easing::EaseOut);
-/// `.toast-card` 的 `toastSlideIn 0.25s ease-out`。原版**没有**豁免它 ——
-/// reduce 下由通配规则压成瞬时。
+/// `.toast-card` 的 `toastSlideIn 0.25s ease-out`。原版**没有**豁免它(reduce 下由
+/// 通配规则压成瞬时),**2026-09-19 用户拍板改为豁免**:toast 是从屏幕外滑进来的
+/// 方向性位移,压成瞬时就是「右下角凭空冒出一块」,与豁免面的口径(转场照播、
+/// 闪烁全停)同类,而且它 250ms 播完即止、不常驻。
 pub const TOAST_SLIDE_IN: TransitionSpec =
-    TransitionSpec::new(Duration::from_millis(250), Easing::EaseOut);
+    TransitionSpec::exempt(Duration::from_millis(250), Easing::EaseOut);
 /// `.done-tag` 的 `tagFadeIn 0.3s ease-out`(`styles.css:522`)。原版**没有**
 /// 豁免它 —— 与 toast 同一档,reduce 下由通配规则压成瞬时。
 pub const TAG_FADE_IN: TransitionSpec =
@@ -947,7 +949,8 @@ mod tests {
         assert_eq!(USAGE_FADE_IN.duration, Duration::from_millis(350));
         assert_eq!(RANK_BAR.duration, Duration::from_millis(500));
         assert_eq!(TOAST_SLIDE_IN.duration, Duration::from_millis(250));
-        // 豁免面:reduce 段里被点名的那些不受闸影响,toast 不在名单里
+        // 豁免面:reduce 段里被点名的那些不受闸影响;toast 原版不在名单里,
+        // 2026-09-19 用户拍板加入(方向性位移不该压成瞬时)
         for exempt in [
             OVERLAY_IN,
             OVERLAY_OUT,
@@ -958,13 +961,10 @@ mod tests {
             SECTION_TOGGLE,
             USAGE_FADE_IN,
             RANK_BAR,
+            TOAST_SLIDE_IN,
         ] {
             assert!(!exempt.respects_reduce, "{exempt:?} 应属豁免面");
         }
-        assert!(
-            TOAST_SLIDE_IN.respects_reduce,
-            "toastSlideIn 在原版 reduce 段没有豁免,必须过闸"
-        );
         assert_eq!(TAG_FADE_IN.duration, Duration::from_millis(300));
         assert!(
             TAG_FADE_IN.respects_reduce,
