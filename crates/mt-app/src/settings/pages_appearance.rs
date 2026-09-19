@@ -9,7 +9,6 @@ use gpui::{
     PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
-use mt_ui::TruncatedText;
 use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 
 use crate::i18n::{Locale, t, tr};
@@ -408,14 +407,16 @@ impl SettingsView {
                                     } else {
                                         ui::text_primary()
                                     })
-                                    .child(TruncatedText::new(name.clone())),
+                                    .truncate()
+                                    .child(name.clone()),
                             )
                             .child(
                                 div()
                                     .min_w_0()
                                     .text_size(ui::font_px(11.0))
                                     .text_color(ui::text_muted())
-                                    .child(TruncatedText::new(theme_id.clone())),
+                                    .truncate()
+                                    .child(theme_id.clone()),
                             ),
                     )
                     .child(

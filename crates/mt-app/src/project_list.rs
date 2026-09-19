@@ -49,7 +49,6 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
-use mt_ui::TruncatedText;
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
     ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
@@ -259,7 +258,8 @@ fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
                 .build(window, cx)
             }
         })
-        .child(TruncatedText::new(format!("⎇ {branch}")))
+        .truncate()
+        .child(format!("⎇ {branch}"))
 }
 
 /// 远程徽章:连接名(断链时「断链」两字 + error 配色)。
@@ -294,11 +294,12 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
             mt_ui::tooltip::Tooltip::new(tip.clone())
                 .build(window, cx)
         })
-        .child(TruncatedText::new(if remote.broken {
+        .truncate()
+        .child(if remote.broken {
             SharedString::from(t("projectList", "remoteBrokenBadge"))
         } else {
             SharedString::from(remote.name.clone())
-        }))
+        })
 }
 
 /// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
@@ -2353,14 +2354,15 @@ impl ProjectList {
                     .items_center()
                     .gap(px(6.0))
                     // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
-                    .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
+                    .child(div().min_w(px(0.0)).truncate().child(name))
                     .when_some(description, |el, desc| {
                         el.child(
                             div()
                                 .min_w(px(0.0))
                                 .text_size(ui::font_px(9.75))
                                 .text_color(ui::text_muted())
-                                .child(TruncatedText::new(desc)),
+                                .truncate()
+                                .child(desc),
                         )
                     })
                 .into_any_element()

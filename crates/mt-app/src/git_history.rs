@@ -28,7 +28,6 @@ use gpui::{
     point, px, uniform_list,
 };
 use mt_project::git::{BranchInfo, GitCommitInfo};
-use mt_ui::TruncatedText;
 
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
@@ -426,9 +425,7 @@ impl GitHistoryContent {
             .text_color(ui::text_primary());
         // 胶囊与提交说明按各自宽度比例收缩、各自截断:胶囊不设 `flex_none`,否则
         // `feature/MT-1234-…` 这种长名一个就把说明整个挤出行外。胶囊保底一截
-        // 宽度好认出 `origin/` 前缀,全名挂 tooltip。截断用 [`TruncatedText`]
-        // 而不是 `truncate()`(后者在这种自然宽度的 flex 项上画不出「…」,
-        // 理由见 `mt_ui::truncated_text` 模块注释)。
+        // 宽度好认出 `origin/` 前缀,全名挂 tooltip。
         for branch in self.shown_branches(&commit.hash) {
             let (bg, fg) = if branch.is_head {
                 (palette_color(0), gpui::white())
@@ -452,13 +449,14 @@ impl GitHistoryContent {
                     .rounded(px(3.0))
                     .bg(bg)
                     .text_color(fg)
-                    .child(TruncatedText::new(branch.name.clone()))
+                    .truncate()
+                    .child(branch.name.clone())
                     .tooltip(move |window, cx| {
                         mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                     }),
             );
         }
-        first_line = first_line.child(TruncatedText::new(message));
+        first_line = first_line.child(div().min_w_0().truncate().child(message));
 
         // ⚠️ `w_full` 不能省:行是 uniform_list 的 item,单独 `layout_as_root`,而
         // taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、不吃 available
@@ -500,7 +498,8 @@ impl GitHistoryContent {
                                 div()
                                     .min_w(px(0.0))
                                     .max_w(px(140.0))
-                                    .child(TruncatedText::new(author)),
+                                    .truncate()
+                                    .child(author),
                             )
                             .child("·")
                             .child(div().flex_none().child(relative))

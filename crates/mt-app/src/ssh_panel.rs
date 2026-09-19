@@ -47,7 +47,6 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
-use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -186,6 +185,7 @@ pub(crate) fn bucket_header(
     count: usize,
     collapsed: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
     div()
         .id(id)
         .w_full()
@@ -203,7 +203,7 @@ pub(crate) fn bucket_header(
                 .text_size(ui::font_px(10.0))
                 .child(if collapsed { "▸" } else { "▾" }),
         )
-        .child(div().min_w(px(0.0)).child(TruncatedText::new(label)))
+        .child(div().min_w(px(0.0)).truncate().child(label))
         .child(div().flex_none().child(format!("({count})")))
 }
 
@@ -334,9 +334,7 @@ pub(crate) fn conn_card(
 /// 卡片里那两行字(名称 + 摘要)。`suffix` 接在摘要后面(「· 已存密码」)。
 pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
     conn_text_with_name(
-        name_line()
-            .child(TruncatedText::new(conn.name.clone()))
-            .into_any_element(),
+        name_line().child(conn.name.clone()).into_any_element(),
         conn,
         suffix,
     )
@@ -347,6 +345,7 @@ pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
 fn name_line() -> gpui::Div {
     div()
         .min_w(px(0.0))
+        .truncate()
         .text_size(ui::font_px(13.0))
         .text_color(ui::text_primary())
 }
@@ -1459,7 +1458,7 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
                 .cursor_pointer()
                 .when(just_copied, |el| el.text_color(ui::accent()))
                 .hover(|el| el.text_color(ui::accent()))
-                .child(TruncatedText::new(conn.name.clone()))
+                .child(conn.name.clone())
                 .on_click({
                     let state = state.clone();
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
