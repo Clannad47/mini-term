@@ -9,6 +9,19 @@ authors.workspace = true
 name = "mini-term"
 path = "src/main.rs"
 
+[features]
+# dev-only 度量工具:打开 gpui-pre 内置的帧剖析叠层(`src/frame_profiler.rs`)。
+# **默认关**,发布构建一行代码、一个依赖都不带。
+#
+# 透传到 `gpui/profiler`(gpui-pre 0.3.5 `Cargo.toml:67` 的非默认 feature):
+# 上游整套 `debug_overlay` 模块、`Window::set_debug_frame_overlay_mode`、
+# `App::foreground_journal` 与 `WindowInvalidator` 里那两个计数字段全由它挂着,
+# 不开就根本不编译;它唯一的新依赖是 `hdrhistogram`(上游拿它存帧耗时直方图)。
+#
+# ⚠️ feature 一开,gpui-pre 连同依赖它的 crate 会整棵重编(几分钟),且与默认
+# 构建**不共用** target 缓存 —— 来回切换会反复重编,量化诊断时一次编完再用。
+frame-profiler = ["gpui/profiler"]
+
 [dependencies]
 gpui.workspace = true
 gpui_platform.workspace = true

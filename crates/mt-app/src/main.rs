@@ -59,6 +59,11 @@ mod file_tree;
 mod file_viewer;
 mod first_run;
 mod focus_nav;
+// dev-only 度量工具(gpui-pre 内置帧剖析叠层)。默认不编译:整个模块连同
+// `open_window` 之后那唯一一处调用都挂在 `frame-profiler` feature 下,
+// 正式版零代码零依赖。用法见该模块的注释。
+#[cfg(feature = "frame-profiler")]
+mod frame_profiler;
 mod frost;
 mod fs_ops;
 mod git_changes;
@@ -2298,6 +2303,11 @@ fn main() {
         // GPUI 侧窗口一建出来元素树就已经构造完(`Workspace::new` 是同步的),
         // 差的只有 GPU 那一帧,于是收在这里。
         startup_trace::mark("setup exit (window opened)");
+
+        // 帧剖析叠层(度量工具)。挂在窗口建好之后:叠层状态住在 `Window` 上,
+        // 不是 App 级的。`MT_FRAME_OVERLAY` 没设时这一行什么都不做。
+        #[cfg(feature = "frame-profiler")]
+        frame_profiler::install(&window, cx);
 
         // 启动补 PTY,排在**首帧呈现之后**。
         //
