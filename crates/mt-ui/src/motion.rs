@@ -77,7 +77,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui::{AnyWindowHandle, App, EntityId, Window};
+use gpui::{AnyWindowHandle, App, EntityId, Subscription, Window, WindowVisibility};
 
 // ─── 闸 ──────────────────────────────────────────────────────
 
@@ -134,6 +134,16 @@ pub fn spin_period(base: Duration) -> Duration {
 //   登记就从泵上摘除,泵空转即停 —— 与 `mt-app::redraw::Pump` 同款
 //   「空跑一拍就收摊」,不留常驻定时器。
 //
+// **窗口不可见(最小化 / 显示器休眠)时这条泵整个停掉**,一帧都不画:
+// gpui 在 `WindowVisibility::Hidden` 下本来就不再向平台要帧,可 `cx.notify`
+// 会走 `WindowInvalidator::wake_platform` 把它硬叫醒(gpui-pre
+// `window.rs:229-237`,注释原文「so a frame request is delivered even if the
+// platform stops requesting frames for idle windows」),所以只能由泵自己认。登记过的 view **原样留着**,
+// 恢复可见时由每扇窗口自带的 `observe_window_visibility` 订阅
+// ([`PulseWindow::_visibility`])把它们叫醒一帧 —— 它们一渲染就重新调
+// [`pulse_phase`],泵随之起来。这一条与「失焦降频」是两档:失焦但看得见时
+// 画面还在人眼前,只降到 2fps,不停。
+//
 // 泵触发用的是 **`cx.notify(挂动画的 view)`** 而不是 `window.refresh()`:
 // refresh 会置 `refreshing` 位、绕过所有 view 级缓存做全量 CPU 重渲染
 // (实测同尺寸下单帧 CPU 是 notify 路的 ~4.6 倍);notify 只弄脏登记过的
@@ -174,6 +184,9 @@ struct PulseWindow {
     /// 自上次泵触发以来,窗口里登记过动画的 view(= [`pulse_phase`] 的调用方)。
     /// 触发即取走;一轮下来还是空的,说明动画都卸载了,该摘除这个窗口。
     views: Vec<EntityId>,
+    /// 可见性订阅。**一 drop 就退订**,所以必须存住;窗口被摘除时随之失效,
+    /// 下次有动画登记会连订阅一起重建。回调见 [`on_pulse_visibility`]。
+    _visibility: Subscription,
 }
 
 /// 一拍里对单个窗口的处置。纯判定,单测钉它。
@@ -183,11 +196,24 @@ enum PulseAction {
     Refresh,
     /// 后台窗口还没到它的拍:什么都不做,登记记录保留。
     Wait,
+    /// 窗口不可见:一帧都不画,登记原样留着,而且**不替这条泵续命** ——
+    /// 全部窗口都在睡就连定时器一起收摊,恢复由订阅叫醒。
+    Sleep,
     /// 到拍但上轮没人登记:动画已从树上消失,把窗口从泵上摘掉。
     Drop,
 }
 
-fn pulse_action(window_active: bool, inactive_due: bool, painted: bool) -> PulseAction {
+fn pulse_action(
+    window_visible: bool,
+    window_active: bool,
+    inactive_due: bool,
+    painted: bool,
+) -> PulseAction {
+    // 可见性先判:最小化的窗口连「该不该摘」都不该下结论 —— 它只是没人看,
+    // 不代表动画从树上消失了
+    if !window_visible {
+        return PulseAction::Sleep;
+    }
     if !(window_active || inactive_due) {
         return PulseAction::Wait;
     }
@@ -195,6 +221,27 @@ fn pulse_action(window_active: bool, inactive_due: bool, painted: bool) -> Pulse
         PulseAction::Refresh
     } else {
         PulseAction::Drop
+    }
+}
+
+/// 窗口可见性变了。恢复可见时把登记过的 view 叫醒一帧 —— 它们一渲染就会重新调
+/// [`pulse_phase`],泵随之起来;变不可见时什么都不做,在跑的那条泵下一拍自停。
+fn on_pulse_visibility(visibility: WindowVisibility, window: &mut Window, cx: &mut App) {
+    if !visibility.is_visible() {
+        return;
+    }
+    let id = window.window_handle().window_id();
+    let views = PULSE.with(|pump| {
+        pump.borrow_mut()
+            .windows
+            .iter_mut()
+            .find(|w| w.handle.window_id() == id)
+            .map(|w| std::mem::take(&mut w.views))
+            .unwrap_or_default()
+    });
+    // 与 `PulseAction::Refresh` 同款语义:取走即开始新一轮观察
+    for view in views {
+        cx.notify(view);
     }
 }
 
@@ -220,23 +267,31 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
     };
     let handle = window.window_handle();
     let view = window.current_view();
+    let visible = window.is_visible();
+    let id = handle.window_id();
+    // 订阅要在借出 PULSE 之前建好:`observe_window_visibility` 只登记不回调,
+    // 但把它塞进 borrow_mut 的作用域里徒增一层嵌套借用的风险
+    let fresh = PULSE.with(|pump| !pump.borrow().windows.iter().any(|w| w.handle.window_id() == id))
+        .then(|| window.observe_window_visibility(on_pulse_visibility));
     let start_pump = PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
-        let id = handle.window_id();
-        let entry = match pump.windows.iter_mut().find(|w| w.handle.window_id() == id) {
-            Some(w) => w,
-            None => {
-                pump.windows.push(PulseWindow {
-                    handle,
-                    views: Vec::new(),
-                });
-                pump.windows.last_mut().expect("刚 push 进去的")
-            }
-        };
+        if let Some(visibility) = fresh {
+            pump.windows.push(PulseWindow {
+                handle,
+                views: Vec::new(),
+                _visibility: visibility,
+            });
+        }
+        let entry = pump
+            .windows
+            .iter_mut()
+            .find(|w| w.handle.window_id() == id)
+            .expect("上面要么找到了要么刚 push 进去");
         if !entry.views.contains(&view) {
             entry.views.push(view);
         }
-        !std::mem::replace(&mut pump.running, true)
+        // 不可见时**不起泵**:登记留着,恢复可见由订阅叫醒
+        visible && !std::mem::replace(&mut pump.running, true)
     });
     if start_pump {
         // gpui-pre 的 `AsyncApp::update` 不再会失败:App 退出时这个任务连同
@@ -256,6 +311,10 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
 
 /// 泵的一拍:按处置口径刷新/摘除各窗口。返回**是否该停泵**(停时已自收
 /// `running`)。
+///
+/// 停泵有两条路:窗口全摘光(动画都卸载了),或**所有窗口都不可见**
+/// ([`PulseAction::Sleep`])—— 后者是「最小化就一帧不画」那条,
+/// 连定时器都不留,恢复由 [`on_pulse_visibility`] 接手。
 fn pulse_tick(cx: &mut App) -> bool {
     let (tick, entries) = PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
@@ -269,13 +328,21 @@ fn pulse_tick(cx: &mut App) -> bool {
     });
     let inactive_due = tick % PULSE_INACTIVE_EVERY == 0;
 
+    // 有没有窗口还醒着。全睡了就没必要再留一条定时器空转
+    let mut any_awake = false;
     for (handle, painted) in entries {
         // 窗口已关按 Drop 处理 —— 弱引用失效是正常生命周期
         let action = handle
             .update(cx, |_, window, _| {
-                pulse_action(window.is_window_active(), inactive_due, painted)
+                pulse_action(
+                    window.is_visible(),
+                    window.is_window_active(),
+                    inactive_due,
+                    painted,
+                )
             })
             .unwrap_or(PulseAction::Drop);
+        any_awake |= action != PulseAction::Sleep;
         let views = PULSE.with(|pump| {
             let mut pump = pump.borrow_mut();
             let id = handle.window_id();
@@ -286,7 +353,8 @@ fn pulse_tick(cx: &mut App) -> bool {
                     .find(|w| w.handle.window_id() == id)
                     .map(|w| std::mem::take(&mut w.views))
                     .unwrap_or_default(),
-                PulseAction::Wait => Vec::new(),
+                // Sleep 与 Wait 一样什么都不动 —— 区别只在它不给泵续命
+                PulseAction::Wait | PulseAction::Sleep => Vec::new(),
                 PulseAction::Drop => {
                     pump.windows.retain(|w| w.handle.window_id() != id);
                     Vec::new()
@@ -301,7 +369,7 @@ fn pulse_tick(cx: &mut App) -> bool {
 
     PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
-        if pump.windows.is_empty() {
+        if pump.windows.is_empty() || !any_awake {
             pump.running = false;
             true
         } else {
@@ -769,15 +837,32 @@ mod tests {
     #[test]
     fn 保底泵一拍的处置口径() {
         // 前台:每拍都到,登记过就刷、没登记就摘
-        assert_eq!(pulse_action(true, false, true), PulseAction::Refresh);
-        assert_eq!(pulse_action(true, false, false), PulseAction::Drop);
+        assert_eq!(pulse_action(true, true, false, true), PulseAction::Refresh);
+        assert_eq!(pulse_action(true, true, false, false), PulseAction::Drop);
         // 后台没到拍:一律等,**不许**因 painted=false 提前摘 ——
         // 它的观察窗口以「刷新」为界,还没刷过下一次就没资格下结论
-        assert_eq!(pulse_action(false, false, true), PulseAction::Wait);
-        assert_eq!(pulse_action(false, false, false), PulseAction::Wait);
+        assert_eq!(pulse_action(true, false, false, true), PulseAction::Wait);
+        assert_eq!(pulse_action(true, false, false, false), PulseAction::Wait);
         // 后台到拍:与前台同口径
-        assert_eq!(pulse_action(false, true, true), PulseAction::Refresh);
-        assert_eq!(pulse_action(false, true, false), PulseAction::Drop);
+        assert_eq!(pulse_action(true, false, true, true), PulseAction::Refresh);
+        assert_eq!(pulse_action(true, false, true, false), PulseAction::Drop);
+    }
+
+    #[test]
+    fn 不可见的窗口一帧都不画也不被摘() {
+        // 最小化压倒其余三个判据:既不刷(没人看)也不摘(动画并没从树上消失)
+        for (active, due, painted) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                pulse_action(false, active, due, painted),
+                PulseAction::Sleep,
+                "active={active} due={due} painted={painted}"
+            );
+        }
     }
 
     #[test]
