@@ -443,7 +443,7 @@ pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 //
 // **```mermaid 围栏是第三种自绘块**(issue #80):TextView 只会把它当代码块
 // 画出源文本。这里把顶层的 mermaid 围栏拆出来,交给 [`MermaidAsset`] 在后台
-// 线程渲染成位图(Mermaid 文本 → SVG → resvg 栅格化),画法与本地图片同一套框;
+// 线程渲染成位图(Mermaid 文本 → SVG → gpui 的 `SvgRenderer`),画法与本地图片同一套框;
 // 渲染失败时退回代码块 + 一行原因,见 [`FileViewer::render_md_mermaid`]。
 
 /// GFM 表格的列对齐(分隔行的 `:---:` 语法)。
@@ -2141,11 +2141,17 @@ const MARKDOWN_CONTENT_MAX_WIDTH: f32 = 860.0;
 /// 图片该占多宽(逻辑像素):原尺寸与可用宽取小 —— 小图保持原大(原版
 /// `max-width:100%` 也不放大),大图压到可用宽。
 ///
-/// `size()` 给的是**设备像素**。svg 那条路 gpui 按 `SMOOTH_SVG_SCALE_FACTOR`
-/// 放大后光栅化(`elements/img.rs:696-706`),换算回逻辑像素要除回去 —— 那个常量
-/// 没从 gpui 导出(私有 mod + `use`,不是 `pub use`),只能照抄它的值 2.0。
+/// `size()` 给的是**设备像素**。svg 那条路(本地/远程 svg 与 mermaid 图表都算)
+/// 由 `SvgRenderer` 按 [`gpui::SMOOTH_SVG_SCALE_FACTOR`] 放大后光栅化,换算回逻辑
+/// 像素要除回去。位图自己记着的倍率(`RenderImage::scale_factor`)是 `pub(crate)`
+/// 的,外面读不到,只能读同样由 gpui 公开的那个常量 —— 至少上游调它的时候这里
+/// 跟着变,不再是写死的 2.0。
 fn image_display_width(data: &gpui::RenderImage, is_svg: bool, avail_w: f32) -> f32 {
-    let scale = if is_svg { 2.0 } else { 1.0 };
+    let scale = if is_svg {
+        gpui::SMOOTH_SVG_SCALE_FACTOR
+    } else {
+        1.0
+    };
     (data.size(0).width.0 as f32 / scale).clamp(1.0, avail_w.max(1.0))
 }
 
@@ -2246,13 +2252,13 @@ impl std::fmt::Display for MermaidError {
 /// (`ImageAssetLoader`)同一机制,预览里的图表因此也是「先占位、好了换图」。
 ///
 /// 两步:`mermaid-rs-renderer` 把图表文本排成 SVG(纯 Rust,用系统字体量字宽),
-/// 再用 resvg 栅格化([`rasterize_svg`],同样是系统字体,中文标签落到微软雅黑
-/// 之类)。栅格倍率照抄 gpui 给 svg 图片的 `SMOOTH_SVG_SCALE_FACTOR`
-/// (见 [`MERMAID_RASTER_SCALE`]),150% / 200% 缩放下不糊;像素格式按
-/// `elements/img.rs` 的 svg 分支处理(去预乘 + RGBA→BGRA)。
+/// 再交给 **gpui 自带的 [`gpui::SvgRenderer`]** 栅格化(`render_single_frame`)
+/// —— 2× 栅格(`SMOOTH_SVG_SCALE_FACTOR`,150% / 200% 缩放下不糊)、去预乘 +
+/// RGBA→BGRA、回填 `scale_factor` 全在它里面,与 gpui 画本地 svg 图片是同一条路。
+/// 它的字体库也比自己搭的一份全:系统字体 + 打包字体 + `system-ui` 这类 CSS
+/// 关键字回退 + **emoji 回退**(标签里的 emoji 不再丢字)。
 /// **不能**走 `Image::from_bytes(ImageFormat::Svg)`:那条路 1× 栅格化且漏了
-/// 通道交换(见 [`FileViewer::render_image`] 的注释);也用不了 gpui 自己的
-/// `SvgRenderer` —— 它和 `SvgSize` 都是 crate 根私有 `use` 的项,外面命名不了。
+/// 通道交换(见 [`FileViewer::render_image`] 的注释)。
 enum MermaidAsset {}
 
 impl gpui::Asset for MermaidAsset {
@@ -2260,83 +2266,40 @@ impl gpui::Asset for MermaidAsset {
     type Output = Result<Arc<gpui::RenderImage>, MermaidError>;
 
     // 不能写成 `async fn`:trait 要求返回的 future 是 `'static`,而 `async fn`
-    // 会把 `_cx` 的借用捕获进 future 里,过不了 'static 检查
+    // 会把 `cx` 的借用捕获进 future 里,过不了 'static 检查。
+    //
+    // 栅格器**在这里**取(`App::svg_renderer` 返回的是 clone,内部两个 Arc:
+    // `dyn AssetSource`(`Send + Sync`)与 `usvg::Options<'static>`(两个解析
+    // 闭包都是 `Send + Sync`)),因此满足 future 的 `Send + 'static`;上游自己
+    // 的 `ImageAssetLoader::load`(`elements/img.rs:630`)就是这么写的。
+    // 拿的是同一份 `Options`,那份懒建的字体库因此与画图标共用,不再各付一次
+    // 加载系统字体的几十到几百毫秒。
     #[allow(clippy::manual_async_fn)]
     fn load(
         source: Self::Source,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
-        async move { render_mermaid_image(&source) }
+        let renderer = cx.svg_renderer();
+        async move { render_mermaid_image(&source, &renderer) }
     }
 }
-
-/// 与 gpui 私有常量 `SMOOTH_SVG_SCALE_FACTOR` 同值。位图尺寸是逻辑尺寸的这么
-/// 多倍,画的时候 [`image_display_width`] 按 `is_svg = true` 除回去。
-const MERMAID_RASTER_SCALE: f32 = 2.0;
 
 /// 排版出来的画布不超过这个尺寸就当空图:解析器对不少残缺写法(括号没闭合、
 /// 箭头写错)**不报错**,只排出一张 2×边距(8px)的空白画布 —— 这种要按失败
 /// 处理,退回代码块让用户看得见原文,而不是一块什么都没有的空白。
 const MERMAID_EMPTY_CANVAS: f32 = 16.0;
 
-fn render_mermaid_image(key: &MermaidKey) -> Result<Arc<gpui::RenderImage>, MermaidError> {
+fn render_mermaid_image(
+    key: &MermaidKey,
+    renderer: &gpui::SvgRenderer,
+) -> Result<Arc<gpui::RenderImage>, MermaidError> {
     let svg = render_mermaid_svg(key)?;
-    let pixmap = rasterize_svg(svg.as_bytes(), MERMAID_RASTER_SCALE)
-        .map_err(|err| MermaidError(err.to_string().into()))?;
-    let (width, height) = (pixmap.width(), pixmap.height());
-    let mut bytes = pixmap.take();
-    // 像素宽度是常量,按 clippy 1.98 的 `chunks_exact_to_as_chunks` 用定长切片
-    for pixel in bytes.as_chunks_mut::<4>().0 {
-        unpremultiply_rgba_to_bgra(pixel);
-    }
-    let buffer = image::RgbaImage::from_raw(width, height, bytes)
-        .ok_or_else(|| MermaidError("pixmap size mismatch".into()))?;
-    Ok(Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-        buffer,
-    )])))
-}
-
-/// SVG 字节 → 预乘 RGBA 位图,尺寸 = SVG 标称尺寸 × `scale`。照抄 gpui
-/// `svg_renderer.rs::render_pixmap` 的做法;字体库是进程级一份、首次用到时
-/// 加载系统字体(几十到几百毫秒,只付一次,而且在后台线程)。
-fn rasterize_svg(bytes: &[u8], scale: f32) -> Result<resvg::tiny_skia::Pixmap, resvg::usvg::Error> {
-    use resvg::usvg;
-    static FONT_DB: std::sync::LazyLock<Arc<usvg::fontdb::Database>> =
-        std::sync::LazyLock::new(|| {
-            let mut db = usvg::fontdb::Database::new();
-            db.load_system_fonts();
-            Arc::new(db)
-        });
-    let options = usvg::Options {
-        fontdb: FONT_DB.clone(),
-        ..Default::default()
-    };
-    let tree = usvg::Tree::from_data(bytes, &options)?;
-    let size = tree.size();
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(
-        (size.width() * scale) as u32,
-        (size.height() * scale) as u32,
-    )
-    .ok_or(usvg::Error::InvalidSize)?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-    Ok(pixmap)
-}
-
-/// tiny-skia 吐出的是**预乘** RGBA,`RenderImage` 的帧要**直通** BGRA
-/// (`assets.rs` 文档明示)。逐像素照抄 gpui `color.rs` 的 `swap_rgba_pa_to_bgra`
-/// (那个函数是 `pub(crate)`,拿不到)。
-fn unpremultiply_rgba_to_bgra(pixel: &mut [u8]) {
-    pixel.swap(0, 2);
-    if pixel[3] > 0 {
-        let alpha = pixel[3] as f32 / 255.0;
-        for channel in &mut pixel[..3] {
-            *channel = (*channel as f32 / alpha) as u8;
-        }
-    }
+    // 倍率传 1.0:`render_parsed` 自己再乘一道 `SMOOTH_SVG_SCALE_FACTOR`,
+    // 位图尺寸因此与本地 svg 图片那条路一致,[`image_display_width`] 按同一个
+    // 常量除回去。
+    renderer
+        .render_single_frame(svg.as_bytes(), 1.0)
+        .map_err(|err| MermaidError(err.to_string().into()))
 }
 
 /// Mermaid 文本 → SVG 字符串。走三段式管线而不是一把梭的 `render`,是为了

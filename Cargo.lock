@@ -4810,7 +4810,6 @@ dependencies = [
  "parking_lot",
  "qrcode",
  "raw-window-handle",
- "resvg 0.46.0",
  "ropey",
  "serde",
  "serde_json",
