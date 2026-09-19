@@ -10,3 +10,5 @@ alacritty_terminal.workspace = true
 mt-pty.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true

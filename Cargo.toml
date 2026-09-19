@@ -61,6 +61,12 @@ gpui-kit-assets = "0.6.2"
 # 4MB-1MB 双水位背压 / set_pty_flow_paused / 30s 超时兜底整套随之作废。
 alacritty_terminal = "0.26"
 portable-pty = "0.8"
+# 列宽判定。alacritty_terminal 自己就靠它(逐字符定宽),mt-terminal 用同一份表算
+# emoji 字位簇的**整簇**宽度(`mt-terminal::width`),版本跟它对齐。
+unicode-width = "0.2"
+# 字位簇边界(UAX #29):emoji 呈现 / 修饰 / ZWJ 序列、区域指示符成对这些「几个字符
+# 落一格」的判定靠它。gpui 依赖树里本来就有,不多拉一棵。
+unicode-segmentation = "1"
 
 # ---------------------------------------------------------------------------
 # 通用

@@ -37,6 +37,10 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod width;
+
+use width::WidthOverride;
+
 /// 把 alacritty 整个重新导出。渲染层(`mt-ui`)要用 `Cell` / `Flags` / `Color` /
 /// `TermMode` / `Selection` 这些类型,统一从这里取,避免各 crate 各自写一份
 /// `alacritty_terminal` 依赖后版本漂移导致类型不互通。
@@ -100,7 +104,7 @@ impl EventListener for EventQueue {
 /// 「有界 channel + 双水位背压 + 前端水位回调」那整条链路。
 pub struct TerminalEmulator {
     term: Arc<Mutex<Term<EventQueue>>>,
-    parser: Mutex<Processor>,
+    parser: Mutex<Parser>,
     events: EventQueue,
     /// 当前的回滚行数。**自己记一份**:`Term` 的 `config` 字段是私有的、
     /// alacritty 也没给读回口,而 [`Self::set_scrollback`] 要靠它做「值没变就不动」
@@ -108,6 +112,21 @@ pub struct TerminalEmulator {
     scrollback: AtomicUsize,
     /// 光标绝对行的最低水位。`Some` = 追踪中,见 [`Self::arm_cursor_floor`]。
     cursor_floor: Mutex<Option<CursorFloor>>,
+}
+
+/// VT 解析器与它的随身暂存。
+struct Parser {
+    vte: Processor,
+    /// [`WidthOverride`] 拼簇文本用的暂存,跟解析器同锁、跨批次复用。
+    cluster: String,
+}
+
+impl Parser {
+    /// 把一批字节经 [`WidthOverride`] 推进 `term`。
+    fn advance(&mut self, term: &mut Term<EventQueue>, bytes: &[u8]) {
+        self.vte
+            .advance(&mut WidthOverride::new(term, &mut self.cluster), bytes);
+    }
 }
 
 /// 追踪中的光标水位。
@@ -153,7 +172,10 @@ impl TerminalEmulator {
         let term = Term::new(config, &size, events.clone());
         Self {
             term: Arc::new(Mutex::new(term)),
-            parser: Mutex::new(Processor::new()),
+            parser: Mutex::new(Parser {
+                vte: Processor::new(),
+                cluster: String::new(),
+            }),
             events,
             scrollback: AtomicUsize::new(scrollback),
             cursor_floor: Mutex::new(None),
@@ -186,22 +208,25 @@ impl TerminalEmulator {
     ///
     /// 追踪光标水位时**改成逐字节推进**(见 [`Self::arm_cursor_floor`]):要找的
     /// 那个位置只在整批数据的**中间态**里存在,喂完再读就已经被后续输出推走了。
+    ///
+    /// 字节不是直接喂 `Term`,中间隔着 [`WidthOverride`]:emoji 序列整簇落一格,
+    /// 理由与手法见 [`width`] 模块注释。
     pub fn advance(&self, bytes: &[u8]) {
         let mut term = self.term.lock();
         let mut parser = self.parser.lock();
         let mut floor = self.cursor_floor.lock();
         let Some(floor) = floor.as_mut().filter(|f| f.budget > 0) else {
-            parser.advance(&mut *term, bytes);
+            parser.advance(&mut term, bytes);
             return;
         };
         let (sampled, rest) = bytes.split_at(bytes.len().min(floor.budget));
         for byte in sampled {
-            parser.advance(&mut *term, std::slice::from_ref(byte));
+            parser.advance(&mut term, std::slice::from_ref(byte));
             floor.min = floor.min.min(cursor_row(&term));
         }
         floor.budget -= sampled.len();
         if !rest.is_empty() {
-            parser.advance(&mut *term, rest);
+            parser.advance(&mut term, rest);
         }
     }
 
