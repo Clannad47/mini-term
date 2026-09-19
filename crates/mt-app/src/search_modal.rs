@@ -38,7 +38,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use mt_project::search::{
     SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
 };
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::menu;
@@ -659,9 +659,7 @@ impl SearchModal {
                             .border_color(ui::border_default())
                             .hover(|el| el.text_color(ui::text_primary()))
                     })
-                    .tooltip(|window, cx| {
-                        Tooltip::new(t("search", "regexTitle")).build(window, cx)
-                    })
+                    .tip(t("search", "regexTitle"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.use_regex = !this.use_regex;
                         cx.notify();

@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::file_viewer::{DocumentSource, FileViewer};
 use crate::i18n::{t, tr};
@@ -971,9 +971,7 @@ impl Render for WorkbenchArea {
                                 .flex_none()
                                 .rounded_full()
                                 .bg(ui::accent())
-                                .tooltip(|window, cx| {
-                                    Tooltip::new(t("fileViewer", "unsaved")).build(window, cx)
-                                }),
+                                .tip(t("fileViewer", "unsaved")),
                         )
                     })
                     .child(

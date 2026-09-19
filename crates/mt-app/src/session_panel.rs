@@ -52,7 +52,7 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
 
@@ -1013,10 +1013,7 @@ impl SessionPanel {
                     .when(has_messages, |el| {
                         el.child(
                             ui::ghost_button("session-copy-all", t("sessionViewer", "copyAll"))
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(tr!("sessionViewer", "messageCount", count = total))
-                                        .build(window, cx)
-                                })
+                                .tip(tr!("sessionViewer", "messageCount", count = total))
                                 .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                                     let Some(preview) = this.preview.as_ref() else {
                                         return;
@@ -1208,7 +1205,7 @@ impl Render for SessionPanel {
                     .hover(|el| el.bg(ui::border_subtle()))
                     // 树模式整行可点(跳转 / 恢复),平铺不可点
                     .when(tree, |el| el.cursor_pointer())
-                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .tip(tip)
                     .when(tree, |el| {
                         el.on_click(cx.listener(move |this: &mut Self, _, window, cx| {
                             let task =
@@ -1348,10 +1345,7 @@ impl Render for SessionPanel {
                                         .id("session-wsl-spinner")
                                         .flex()
                                         .items_center()
-                                        .tooltip(|window, cx| {
-                                            Tooltip::new(t("sessionList", "wslLoading"))
-                                                .build(window, cx)
-                                        })
+                                        .tip(t("sessionList", "wslLoading"))
                                         .child(ui::spinner(px(12.0), ui::text_muted())),
                                 )
                             })
@@ -1362,10 +1356,7 @@ impl Render for SessionPanel {
                                         .id("session-remote-spinner")
                                         .flex()
                                         .items_center()
-                                        .tooltip(|window, cx| {
-                                            Tooltip::new(t("sessionList", "remoteLoading"))
-                                                .build(window, cx)
-                                        })
+                                        .tip(t("sessionList", "remoteLoading"))
                                         .child(ui::spinner(px(12.0), ui::text_muted())),
                                 )
                             }),
@@ -1387,13 +1378,10 @@ impl Render for SessionPanel {
                                         .text_color(ui::text_muted())
                                         .cursor_pointer()
                                         .hover(|el| el.text_color(ui::text_primary()))
-                                        .tooltip(move |window, cx| {
-                                            Tooltip::new(if tree {
-                                                t("sessionList", "viewFlat")
-                                            } else {
-                                                t("sessionList", "viewTree")
-                                            })
-                                            .build(window, cx)
+                                        .tip(if tree {
+                                            t("sessionList", "viewFlat")
+                                        } else {
+                                            t("sessionList", "viewTree")
                                         })
                                         .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                                             this.toggle_view(cx);
@@ -1409,9 +1397,7 @@ impl Render for SessionPanel {
                                     .text_color(ui::text_muted())
                                     .cursor_pointer()
                                     .hover(|el| el.text_color(ui::accent()))
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new(t("sessionList", "refresh")).build(window, cx)
-                                    })
+                                    .tip(t("sessionList", "refresh"))
                                     .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                                         this.refresh(true, cx);
                                     }))

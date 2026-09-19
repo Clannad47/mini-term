@@ -38,7 +38,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
 
 use crate::branch_family;
@@ -972,13 +972,14 @@ impl TerminalArea {
                         // (与文件树行 hover 同一档)
                         .hover(|el| el.bg(ui::bg_overlay()))
                         // 悬停看全文(含粘贴多行时的换行);挂着的再补一句为什么跳不了
-                        .tooltip({
-                            let full = SharedString::from(if pending {
-                                format!("{}\n\n{}", marker.line, t("markerList", "pendingAnchor"))
-                            } else {
-                                marker.line.clone()
-                            });
-                            move |window, cx| Tooltip::new(full.clone()).build(window, cx)
+                        .tip(if pending {
+                            SharedString::from(format!(
+                                "{}\n\n{}",
+                                marker.line,
+                                t("markerList", "pendingAnchor")
+                            ))
+                        } else {
+                            SharedString::from(marker.line.clone())
                         })
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             cx.stop_propagation();
@@ -1038,9 +1039,7 @@ impl TerminalArea {
                                     .rounded_full()
                                     .bg(ui::color_ai_working())
                                     // 原版是 aria-label,gpui 没有 aria,落成 tooltip
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(t("markerList", "inProgress")).build(window, cx)
-                                    }),
+                                    .tip(t("markerList", "inProgress")),
                             )
                         }),
                 );
@@ -1494,7 +1493,7 @@ impl TerminalArea {
                 .px(px(CTRL_CLUSTER_PAD))
                 .opacity(0.5)
                 .hover(|el| el.opacity(1.0))
-                .tooltip(|window, cx| Tooltip::new(t("paneGroup", "collapsedHint")).build(window, cx))
+                .tip(t("paneGroup", "collapsedHint"))
                 .child(VectorIcon::new(ICON_MAXIMIZE, px(CTRL_ICON)).ink(ui::text_muted())),
         )
         .into_any_element()
@@ -2032,16 +2031,13 @@ impl TerminalArea {
                 .cursor_pointer()
                 .text_color(ui::text_muted())
                 .hover(|el| el.text_color(ui::accent()).bg(ui::border_subtle()))
-                .tooltip(move |window, cx| {
-                    // `{mod}` 的插值不能走 `tr!`:那个宏的参数位是 `$name:ident`,
-                    // 而 `mod` 是 Rust 关键字塞不进去(`search_modal.rs:320` 同样的坑)
-                    Tooltip::new(mt_i18n::t_args(
-                        "paneGroup",
-                        "markerTooltip",
-                        &[("mod", mod_label())],
-                    ))
-                    .build(window, cx)
-                })
+                // `{mod}` 的插值不能走 `tr!`:那个宏的参数位是 `$name:ident`,
+                // 而 `mod` 是 Rust 关键字塞不进去(`search_modal.rs:320` 同样的坑)
+                .tip(mt_i18n::t_args(
+                    "paneGroup",
+                    "markerTooltip",
+                    &[("mod", mod_label())],
+                ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
                     this.toggle_marker_popover(&marker_pane_id, pty_id, window, cx);
@@ -2062,17 +2058,14 @@ impl TerminalArea {
                     ICON_MAXIMIZE
                 },
             )
-            .tooltip(move |window, cx| {
-                Tooltip::new(t(
-                    "paneGroup",
-                    if is_maximized {
-                        "restorePane"
-                    } else {
-                        "maximizePane"
-                    },
-                ))
-                .build(window, cx)
-            })
+            .tip(t(
+                "paneGroup",
+                if is_maximized {
+                    "restorePane"
+                } else {
+                    "maximizePane"
+                },
+            ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 cx.stop_propagation();
                 let (pid, anchor) = (pid_max.clone(), anchor_max.clone());

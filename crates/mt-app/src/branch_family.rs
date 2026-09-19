@@ -37,7 +37,7 @@ use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 use mt_ai::sessions::{AiSession, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon};
 
@@ -362,7 +362,7 @@ impl BranchFamilyPanel {
                         crate::menu::close(window, cx);
                     }))
             })
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tip(tip)
             // 连线前缀:**等宽字体 + 不换行 + 不截断**,`│├└` 才对得齐
             .when(!row.prefix.is_empty(), |el| {
                 el.child(

@@ -55,7 +55,7 @@ use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::DragFilePath;
 use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
@@ -1409,16 +1409,13 @@ impl Render for FileTree {
                         el.child(
                             // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
                             header_button("file-tree-search")
-                                .tooltip(|window, cx| {
-                                    // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
-                                    // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
-                                    Tooltip::new(mt_i18n::t_args(
-                                        "fileTree",
-                                        "header.searchTitle",
-                                        &[("mod", mod_label())],
-                                    ))
-                                    .build(window, cx)
-                                })
+                                // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
+                                // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
+                                .tip(mt_i18n::t_args(
+                                    "fileTree",
+                                    "header.searchTitle",
+                                    &[("mod", mod_label())],
+                                ))
                                 .on_click(move |_event, window, cx| {
                                     crate::search_modal::open(store_for_search.clone(), window, cx);
                                 })
@@ -1431,16 +1428,10 @@ impl Render for FileTree {
                         header_button("file-tree-refresh")
                             // 远程项目多一句:刷新会重读远程根 `.gitignore`
                             // (原版 `FileTree.tsx` 的 `remote.refreshTitle`)
-                            .tooltip({
-                                let remote = is_remote;
-                                move |window, cx| {
-                                    Tooltip::new(if remote {
-                                        t("fileTree", "remote.refreshTitle")
-                                    } else {
-                                        t("fileTree", "header.refresh")
-                                    })
-                                    .build(window, cx)
-                                }
+                            .tip(if is_remote {
+                                t("fileTree", "remote.refreshTitle")
+                            } else {
+                                t("fileTree", "header.refresh")
                             })
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.refresh_root(cx);
@@ -1453,9 +1444,7 @@ impl Render for FileTree {
                                 "file-tree-upload-file",
                                 header_capabilities.mutations_enabled,
                             )
-                            .tooltip(|window, cx| {
-                                Tooltip::new(t("fileTree", "menu.uploadFiles")).build(window, cx)
-                            })
+                            .tip(t("fileTree", "menu.uploadFiles"))
                             .when(header_capabilities.mutations_enabled, |el| {
                                 el.on_click(cx.listener(|this, _event, window, cx| {
                                     let Some(context) = this.operation_context(cx) else {
@@ -1491,9 +1480,7 @@ impl Render for FileTree {
                                 "file-tree-upload-folder",
                                 header_capabilities.mutations_enabled,
                             )
-                            .tooltip(|window, cx| {
-                                Tooltip::new(t("fileTree", "menu.uploadFolder")).build(window, cx)
-                            })
+                            .tip(t("fileTree", "menu.uploadFolder"))
                             .when(header_capabilities.mutations_enabled, |el| {
                                 el.on_click(cx.listener(|this, _event, window, cx| {
                                     let Some(context) = this.operation_context(cx) else {
@@ -1527,9 +1514,7 @@ impl Render for FileTree {
                     })
                     .child(
                         header_action_button("file-tree-paste", header_capabilities.paste_enabled)
-                            .tooltip(|window, cx| {
-                                Tooltip::new(t("fileTree", "menu.paste")).build(window, cx)
-                            })
+                            .tip(t("fileTree", "menu.paste"))
                             .when(header_capabilities.paste_enabled, |el| {
                                 el.on_click(cx.listener(|this, _event, window, cx| {
                                     let Some(context) = this.operation_context(cx) else {
@@ -1561,9 +1546,7 @@ impl Render for FileTree {
                             "file-tree-new-file",
                             header_capabilities.mutations_enabled,
                         )
-                        .tooltip(|window, cx| {
-                            Tooltip::new(t("fileTree", "menu.newFile")).build(window, cx)
-                        })
+                        .tip(t("fileTree", "menu.newFile"))
                         .when(header_capabilities.mutations_enabled, |el| {
                             el.on_click(cx.listener(|this, _event, window, cx| {
                                 let Some(context) = this.operation_context(cx) else {
@@ -1598,9 +1581,7 @@ impl Render for FileTree {
                             "file-tree-new-folder",
                             header_capabilities.mutations_enabled,
                         )
-                        .tooltip(|window, cx| {
-                            Tooltip::new(t("fileTree", "menu.newFolder")).build(window, cx)
-                        })
+                        .tip(t("fileTree", "menu.newFolder"))
                         .when(header_capabilities.mutations_enabled, |el| {
                             el.on_click(cx.listener(|this, _event, window, cx| {
                                 let Some(context) = this.operation_context(cx) else {
@@ -1933,12 +1914,9 @@ impl FileTree {
                     .text_size(ui::font_px(9.75))
                     .text_color(ui::text_muted())
                     .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
-                    .tooltip({
+                    .tip({
                         let editor = current.clone();
-                        move |window, cx| {
-                            Tooltip::new(tr!("fileTree", "header.openWithEditor", editor = editor))
-                                .build(window, cx)
-                        }
+                        tr!("fileTree", "header.openWithEditor", editor = editor)
                     })
                     .on_click(open_default)
                     .child(current.clone()),
@@ -1960,9 +1938,7 @@ impl FileTree {
                     .cursor_pointer()
                     .text_color(ui::text_muted())
                     .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
-                    .tooltip(|window, cx| {
-                        Tooltip::new(t("fileTree", "menu.chooseOtherEditor")).build(window, cx)
-                    })
+                    .tip(t("fileTree", "menu.chooseOtherEditor"))
                     .on_mouse_down(
                         MouseButton::Left,
                         move |event: &MouseDownEvent, window, cx| {

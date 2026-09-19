@@ -61,7 +61,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, WindowControlArea, anchored, deferred, div, point,
     prelude::FluentBuilder, px, relative,
 };
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::rgb8;
 
@@ -544,7 +544,7 @@ impl TitleBar {
                     cx.notify();
                 }
             }))
-            .tooltip(move |window, cx| Tooltip::new(t("app", tip)).build(window, cx))
+            .tip(t("app", tip))
             .child(VectorIcon::new(shapes, px(10.0)).ink(ink))
     }
 
@@ -580,9 +580,7 @@ impl TitleBar {
             .text_color(ui::text_primary())
             .cursor_pointer()
             .hover(|el| el.border_color(ui::accent()).bg(ui::border_subtle()))
-            .tooltip(move |window, cx| {
-                Tooltip::new(t("app", "titleBar.projectSwitcher")).build(window, cx)
-            })
+            .tip(t("app", "titleBar.projectSwitcher"))
             .on_click(cx.listener(|this, _event, window, cx| {
                 if this.switcher_open {
                     this.dismiss_switcher(window, cx);

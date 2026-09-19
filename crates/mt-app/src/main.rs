@@ -133,7 +133,7 @@ use gpui::{
 use gpui::StyledImage as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::{Root, WindowExt as _};
-use mt_ui::tooltip::Tooltip;
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
@@ -1188,9 +1188,7 @@ impl Workspace {
                     .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(t("app", "activityBar.closeDrawer")).build(window, cx)
-                    })
+                    .tip(t("app", "activityBar.closeDrawer"))
                     .child("✕")
                     .on_click(cx.listener(|this, _event, _window, cx| this.set_drawer(None, cx))),
             )
