@@ -2,15 +2,16 @@
 //!
 //! # 为什么图标是自绘而不是 `gpui_component::IconName`
 //!
-//! `IconName` 只是一张「枚举 → `icons/xxx.svg` 路径」的映射表,**图形本体不在
-//! gpui-component 这个 crate 里** —— crates.io 上的 0.5.1 包里既没有 `assets/`
-//! 也没有任何 `AssetSource` 实现(上游仓库把 lucide 的 svg 放在示例程序的资产
-//! 目录里,由宿主自己注册)。mt-app 现在没有注册 asset source,直接用
-//! `IconName::Settings` 的结果是**一片空白**,而且这种失败在编译期看不出来。
+//! `IconName` 只是一张「枚举 → `icons/xxx.svg` 路径」的映射表,图形本体来自宿主
+//! 注册的 `AssetSource`。**2026-09-19 补记**:入口已挂 `gpui_kit_assets::Assets`
+//! (见 `main.rs` 的 `with_assets`),上游 `IconName` 现在画得出来 —— 原先那条
+//! 「0.5.1 不带 svg 资产、渲染成空白」的判据作废。
 //!
-//! 于是走 mt-ui 已经在用的那条路:[`mt_ui::icons::VectorIcon`] 的形状 DSL。
-//! 好处是几何直接照抄原版 SVG 的 `path`(下面每张表的注释里都留着原文),
-//! 与状态灯/品牌图标同一个渲染器,不必再引一套资产管线。
+//! 仍然自绘的理由是**字形**:这条边条的每枚图标都照抄原版(Tauri 版)
+//! `ActivityBar.tsx` 的 `path`(viewBox `0 0 16 16`、统一 `stroke-width="1.2"`,
+//! 下面每张表的注释里都留着原文),与 lucide 那 101 枚不是同一套字形;
+//! 走 [`mt_ui::icons::VectorIcon`] 的形状 DSL 还能与状态灯/品牌图标共用同一个
+//! 渲染器,几何是纯数据可单测。
 //!
 //! # 只画有落点的按钮
 //!

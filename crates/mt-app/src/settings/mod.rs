@@ -392,8 +392,10 @@ const HEADER_H: f32 = 52.0;
 ///
 /// **不用 `Dialog::title`**:设置面板要 `p_0()`(左右两列自己贴边铺满),而
 /// `Dialog` 的标题内边距跟着同一个 padding 走 —— 一 `p_0()` 标题就贴死在面板
-/// 左上角的圆角上,而且没有分隔线。它自带的 ✕ 画 `IconName::Close`
-/// (0.5.1 无 svg 资产 → 空白),同样只能自绘。
+/// 左上角的圆角上,而且没有分隔线。它自带的 ✕ 是绝对定位在面板右上角的,`p_0()`
+/// 之下落到 8,8、与这条自绘头部打架,同样只能自绘。(2026-09-19 补记:原先记的
+/// 是「它自带的 ✕ 画 `IconName::Close`,0.5.1 无 svg 资产 → 空白」——
+/// 入口已挂 `gpui_kit_assets::Assets`,该判据作废,版面这条不变。)
 fn render_dialog_header() -> impl IntoElement {
     div()
         .flex()
@@ -471,8 +473,9 @@ pub fn open_settings(
                 .p_0()
                 // 头部自绘(见 [`render_dialog_header`]):`p_0()` 之下 `Dialog`
                 // 自带的 title 内边距是 0,标题会贴死在面板左上角圆角上;
-                // 它自带的 ✕ 画的是 `IconName::Close`,0.5.1 无 svg 资产 →
-                // 渲染成空白,留着等于在右上角埋一个看不见的可点区
+                // 它自带的 ✕ 也绝对定位到 8,8,与自绘头部那颗重叠
+                // (2026-09-19 补记:入口已挂 `gpui_kit_assets::Assets`,原先记的
+                // 「0.5.1 无 svg 资产 → 空白,等于埋一个看不见的可点区」已作废)
                 .close_button(false)
                 // 改了半天设置、误点遮罩就没了 —— 面板里还有编辑中的表单
                 .overlay_closable(false)

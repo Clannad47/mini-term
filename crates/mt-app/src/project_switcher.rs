@@ -108,8 +108,10 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
             dialog
                 // 头/尾都是自己画的分隔线,交给 Dialog 加边距会把线切断
                 .p_0()
-                // `close_button` 画的是 `IconName::Close`,而 0.5.1 不带 svg 资产
-                // (渲染成空白,编译期无感);原版这个浮层也没有 ✕
+                // 原版这个浮层没有 ✕,所以关掉。(2026-09-19 补记:入口已挂
+                // `gpui_kit_assets::Assets`,原先记的「`IconName::Close` 没有
+                // svg 资产、渲染成空白」已作废 —— 它现在画得出来,更要关掉:
+                // `p_0()` 之下上游 ✕ 会贴到 8,8,压在自绘的头部上)
                 .close_button(false)
                 // 原版 `panelClassName="w-[460px] max-h-[60vh]"` + `align="top"`
                 // (`items-start pt-[10vh]`,正好是 Dialog 的默认 margin_top)

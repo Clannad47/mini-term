@@ -1010,8 +1010,12 @@ const SPINNER_ARC: &[Shape] = &[Shape::line(
     },
 )];
 
-/// 加载中的转圈。**自绘** —— gpui-component 的 `Spinner` 默认图标是
-/// `IconName::Loader`,而 0.5.1 不带 svg 资产,转的是个空框(见 `menu` 模块注释)。
+/// 加载中的转圈。**自绘** —— gpui-component 的 `Spinner` 走
+/// `with_animation(Animation::new(0.8s).repeat())`(0.6.2 `spinner.rs`),
+/// 那条路每帧请求重绘,正是下面这段要躲的坑;它也没有减弱动效那档豁免。
+/// (2026-09-19 补记:原先记的是「它默认图标 `IconName::Loader`,0.5.1 不带
+/// svg 资产,转的是个空框」—— 入口已挂 `gpui_kit_assets::Assets`,
+/// 该判据作废;动画口径这条才是决定性的。)
 ///
 /// 周期 1s 匀速(Tailwind `animate-spin` 的默认值),相位来自
 /// `mt_ui::motion::pulse_phase` 的低频泵 —— **不用** `with_animation(..repeat())`,
