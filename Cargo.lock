@@ -4840,6 +4840,7 @@ dependencies = [
  "tree-sitter-proto",
  "tree-sitter-swift",
  "tree-sitter-xml",
+ "unicode-segmentation",
  "uuid",
  "windows 0.61.3",
  "winresource",

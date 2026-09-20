@@ -208,19 +208,36 @@ impl AppStore {
         crate::ssh_conn::remote_connection(project, &self.config.ssh_connections).cloned()
     }
 
-    /// pane 显示名的统一口径:自定义名 > 远程连接名 > shell 名
-    /// (`remoteProject.ts::paneDisplayLabel`)。tab 栏与项目预览浮层共用,
-    /// 防两处口径漂移。
+    /// pane 显示名的两段口径:`(主段, 副段)`。tab 栏、项目预览浮层、右键菜单
+    /// 共用这一个出口,防各处漂移。
+    ///
+    /// - **主段** = 自定义名 > 远程连接名 > shell 名(`remoteProject.ts::paneDisplayLabel`,
+    ///   算法在 `pure::pane_primary_label_of`)。这是「这个 pane 是什么」的身份段,
+    ///   **永远不含**终端自报的标题 —— 改名弹窗的预填只该看它(拿拼好的一行去
+    ///   预填的话,用户一点「重命名」就会把 shell 自动灌的那半截目录当成自己的
+    ///   名字存下来);
+    /// - **副段** = shell 通过 OSC 0/2 报上来的窗口标题,`None` = 这个 pane 不显示副段。
+    ///   四道闸见 [`osc_subtitle`]:开关(`config.tabTitleFollowsShell`,缺省开)或
+    ///   tab 上正显示 AI 品牌图标(`pure::subtitle_enabled`)、有自定义名、标题为空、
+    ///   标题是 shell 自己的默认标题。
+    ///
+    /// 渲染层拿两段是为了**分别排版**(副段该更小更淡、该先被挤掉);
+    /// 只要一行文本的调用点走 [`Self::pane_display_label`]。
+    pub fn pane_title_parts(&self, project_id: &str, pane: &PaneState) -> (String, Option<String>) {
+        super::pure::pane_title_parts_of(
+            self.project(project_id),
+            &self.config.ssh_connections,
+            pane,
+            super::pure::subtitle_enabled(&self.config, pane),
+        )
+    }
+
+    /// [`Self::pane_title_parts`] 拼成一行:`主段` 或 `主段 · 副段`。
+    ///
+    /// 菜单项、拖影、预览浮层这些「只有一行文本可用」的地方走这条。
     pub fn pane_display_label(&self, project_id: &str, pane: &PaneState) -> String {
-        if let Some(title) = pane.custom_title.as_deref().filter(|t| !t.is_empty()) {
-            return title.to_string();
-        }
-        if let Some(project) = self.project(project_id)
-            && crate::ssh_conn::is_remote_project(project)
-        {
-            return crate::ssh_conn::remote_pane_label(project, &self.config.ssh_connections);
-        }
-        pane.shell_name.clone()
+        let (primary, sub) = self.pane_title_parts(project_id, pane);
+        super::pure::join_title_parts(&primary, sub.as_deref())
     }
 
     /// 添加一个 SSH 远程项目并返回它的 id(`AddRemoteProjectModal.tsx::handleSave`

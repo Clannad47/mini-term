@@ -198,6 +198,12 @@ pub struct AppConfig {
     /// 终端区换场动画总开关（切 tab/切面板/最大化/拆分）。`None` = UI 层默认开启。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_animations: Option<bool>,
+    /// 页签标题是否跟随 shell 通过 OSC 0/2 设置的窗口标题（Windows Terminal 的做法）。
+    /// `None` = UI 层默认开启。开着时页签显示「主段 · 副段」，副段取终端自报的标题
+    /// （oh-my-posh 之类会把当前目录写进去，两个同名 pwsh 页签因此能分辨）；
+    /// 关掉只是不显示副段，标题本身照常收着，重新打开立刻就有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_title_follows_shell: Option<bool>,
     /// 启动恢复布局后是否自动续接上次的 AI 会话（往 pane 写 resume 命令）。
     /// `None` = UI 层默认开启（保持旧行为）。关掉只是不写命令，会话身份仍随布局
     /// 持久化，重新打开开关后下次启动照样能续上。
@@ -620,6 +626,7 @@ impl Default for AppConfig {
             tray_max_projects: None,
             tray_click_focus: None,
             terminal_animations: None,
+            tab_title_follows_shell: None,
             ai_auto_resume: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
@@ -1400,6 +1407,35 @@ mod tests {
         )
         .unwrap();
         assert!(!off.smart_copy_paste, "显式 false 不许被新默认盖掉");
+    }
+
+    /// 页签标题跟随 shell:纯增量字段 —— `None` 时不写进 JSON（不污染存量配置），
+    /// 显式 `false` 要能往返，键名是 camelCase 的 `tabTitleFollowsShell`。
+    #[test]
+    fn tab_title_follows_shell_是纯增量字段() {
+        let legacy = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": []
+        }"#;
+        let mut config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(
+            config.tab_title_follows_shell.is_none(),
+            "没这个键 = 没设过,由 UI 层按默认开启处理"
+        );
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("tabTitleFollowsShell"),
+            "没设过时不该污染持久化配置"
+        );
+        assert!(AppConfig::default().tab_title_follows_shell.is_none());
+
+        config.tab_title_follows_shell = Some(false);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""tabTitleFollowsShell":false"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tab_title_follows_shell, Some(false));
     }
 
     #[test]

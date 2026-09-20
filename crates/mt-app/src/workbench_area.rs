@@ -870,7 +870,8 @@ impl Render for WorkbenchArea {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .text_size(ui::font_px(12.0))
+            // 13 而不是 12:这是「页」的一层,要压得住下面那条终端 tab 栏
+            .text_size(ui::font_px(TAB_FONT))
             .when(terminal_active, |el| {
                 el.bg(ui::bg_terminal())
                     .text_color(ui::text_primary())
@@ -934,7 +935,7 @@ impl Render for WorkbenchArea {
                     .items_center()
                     .gap(px(6.0))
                     .cursor_pointer()
-                    .text_size(ui::font_px(12.0))
+                    .text_size(ui::font_px(TAB_FONT))
                     .when(selected, |el| {
                         // 与文档页容器同色:背景图皮肤下随内容区一起半透明,
                         // 不透明的 bg_base 会在半透明页签条上凸成一块实色
@@ -1033,7 +1034,7 @@ impl Render for WorkbenchArea {
             })
             .flatten();
         let tab_bar = div()
-            .h(px(34.0))
+            .h(px(TAB_BAR_H))
             .flex_none()
             .flex()
             .items_center()
@@ -1122,7 +1123,17 @@ impl Render for WorkbenchArea {
 /// 「页签横向溢出了没有」的判据阈值。取 0.5px 而不是 0：taffy 的宽度是浮点，
 /// 内容刚好填满时 `max_offset` 常残一丝亚像素，按 0 判会让滚动条无谓地闪出来。
 const SCROLLBAR_EPSILON: f32 = 0.5;
-/// 可见 thumb 的粗细。页签条统共 34px 高，再粗就压掉一层。
+
+/// 工作台页签条的高度 = 左栏「项目」标题行的高度(`ui::PANEL_HEADER_H`):
+/// 两者并排在同一水平线上,不一样高时底边线在分栏处会断成两截。
+///
+/// 这一层是「页」(终端页 / 各个文档页),它下面还叠着终端自己的叶子 tab 栏;
+/// 层级靠字号(13 对 12)与形态(顶线页签对圆角胶囊)拉开,不靠高度。
+const TAB_BAR_H: f32 = ui::PANEL_HEADER_H;
+/// 工作台页签的字号。比叶子 tab 栏的 12 大一档,理由同 [`TAB_BAR_H`]。
+const TAB_FONT: f32 = 13.0;
+
+/// 可见 thumb 的粗细。页签条统共 36px 高，再粗就压掉一层。
 const TAB_THUMB_HEIGHT: f32 = 4.0;
 /// thumb 的拖拽热区高度（外层透明壳）。4px 的可见条太难按中。
 const TAB_THUMB_HIT_HEIGHT: f32 = 10.0;

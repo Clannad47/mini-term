@@ -720,6 +720,8 @@ const USED_KEYS: &[&str] = &[
     "settings.terminal.newNamePlaceholder",
     "settings.terminal.scrollback",
     "settings.terminal.scrollbackDesc",
+    "settings.terminal.tabTitleFollowsShellDesc",
+    "settings.terminal.tabTitleFollowsShellTitle",
     "settings.themes.addPack",
     "settings.themes.applyFailed",
     "settings.themes.browseGallery",
