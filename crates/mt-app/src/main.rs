@@ -75,6 +75,7 @@ mod git_watch;
 mod git_worktree;
 mod hotkeys;
 mod i18n;
+mod image_lightbox;
 mod logfile;
 mod markers;
 mod menu;
@@ -1353,8 +1354,13 @@ impl Render for Workspace {
         // 会把弹窗自己抓进去。抓帧同步(PrintWindow 有窗口线程亲和性,也快),
         // 模糊丢后台 —— 同步跑 debug 构建的模糊会把弹窗首帧拖出「慢半拍」
         // (用户实测);玻璃晚一两帧淡入,压暗层与弹窗本体零延迟。
+        //
+        // 图片放大浮层(`image_lightbox`)由文档页签自己 `deferred` 画出来,根层
+        // 不持有它,只按 overlay 栈里有没有它来垫玻璃 —— 它打开的那次 notify 会把
+        // 祖先视图一路标脏,这里必定在同一帧里重跑,抓到的仍是没有浮层的上一帧。
         let dialog_open = window.has_active_dialog(cx);
-        let frost_wanted = dialog_open || self.usage_open;
+        let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
+        let frost_wanted = dialog_open || self.usage_open || lightbox_open;
         if frost_wanted {
             if self.frost.is_none() && self.frost_task.is_none() {
                 if let Some(raw) = frost::capture_raw(window) {

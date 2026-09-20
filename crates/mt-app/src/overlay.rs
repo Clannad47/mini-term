@@ -104,6 +104,9 @@ pub mod kind {
     /// 日期选择浮层(用量面板的自定义起止)。种类唯一 —— 起、止两个输入框各点一次
     /// 只该开一个:第二次点会顶掉第一个(宿主换掉实体,旧的 drop 时摘栈)。
     pub const DATE_PICKER: &str = "date-picker";
+    /// 图片放大浮层(Markdown 预览里点 Mermaid 图表打开)。种类唯一:整窗遮罩,
+    /// 同时只可能看一张。`main.rs` 也按它在不在栈里决定要不要垫毛玻璃快照。
+    pub const IMAGE_LIGHTBOX: &str = "image-lightbox";
 }
 
 /// 栈里的一条。

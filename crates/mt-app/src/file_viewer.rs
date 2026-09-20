@@ -80,6 +80,7 @@ use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
+use crate::image_lightbox::{ImageLightbox, ImageLightboxEvent};
 use crate::prompt::{Confirm, show_alert};
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 use crate::ui;
@@ -2147,12 +2148,24 @@ const MARKDOWN_CONTENT_MAX_WIDTH: f32 = 860.0;
 /// 的,外面读不到,只能读同样由 gpui 公开的那个常量 —— 至少上游调它的时候这里
 /// 跟着变,不再是写死的 2.0。
 fn image_display_width(data: &gpui::RenderImage, is_svg: bool, avail_w: f32) -> f32 {
+    image_natural_size(data, is_svg)
+        .width
+        .clamp(1.0, avail_w.max(1.0))
+}
+
+/// 图片的原始**逻辑**尺寸(svg 那条路已把栅格倍率除回去,口径同上)。放大浮层
+/// 按它算「适应窗口」与 100%。
+fn image_natural_size(data: &gpui::RenderImage, is_svg: bool) -> gpui::Size<f32> {
     let scale = if is_svg {
         gpui::SMOOTH_SVG_SCALE_FACTOR
     } else {
         1.0
     };
-    (data.size(0).width.0 as f32 / scale).clamp(1.0, avail_w.max(1.0))
+    let size = data.size(0);
+    gpui::size(
+        (size.width.0.max(1) as f32 / scale).max(1.0),
+        (size.height.0.max(1) as f32 / scale).max(1.0),
+    )
 }
 
 fn image_aspect_ratio(data: &gpui::RenderImage) -> f32 {
@@ -2402,6 +2415,10 @@ pub struct FileViewer {
     /// 已不在文档里的那些连缓存带纹理一起放掉([`Self::release_stale_mermaid`]),
     /// 页签关闭时全放(`on_release`)。`RefCell` 的理由同 [`Self::md_cache`]。
     mermaid_requested: RefCell<HashSet<MermaidKey>>,
+    /// 点开的 mermaid 图表放大浮层(见 [`crate::image_lightbox`])。整窗遮罩由
+    /// 它自己 `deferred` 画,这里只持有实体、在根上 `child` 出来;关闭 = 丢实体。
+    lightbox: Option<Entity<ImageLightbox>>,
+    _lightbox_sub: Option<Subscription>,
     /// html 预览的滚动位置。**必须住在实体上**:裸
     /// `overflow_y_scroll()` 的偏移存在按帧回收的 element state 里,切去终端页
     /// 的那几帧预览不渲染、状态被回收,切回来就跳回顶部。「预览 ↔ 源码」来回切
@@ -2496,6 +2513,8 @@ impl FileViewer {
             md_list_sync: std::cell::Cell::new((0, px(0.0))),
             approved_remote_images: HashSet::new(),
             mermaid_requested: RefCell::new(HashSet::new()),
+            lightbox: None,
+            _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
@@ -3928,15 +3947,30 @@ impl FileViewer {
                 }
             }
             Some(Ok(data)) => {
-                let mut frame = div();
+                // 点开在整窗浮层里看(滚轮缩放 / 拖动平移):大一点的架构图缩进
+                // 860px 的列里字全糊在一起,原地放大又会与文档滚动抢滚轮,
+                // 所以是弹窗(用户拍板)。浮层拿的是同一份位图,不重新渲染。
+                let natural = image_natural_size(&data, true);
+                let image = data.clone();
+                let lightbox_open = self.lightbox.is_some();
+                let mut frame = div().id(id);
                 frame.style().aspect_ratio = Some(image_aspect_ratio(&data));
                 frame
                     .w(px(image_display_width(&data, true, avail_w)))
                     .max_w_full()
                     .min_w_0()
+                    .cursor_pointer()
+                    // 浮层开着时把提示摘掉:gpui 的延时显示任务按元素**绝对边界**判
+                    // 悬停、不认遮挡(div.rs `handle_tooltip_mouse_move` 上方的 TODO),
+                    // 移上来就点的话提示会在浮层打开后才冒出来、盖在浮层上;元素这一帧
+                    // 没有 tooltip builder 时上游会把挂起的任务连同提示一起丢掉。
+                    .when(!lightbox_open, |el| el.tip(t("fileViewer", "lightboxOpen")))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_lightbox(image.clone(), natural, window, cx);
+                    }))
                     .child(
                         img(data.clone())
-                            .id(id)
                             .size_full()
                             .object_fit(gpui::ObjectFit::Contain),
                     )
@@ -3944,6 +3978,33 @@ impl FileViewer {
             }
             Some(Err(err)) => failure(id, &err),
         }
+    }
+
+    /// 打开图片放大浮层。先清后建:换浮层时旧实体必须先 drop 掉,否则 overlay 栈
+    /// 会错乱(理由见 `ImageLightbox::new` 的注释)。
+    fn open_lightbox(
+        &mut self,
+        image: Arc<gpui::RenderImage>,
+        natural: gpui::Size<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.lightbox = None;
+        self._lightbox_sub = None;
+        let lightbox = cx.new(|cx| ImageLightbox::new(image, natural, window, cx));
+        self._lightbox_sub = Some(cx.subscribe_in(
+            &lightbox,
+            window,
+            |this: &mut Self, _, event, _window, cx| {
+                let ImageLightboxEvent::Dismissed = event;
+                // 只丢实体、不动 `_lightbox_sub` —— 那是正在跑的这条订阅自己,
+                // 实体一没它也不会再触发,真正的清理在下一次 open_lightbox 开头
+                this.lightbox = None;
+                cx.notify();
+            },
+        ));
+        self.lightbox = Some(lightbox);
+        cx.notify();
     }
 
     /// 同一张图表另一套配色的渲染结果(还在缓存里的话)。只翻
@@ -4592,6 +4653,9 @@ impl Render for FileViewer {
                     .overflow_hidden()
                     .child(self.render_content(window, cx)),
             )
+            // 图片放大浮层:实体自己 `deferred` 到整窗之上,挂在哪一层都一样;
+            // 挂根上是为了不随预览列表的行一起被回收
+            .when_some(self.lightbox.clone(), |el, lightbox| el.child(lightbox))
     }
 }
 
