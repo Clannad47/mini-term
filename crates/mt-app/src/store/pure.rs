@@ -1379,7 +1379,10 @@ mod tests {
     /// 清洗:控制字符要在 trim 之前砍掉,收敛后为空归一成 `None`。
     #[test]
     fn osc_标题清洗去控制字符并归一空串() {
-        assert_eq!(sanitize_osc_title("  ~/repo/mini-term  ").as_deref(), Some("~/repo/mini-term"));
+        assert_eq!(
+            sanitize_osc_title("  ~/repo/mini-term  ").as_deref(),
+            Some("~/repo/mini-term")
+        );
         assert_eq!(
             sanitize_osc_title("\u{1b}\u{7} ~/repo \u{7}").as_deref(),
             Some("~/repo"),
@@ -1540,14 +1543,19 @@ mod tests {
         let mut pane = titled("pwsh", Some("✳ Claude Code"), None);
         assert!(subtitle_enabled(&config, &pane), "纯 shell 时照常显示");
         pane.status = PaneStatus::AiWorking;
-        assert!(!subtitle_enabled(&config, &pane), "品牌图标已经说明跑的是谁");
+        assert!(
+            !subtitle_enabled(&config, &pane),
+            "品牌图标已经说明跑的是谁"
+        );
         pane.status = PaneStatus::AiIdle;
         assert!(!subtitle_enabled(&config, &pane));
         pane.status = PaneStatus::Idle;
         assert!(subtitle_enabled(&config, &pane), "AI 退出后副段回来");
 
-        let mut off = mt_config::AppConfig::default();
-        off.tab_title_follows_shell = Some(false);
+        let off = mt_config::AppConfig {
+            tab_title_follows_shell: Some(false),
+            ..Default::default()
+        };
         assert!(!subtitle_enabled(&off, &pane), "开关关着一律没有");
     }
 

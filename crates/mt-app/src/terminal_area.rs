@@ -1500,8 +1500,7 @@ impl TerminalArea {
             let (pid_click, pane_click) = (pid.clone(), pane_id.clone());
             let (pid_key, pane_key) = (pid.clone(), pane_id.clone());
             // 右键菜单的「重命名」只预填主段(理由见展开态 tab 的同一处注释)
-            let (pid_menu, pane_menu, label_menu) =
-                (pid.clone(), pane_id.clone(), primary.clone());
+            let (pid_menu, pane_menu, label_menu) = (pid.clone(), pane_id.clone(), primary.clone());
             let pane_hover = pane_id.clone();
             let pane_rect = pane_id.clone();
             let this_rect = this_area.clone();
@@ -1576,15 +1575,20 @@ impl TerminalArea {
                         }),
                     )
                     // 折叠条底色是 bg_elevated(悬停 bg_overlay),挖空笔画取前者
-                    .child(tab_icon_slot(status, &shell_name, is_active, ui::bg_elevated()))
+                    .child(tab_icon_slot(
+                        status,
+                        &shell_name,
+                        is_active,
+                        ui::bg_elevated(),
+                    ))
                     .when_some(vendor, |el, vendor| {
-                        el.child(BrandIcon::new(Some(vendor)).size(px(12.0)).color(
-                            if is_active {
-                                ui::text_primary()
-                            } else {
-                                ui::text_muted()
-                            },
-                        ))
+                        // VectorIcon 不继承 text_color,跟着 tab 的明暗自己喂
+                        let color = if is_active {
+                            ui::text_primary()
+                        } else {
+                            ui::text_muted()
+                        };
+                        el.child(BrandIcon::new(Some(vendor)).size(px(12.0)).color(color))
                     })
                     // 与展开态同一套两段式标题;折叠条上的 tab 没有 max_w,
                     // 副段再长也别把整条撑爆
@@ -1837,8 +1841,7 @@ impl TerminalArea {
             let pid_drag = project_id.to_string();
             // 与 `has_active_drag` 与门:拖拽被中断(松手在窗外)时 gpui 会清
             // active_drag 并重画,变淡自动撤销,不必到处补清理
-            let is_dragging_self =
-                dragging && self.pane_drag.as_deref() == Some(pane.id.as_str());
+            let is_dragging_self = dragging && self.pane_drag.as_deref() == Some(pane.id.as_str());
             // 悬停态本来就由下面那个 `on_hover` 维护着(它给缩略图预览用),
             // 这里直接读:chip 的悬停底色与「× 现不现身」都看它
             let is_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
