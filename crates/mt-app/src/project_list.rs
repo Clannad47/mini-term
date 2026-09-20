@@ -2233,7 +2233,9 @@ impl ProjectList {
             .items_center()
             .justify_between()
             .px(px(10.0))
-            .py(px(6.0))
+            // 高度与右侧工作台页签条对齐(见 `ui::PANEL_HEADER_H`),不靠内衬凑
+            .h(px(ui::PANEL_HEADER_H))
+            .flex_none()
             .border_b_1()
             .border_color(ui::border_subtle())
             // 标题栏空白右键 = 新建分组(原版 `ProjectList.tsx:1069-1074`)

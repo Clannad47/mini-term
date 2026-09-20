@@ -599,6 +599,10 @@ fn default_shell_title_core(title: &str, shell_name: &str) -> bool {
 /// 2. pane 有自定义名 —— 用户亲手命名了就尊重,不在后面缀一条自动来的;
 /// 3. 没收到过标题 / 收到的是空标题;
 /// 4. 标题是 shell 自己的默认标题([`is_default_shell_title`])。
+///
+/// 过了闸再剥一层壳:oh-my-posh 默认标题模板是 `{{ .Shell }} in {{ .Folder }}`,
+/// 报上来的是 `pwsh in mini-term`,而主段本来就写着 `pwsh`,原样缀上去就是
+/// 「pwsh · pwsh in mini-term」。前缀与 shell 名相同时剥掉,只留目录。
 pub fn osc_subtitle(pane: &PaneState, enabled: bool) -> Option<String> {
     if !enabled {
         return None;
@@ -610,7 +614,27 @@ pub fn osc_subtitle(pane: &PaneState, enabled: bool) -> Option<String> {
     if title.is_empty() || is_default_shell_title(title, &pane.shell_name) {
         return None;
     }
-    Some(title.to_string())
+    Some(strip_shell_in_prefix(title, &pane.shell_name).to_string())
+}
+
+/// 剥掉 oh-my-posh 默认模板的 `<shell> in ` 前缀(大小写不敏感,按字节比,
+/// 理由同 [`is_default_shell_title`] 里的 `Administrator: `)。剥完为空就不剥。
+fn strip_shell_in_prefix<'a>(title: &'a str, shell_name: &str) -> &'a str {
+    let shell = shell_name.trim();
+    if shell.is_empty() {
+        return title;
+    }
+    let prefix = format!("{shell} in ");
+    if title.len() > prefix.len()
+        && title.is_char_boundary(prefix.len())
+        && title[..prefix.len()].eq_ignore_ascii_case(&prefix)
+    {
+        let rest = title[prefix.len()..].trim();
+        if !rest.is_empty() {
+            return rest;
+        }
+    }
+    title
 }
 
 /// pane 显示名**主段**的判定本体:自定义名 > 远程连接名 > shell 名。
@@ -1492,6 +1516,35 @@ mod tests {
         assert_eq!(
             osc_subtitle(&titled("pwsh", Some("pwsh"), None), true),
             None
+        );
+    }
+
+    /// oh-my-posh 默认模板 `{{ .Shell }} in {{ .Folder }}`:前缀等于 shell 名时剥掉。
+    #[test]
+    fn 副段剥掉_shell_in_前缀() {
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("pwsh in mini-term"), None), true).as_deref(),
+            Some("mini-term")
+        );
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("PWSH in ~/repo"), None), true).as_deref(),
+            Some("~/repo"),
+            "大小写不敏感"
+        );
+        assert_eq!(
+            osc_subtitle(&titled("cmd", Some("pwsh in mini-term"), None), true).as_deref(),
+            Some("pwsh in mini-term"),
+            "前缀不是自己的 shell 名就不剥"
+        );
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("pwsh in "), None), true).as_deref(),
+            Some("pwsh in"),
+            "剥完为空就不剥(标题本身 trim 后是「pwsh in」)"
+        );
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("pwsh in 终端"), None), true).as_deref(),
+            Some("终端"),
+            "剩余部分是多字节也不会切到字符中间"
         );
     }
 

@@ -313,6 +313,11 @@ pub fn palette() -> Palette {
 /// 各处 `font_px(13.0)` 之类的字面量就是按这个基准写的。
 pub const BASE_UI_FONT_SIZE: f32 = 13.0;
 
+/// 顶部一排「栏头」的统一高度:左栏「项目」标题行与右侧工作台页签条并排在
+/// 同一水平线上,两者必须一样高,否则那条底边线在分栏处断成两截。
+/// 两处都按这个常量写死,不再各自由内衬 + 行高凑出来。
+pub const PANEL_HEADER_H: f32 = 30.0;
+
 /// 界面字号 / 字族快照。改它的唯一入口是 [`set_ui_font`]。
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiFont {
