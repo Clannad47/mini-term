@@ -38,7 +38,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
+use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, ShellIcon, ShellKind, VectorIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::branch_family;
@@ -346,7 +346,64 @@ fn marker_anchor_inset(has_maximize: bool) -> f32 {
 
 /// tab 栏高度 —— 折叠标题条与它等高(折叠条就是「只剩标题栏的那一格」,
 /// 高度对不上会让最大化前后的视线落点跳一下)。
-const TAB_BAR_H: f32 = 26.0;
+///
+/// 26 → 30:tab 改成胶囊形后要给上下各留一点呼吸位([`TAB_CHIP_H`] 22 +
+/// 上下各 4),不然胶囊顶着条的上下边缘、看不出是「浮在条上的一颗」。
+const TAB_BAR_H: f32 = 30.0;
+
+/// 叶子 tab 胶囊的高度。条高减去上下各 4px 的留白。
+const TAB_CHIP_H: f32 = 22.0;
+/// 胶囊圆角。
+const TAB_CHIP_ROUND: f32 = 6.0;
+/// 胶囊最窄 / 最宽。**不再 `justify_center` + `min_w(110)`** —— 那套让
+/// 「pwsh ×」缩在正中、两侧各留 30px 空白,× 也贴着文字而不靠边。
+const TAB_CHIP_MIN_W: f32 = 72.0;
+const TAB_CHIP_MAX_W: f32 = 200.0;
+/// tab 上的图标槽:状态灯与 shell 图标共用这一格,**尺寸固定**,
+/// 状态一变(idle ↔ ai-working)也不许让后面的标题横跳。
+const TAB_ICON_SLOT: f32 = 16.0;
+/// tab 标题副段的字号(主段小一档)。
+const TAB_SECONDARY_FONT: f32 = 11.0;
+
+/// tab 上的标题:主段 + 可选副段(`主段 · 副段`)。
+///
+/// 拆成一个独立的小助手,是为了给**并行开发中的「标题跟随 shell 的 OSC 标题」**
+/// 留接口:那一支会在 store 上提供 `pane_title_parts(project_id, pane) ->
+/// (String, Option<String>)`,合并时只要把这里的 `secondary` 从 `None` 换成
+/// 它的第二个返回值即可,tab 那一大坨渲染代码一行都不用动。
+///
+/// ⚠️ 外层容器是 `min_w(0) + flex_1 + overflow_hidden`,省略号由**内部两段各自**
+/// 的 `truncate()` 负责 —— `truncate()` 与 `line_clamp()` **不能混用**
+/// (见 `project_gpui_truncate_ellipsis` 的口径),这里一处都没有 clamp。
+fn tab_label(
+    primary: SharedString,
+    secondary: Option<SharedString>,
+    active: bool,
+) -> impl IntoElement {
+    div()
+        .min_w(px(0.0))
+        .flex_1()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(div().min_w(px(0.0)).truncate().child(primary))
+        .when_some(secondary, |el, secondary| {
+            el.child(
+                div()
+                    .min_w(px(0.0))
+                    .pl(px(4.0))
+                    .truncate()
+                    .text_size(ui::font_px(TAB_SECONDARY_FONT))
+                    // 激活 chip 上的副段略亮一点,未激活的再退半档 ——
+                    // 否则一条 tab 栏上同一批灰字分不出哪条在前台
+                    .text_color(ui::with_alpha(
+                        ui::text_muted(),
+                        if active { 1.0 } else { 0.75 },
+                    ))
+                    .child(format!("· {secondary}")),
+            )
+        })
+}
 
 /// 折叠标题条区最多吃掉终端区多高。叶子多到码不下时那一区自己滚,
 /// **绝不挤掉铺满的那一格** —— 最大化的本意就是给它腾地方。
@@ -1633,14 +1690,33 @@ impl TerminalArea {
         // 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y` 记到 x 上
         // (gpui-0.2.2 `elements/div.rs:2422-2428`,默认值见 `style.rs:741`)——
         // 与原版靠 WebView 免费拿到的那条行为等价。
+        //
+        // ⚠️ **这条不刷底色了**(原先是 `bg_elevated()`)。
+        //
+        // 它属于「终端页」,而上面那条工作台页签条里激活的「终端」页签用的是
+        // `bg_terminal` —— 两者同色才连成一片。此前用 elevated,于是从上往下是
+        // 「激活页签 → 更亮的一条带 → 终端内容」,页签与内容之间凭空多出一层,
+        // 「页签连着内容」的隐喻断在这儿。
+        //
+        // 要的颜色正是 `bg_terminal`,但**不能自己刷一遍**:TerminalArea 根容器
+        // 已经刷过一层(见 `render` 尾部那句),背景图主题下 bg_terminal 是半透明
+        // rgba,再刷就是透明度叠乘、这一条会比下面的终端内容暗一块。不刷即可
+        // 透出根容器那层,颜色分毫不差 —— 与 PaneGroup 根「一律不刷底色」同一条
+        // 口径(`styles.css:151` / `themePackManager.ts:294`,见下方 2540 行注释)。
+        // 与终端内容之间仍留 `border_b_1`,那是这一层唯一的分界线。
         let mut bar = div()
             .id(gpui::SharedString::from(format!("tabbar-{leaf_id}")))
             .flex()
             .items_center()
             .flex_none()
+            .gap(px(4.0))
+            // 只给左内衬:右边缘是 `render_leaf_controls` 那一格,它自带
+            // `px(CTRL_CLUSTER_PAD)`。这里再补一道右内衬会把控件簇整体左推,
+            // 而 marker 浮层的锚点([`MARKER_ANCHOR_INSET`])是按「簇紧贴叶子
+            // 右缘」算出来的常量,推一下就对不上了。
+            .pl(px(6.0))
             .h(px(TAB_BAR_H))
             .overflow_x_scroll()
-            .bg(ui::bg_elevated())
             .border_b_1()
             .border_color(ui::border_subtle())
             .text_size(ui::font_px(12.0));
@@ -1681,6 +1757,9 @@ impl TerminalArea {
             // active_drag 并重画,变淡自动撤销,不必到处补清理
             let is_dragging_self =
                 dragging && self.pane_drag.as_deref() == Some(pane.id.as_str());
+            // 悬停态本来就由下面那个 `on_hover` 维护着(它给缩略图预览用),
+            // 这里直接读:chip 的悬停底色与「× 现不现身」都看它
+            let is_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
             bar = bar.child(
                 div()
                     .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
@@ -1744,26 +1823,38 @@ impl TerminalArea {
                         .absolute()
                         .size_full()
                     })
+                    // ── 胶囊(chip)形态 ──────────────────────────────────
+                    //
+                    // **这一层不画 accent 顶线**:顶线是「哪一页在前台」的标识,
+                    // 归上面那条工作台页签条独占。两层各画一条橙线时两条线上下
+                    // 贴着、层级根本读不出来。这一层改用「底色 + 描边」的胶囊:
+                    // 激活 = elevated 底 + 描边 + 主文色;未激活 = 透明底 + 弱文色;
+                    // 悬停未激活 = 一层极淡的底(从前鼠标扫过 chip 毫无反馈,
+                    // 只有 500ms 后弹出的缩略图)。
+                    .h(px(TAB_CHIP_H))
+                    .flex_none()
                     .flex()
                     .items_center()
-                    .justify_center()
                     .gap(px(6.0))
-                    .px(px(10.0))
-                    .min_w(px(110.0))
+                    .px(px(8.0))
+                    .min_w(px(TAB_CHIP_MIN_W))
+                    .max_w(px(TAB_CHIP_MAX_W))
+                    .rounded(px(TAB_CHIP_ROUND))
                     .cursor_pointer()
+                    // 描边**三态都占位**,只换颜色:只给激活态加 border 会让未激活
+                    // 的 chip 内容区少 2px,切 tab 时整条 tab 栏横跳一下
+                    .border_1()
                     .when(is_active, |el| {
-                        el.bg(ui::bg_terminal())
+                        el.bg(ui::bg_elevated())
                             .text_color(ui::text_primary())
-                            .border_t_2()
-                            .border_color(ui::accent())
+                            .border_color(ui::border_default())
                     })
                     .when(!is_active, |el| {
-                        el.text_color(ui::text_muted()).border_t_2().border_color(
-                            gpui::Hsla {
-                                a: 0.0,
-                                ..ui::accent()
-                            },
-                        )
+                        el.text_color(ui::text_muted())
+                            .border_color(ui::with_alpha(ui::border_default(), 0.0))
+                            .when(is_hovered, |el| {
+                                el.bg(ui::with_alpha(ui::text_muted(), 0.12))
+                            })
                     })
                     // ── tab 拖起(v0.14.0):移动 / 合并 / 重排 ─────────────
                     //
@@ -1829,9 +1920,47 @@ impl TerminalArea {
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
+                    // ── 图标槽(16×16,固定)──────────────────────────
+                    //
+                    // 闲着的时候画 **shell 图标**,有状态的时候才让位给状态灯:
+                    // `idle` 那颗状态灯是个空心圈,一屏五个闲置终端就是五颗
+                    // 一模一样的 ○,占着位置不带任何信息。
+                    //
+                    // 两个分支都塞进同一个固定尺寸的盒子 —— 状态一变(idle ↔
+                    // ai-working)标题就跟着横跳一格是绝对不行的。
+                    //
                     // 动画 id 拿 pane id 拼(跨帧稳定、逐 tab 唯一);**不能用循环
                     // 下标** —— 删掉中间一个 tab 会让后面所有状态灯的动画进度跳一格
-                    .child(ui::status_dot(pane.status))
+                    .child(
+                        div()
+                            .w(px(TAB_ICON_SLOT))
+                            .h(px(TAB_ICON_SLOT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            // 未激活 chip 上的图标压暗一档,与弱化的标题同调
+                            .when(!is_active, |el| el.opacity(0.7))
+                            .child(if pane.status == PaneStatus::Idle {
+                                ShellIcon::new(ShellKind::from_shell_name(&pane.shell_name))
+                                    .size(px(14.0))
+                                    // 「未知」那枚跟随主题色;其余八家写死品牌色
+                                    .color(if is_active {
+                                        ui::text_primary()
+                                    } else {
+                                        ui::text_muted()
+                                    })
+                                    // fish 的眼睛是挖空语义,给它 chip 的底色
+                                    .contrast(if is_active {
+                                        ui::bg_elevated()
+                                    } else {
+                                        ui::bg_terminal()
+                                    })
+                                    .into_any_element()
+                            } else {
+                                ui::status_dot(pane.status).into_any_element()
+                            }),
+                    )
                     // AI 品牌图标(原版 `PaneGroup.tsx` 的 `aiActive && <BrandIcon/>`):
                     // 只在这个 pane 真有 AI 会话身份时出现,认不出厂商就不占位
                     .when_some(vendor, |el, vendor| {
@@ -1846,13 +1975,15 @@ impl TerminalArea {
                                 }),
                         )
                     })
-                    .child(div().child(label_text.clone()))
+                    // TODO(tab-title): 副段由 store.pane_title_parts() 提供,合并时接上
+                    .child(tab_label(label_text.clone().into(), None, is_active))
                     // 未读完成标(窗口没聚焦时完成的任务)
                     .when(has_unread, |el| {
                         el.child(
                             div()
                                 .w(px(5.0))
                                 .h(px(5.0))
+                                .flex_none()
                                 .rounded_full()
                                 .bg(ui::color_success()),
                         )
@@ -1862,12 +1993,17 @@ impl TerminalArea {
                             .id(gpui::SharedString::from(format!("tab-close-{}", pane.id)))
                             .w(px(14.0))
                             .h(px(14.0))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(3.0))
                             .text_color(ui::text_muted())
                             .hover(|el| el.bg(ui::bg_overlay()).text_color(ui::color_error()))
+                            // × **始终占位**,只是平时透明:靠 `when` 把它整个摘掉
+                            // 的话,鼠标一进 chip 就多出 14+6px、标题当场被挤窄,
+                            // 长标题还会在悬停的一瞬间换一次省略位置
+                            .when(!is_active && !is_hovered, |el| el.opacity(0.0))
                             // tab 上的 × 与右键「关闭此终端」同一个入口:关之前
                             // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
                             .on_click(cx.listener(move |this, _event, window, cx| {
@@ -1891,12 +2027,21 @@ impl TerminalArea {
         bar = bar.child(
             div()
                 .id(gpui::SharedString::from(format!("tab-new-{leaf_id}")))
-                .px(px(8.0))
+                // 与 chip 同一套手感:方形圆角 + 悬停底色(原先只是一个裸「+」,
+                // 悬停只换文字色,按上去没有「这是一颗按钮」的实感)
+                .w(px(TAB_CHIP_H))
+                .h(px(TAB_CHIP_H))
+                .flex_none()
                 .flex()
                 .items_center()
+                .justify_center()
+                .rounded(px(TAB_CHIP_ROUND))
                 .cursor_pointer()
                 .text_color(ui::text_muted())
-                .hover(|el| el.text_color(ui::accent()))
+                .hover(|el| {
+                    el.bg(ui::with_alpha(ui::text_muted(), 0.12))
+                        .text_color(ui::accent())
+                })
                 // 左键单击**直接弹 shell 选择菜单**(不是长按、不是下拉箭头);
                 // 只有一个 shell 时不弹 —— 否则单 shell 用户每次多点一下
                 // (`PaneGroup.tsx:218-232` 那道 `<= 1` 的闸)
@@ -3418,7 +3563,7 @@ impl Render for TerminalArea {
                 };
                 entity.map(|entity| {
                     // 占位高度 = render_maximized 里折叠区的实际高度公式:
-                    // min(条数 × 26, 区上限);对不齐就是滑出途中一次 PTY reflow
+                    // min(条数 × TAB_BAR_H, 区上限);对不齐就是滑出途中一次 PTY reflow
                     let zone_h = (self.area_size.height * COLLAPSED_ZONE_MAX)
                         .max(px(TAB_BAR_H))
                         .min(px(bar_count as f32 * TAB_BAR_H));

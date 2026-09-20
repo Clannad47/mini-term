@@ -11,6 +11,7 @@
 //! ├── file      文件树图标的查表规则与 Element(fileIcon.ts / FileTree.tsx)
 //! ├── file_art  ↑ 用的 263 枚官方图形状表 —— **生成物**,见 tools/gen_file_icons.mjs
 //! ├── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
+//! ├── shell     shell 图标(pwsh/cmd/bash/…)—— idle 态的 tab 上顶替状态灯
 //! └── usage_glyphs  用量面板 KPI 六枚图标的形状表(KpiCards.tsx)
 //! ```
 //!
@@ -60,6 +61,7 @@
 pub mod brand;
 pub mod file;
 pub mod file_art;
+pub mod shell;
 pub mod status;
 pub mod svg_path;
 pub mod tech;
@@ -70,6 +72,7 @@ pub mod vector;
 pub use brand::{ALL_VENDORS, AiVendor, BrandIcon};
 pub use file::{FileIcon, art_of as file_art_of};
 pub use file_art::FileArt;
+pub use shell::{ALL_SHELL_KINDS, ShellIcon, ShellKind};
 pub use status::{ALL_STATUS_KINDS, SPIN_PERIOD, StatusDot, StatusKind};
 pub use tech::{ALL_TECH_CATEGORIES, TechCategory, TechIcon};
 pub use tech_art::{ALL_PROJECT_KINDS, ProjectKind};
@@ -83,6 +86,7 @@ pub(crate) fn all_shape_tables() -> Vec<&'static [Shape]> {
     out.extend(tech::shape_tables());
     out.extend(file::shape_tables());
     out.extend(status::shape_tables());
+    out.extend(shell::shape_tables());
     out.extend(usage_glyphs::shape_tables());
     out
 }
