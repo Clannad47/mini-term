@@ -217,8 +217,9 @@ impl AppStore {
     ///   预填的话,用户一点「重命名」就会把 shell 自动灌的那半截目录当成自己的
     ///   名字存下来);
     /// - **副段** = shell 通过 OSC 0/2 报上来的窗口标题,`None` = 这个 pane 不显示副段。
-    ///   四道闸见 [`osc_subtitle`]:开关(`config.tabTitleFollowsShell`,缺省开)、
-    ///   有自定义名、标题为空、标题是 shell 自己的默认标题。
+    ///   四道闸见 [`osc_subtitle`]:开关(`config.tabTitleFollowsShell`,缺省开)或
+    ///   tab 上正显示 AI 品牌图标(`pure::subtitle_enabled`)、有自定义名、标题为空、
+    ///   标题是 shell 自己的默认标题。
     ///
     /// 渲染层拿两段是为了**分别排版**(副段该更小更淡、该先被挤掉);
     /// 只要一行文本的调用点走 [`Self::pane_display_label`]。
@@ -227,8 +228,7 @@ impl AppStore {
             self.project(project_id),
             &self.config.ssh_connections,
             pane,
-            // 缺省开启(`config.tabTitleFollowsShell`)
-            self.config.tab_title_follows_shell.unwrap_or(true),
+            super::pure::subtitle_enabled(&self.config, pane),
         )
     }
 

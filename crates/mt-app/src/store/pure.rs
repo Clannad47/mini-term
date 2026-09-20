@@ -595,7 +595,8 @@ fn default_shell_title_core(title: &str, shell_name: &str) -> bool {
 /// 页签副段的口径。返回 `None` = 这个 pane 不显示副段。
 ///
 /// 四道闸(任一不过就没有副段):
-/// 1. 开关关着;
+/// 1. 开关关着 / 这个 pane 正显示 AI 会话身份(两者合在 `enabled` 里,见
+///    [`subtitle_enabled`]);
 /// 2. pane 有自定义名 —— 用户亲手命名了就尊重,不在后面缀一条自动来的;
 /// 3. 没收到过标题 / 收到的是空标题;
 /// 4. 标题是 shell 自己的默认标题([`is_default_shell_title`])。
@@ -615,6 +616,18 @@ pub fn osc_subtitle(pane: &PaneState, enabled: bool) -> Option<String> {
         return None;
     }
     Some(strip_shell_in_prefix(title, &pane.shell_name).to_string())
+}
+
+/// 这个 pane 现在该不该显示副段:开关开着,**且 tab 上没在显示 AI 会话身份**。
+///
+/// AI CLI 会把自己的名字写进窗口标题(Claude Code 是 `✳ Claude Code`),而 tab 上
+/// 已经挂着品牌图标了,再缀一段「· ✳ Claude Co…」只是把同一件事说第二遍,还把
+/// 胶囊撑到截断。会话身份的判据与品牌图标同一条([`PaneState::shows_ai_session`]),
+/// 图标一出现副段就收起,图标一撤副段再回来。
+pub fn subtitle_enabled(config: &mt_config::AppConfig, pane: &PaneState) -> bool {
+    // 两个开关都是缺省开启
+    config.tab_title_follows_shell.unwrap_or(true)
+        && !pane.shows_ai_session(config.ai_auto_resume.unwrap_or(true))
 }
 
 /// 剥掉 oh-my-posh 默认模板的 `<shell> in ` 前缀(大小写不敏感,按字节比,
@@ -1517,6 +1530,25 @@ mod tests {
             osc_subtitle(&titled("pwsh", Some("pwsh"), None), true),
             None
         );
+    }
+
+    /// tab 上挂着 AI 品牌图标时,标题里的「Claude Code」只是把同一件事说第二遍。
+    #[test]
+    fn ai_会话在场时不显示副段() {
+        use crate::tree::PaneStatus;
+        let config = mt_config::AppConfig::default();
+        let mut pane = titled("pwsh", Some("✳ Claude Code"), None);
+        assert!(subtitle_enabled(&config, &pane), "纯 shell 时照常显示");
+        pane.status = PaneStatus::AiWorking;
+        assert!(!subtitle_enabled(&config, &pane), "品牌图标已经说明跑的是谁");
+        pane.status = PaneStatus::AiIdle;
+        assert!(!subtitle_enabled(&config, &pane));
+        pane.status = PaneStatus::Idle;
+        assert!(subtitle_enabled(&config, &pane), "AI 退出后副段回来");
+
+        let mut off = mt_config::AppConfig::default();
+        off.tab_title_follows_shell = Some(false);
+        assert!(!subtitle_enabled(&off, &pane), "开关关着一律没有");
     }
 
     /// oh-my-posh 默认模板 `{{ .Shell }} in {{ .Folder }}`:前缀等于 shell 名时剥掉。
