@@ -9,10 +9,11 @@ use std::path::Path;
 
 use mt_config::ProjectConfig;
 use mt_ui::TerminalStyle;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::notify::PaneRef;
 use crate::session_panel::build_resume_command;
-use crate::tree::{AiSessionRef, PaneStatus, SplitNode};
+use crate::tree::{AiSessionRef, PaneState, PaneStatus, SplitNode};
 
 use super::ProjectState;
 
@@ -504,12 +505,162 @@ pub(super) fn remove_from_tree(tree: &mut Vec<mt_config::ProjectTreeItem>, proje
     });
 }
 
+// ─── 页签标题跟随 shell(OSC 0/2)的纯函数(可测) ──────────────
+
+/// OSC 标题的字符数上限。tab 栏是一行横排,副段过长会把同组其它 tab 挤出可视区;
+/// 比移动端改名那条(64)更紧 —— 那是用户手打的名字,这里是 shell 自动灌的
+/// 一整条目录路径,默认就很长。截断而不是丢弃。
+pub const MAX_OSC_TITLE_GRAPHEMES: usize = 48;
+
+/// 收敛 shell 报上来的窗口标题:砍控制字符 → 去首尾空白 → 按**字素**限长。
+///
+/// 三处细节:
+/// - 控制字符要在 trim **之前**砍:`\x1b` 之类不算 `char::is_whitespace`,
+///   先 trim 的话它们会把真正的空白挡在外面;
+/// - 按字素而不是 `char` 截断:emoji 与带修饰符的字(👩‍💻 / é 的组合形式)
+///   拆到一半会在 tab 上画出半个字形;
+/// - 收敛后为空(纯空白 / 纯控制字符)返回 `None`,与 `ResetTitle` 同归一档。
+pub fn sanitize_osc_title(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, g) in UnicodeSegmentation::graphemes(trimmed, true).enumerate() {
+        if i >= MAX_OSC_TITLE_GRAPHEMES {
+            break;
+        }
+        out.push_str(g);
+    }
+    Some(out)
+}
+
+/// 「这条标题就是 shell 自己的默认标题」——等于什么信息都没给,副段不该显示它。
+///
+/// 判据全部**大小写不敏感**,并且先把 `Administrator: ` 前缀剥掉再比一次
+/// (提权的 Windows 控制台会给标题加这个前缀)。逐条:
+///
+/// | 形态 | 例 |
+/// |------|-----|
+/// | 等于 pane 的 shell 名 | 页签本来就叫这个 |
+/// | `pwsh` | PowerShell 7 未配主题时的默认 |
+/// | 以 `PowerShell` 开头 | `PowerShell 7.5.3` |
+/// | `Windows PowerShell` | 内置 5.1 |
+/// | `Command Prompt` | 英文版 cmd |
+/// | 等于 / 以 `\cmd.exe` 结尾 | `C:\WINDOWS\system32\cmd.exe` |
+/// | `bash` / `zsh` / `fish` / `nu` | 类 Unix shell 的裸名 |
+pub fn is_default_shell_title(title: &str, shell_name: &str) -> bool {
+    let title = title.trim();
+    if title.is_empty() {
+        return true;
+    }
+    if default_shell_title_core(title, shell_name) {
+        return true;
+    }
+    // 提权控制台给标题加的 `Administrator: ` 前缀:剥掉再比一次。
+    // 前缀是纯 ASCII,所以按字节比 `eq_ignore_ascii_case` 就够,**不走
+    // `to_lowercase()` 再切片** —— 那个会改变字节长度(`İ` 变两个码点),
+    // 拿小写串的偏移去切原串会切到字符中间直接 panic。
+    const ADMIN_PREFIX: &str = "Administrator: ";
+    if title.len() > ADMIN_PREFIX.len()
+        && title.is_char_boundary(ADMIN_PREFIX.len())
+        && title[..ADMIN_PREFIX.len()].eq_ignore_ascii_case(ADMIN_PREFIX)
+    {
+        let rest = title[ADMIN_PREFIX.len()..].trim();
+        return rest.is_empty() || default_shell_title_core(rest, shell_name);
+    }
+    false
+}
+
+/// [`is_default_shell_title`] 的判据本体(不含 `Administrator: ` 剥壳那一层)。
+fn default_shell_title_core(title: &str, shell_name: &str) -> bool {
+    let lower = title.to_lowercase();
+    if !shell_name.trim().is_empty() && lower == shell_name.trim().to_lowercase() {
+        return true;
+    }
+    if lower.starts_with("powershell") {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "pwsh" | "windows powershell" | "command prompt" | "bash" | "zsh" | "fish" | "nu"
+    ) {
+        return true;
+    }
+    // cmd 把自己的标题设成完整路径:`C:\WINDOWS\system32\cmd.exe`
+    lower == "cmd.exe" || lower.ends_with("\\cmd.exe")
+}
+
+/// 页签副段的口径。返回 `None` = 这个 pane 不显示副段。
+///
+/// 四道闸(任一不过就没有副段):
+/// 1. 开关关着;
+/// 2. pane 有自定义名 —— 用户亲手命名了就尊重,不在后面缀一条自动来的;
+/// 3. 没收到过标题 / 收到的是空标题;
+/// 4. 标题是 shell 自己的默认标题([`is_default_shell_title`])。
+pub fn osc_subtitle(pane: &PaneState, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if pane.custom_title.as_deref().is_some_and(|t| !t.is_empty()) {
+        return None;
+    }
+    let title = pane.osc_title.as_deref()?.trim();
+    if title.is_empty() || is_default_shell_title(title, &pane.shell_name) {
+        return None;
+    }
+    Some(title.to_string())
+}
+
+/// pane 显示名**主段**的判定本体:自定义名 > 远程连接名 > shell 名。
+///
+/// 远程那一档要查连接表,所以两份数据由 store 传进来 —— 判定本身不碰 `self`,
+/// 于是三档都能直接单测(`AppStore` 要 gpui 的 `Context` 才造得出来)。
+/// `project` 为 `None`(项目已被删 / 调用方没有项目上下文)时退到 shell 名。
+pub fn pane_primary_label_of(
+    project: Option<&ProjectConfig>,
+    connections: &[mt_config::SshConnection],
+    pane: &PaneState,
+) -> String {
+    if let Some(title) = pane.custom_title.as_deref().filter(|t| !t.is_empty()) {
+        return title.to_string();
+    }
+    if let Some(project) = project.filter(|p| crate::ssh_conn::is_remote_project(p)) {
+        return crate::ssh_conn::remote_pane_label(project, connections);
+    }
+    pane.shell_name.clone()
+}
+
+/// [`AppStore::pane_title_parts`](crate::store::AppStore::pane_title_parts) 的
+/// 判定本体:主段见 [`pane_primary_label_of`],副段见 [`osc_subtitle`]。
+pub fn pane_title_parts_of(
+    project: Option<&ProjectConfig>,
+    connections: &[mt_config::SshConnection],
+    pane: &PaneState,
+    enabled: bool,
+) -> (String, Option<String>) {
+    (
+        pane_primary_label_of(project, connections, pane),
+        osc_subtitle(pane, enabled),
+    )
+}
+
+/// 把 [`AppStore::pane_title_parts`](crate::store::AppStore::pane_title_parts)
+/// 的两段拼成一行 —— `pane_display_label` 与移动端快照共用这一个拼法。
+pub fn join_title_parts(primary: &str, subtitle: Option<&str>) -> String {
+    match subtitle {
+        Some(sub) if !sub.is_empty() => format!("{primary} · {sub}"),
+        _ => primary.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 只有测试用得到的两个类型(`two_projects` 造布局用),不进模块顶部的
-    // `use`,免得非测试构建多两条无人使用的导入。
-    use crate::tree::{PaneState, ProjectPanel};
+    // 只有测试用得到的类型(`two_projects` 造布局用),不进模块顶部的
+    // `use`,免得非测试构建多一条无人使用的导入。
+    use crate::tree::ProjectPanel;
 
     fn project(id: &str, name: &str) -> ProjectConfig {
         ProjectConfig {
@@ -1184,5 +1335,257 @@ mod tests {
         );
         assert_eq!(next_maximized(Some("p1"), None), None, "显式还原");
         assert_eq!(next_maximized(None, None), None);
+    }
+
+    // ─── 页签标题跟随 shell(OSC 0/2) ───────────────────────────
+
+    /// 清洗:控制字符要在 trim 之前砍掉,收敛后为空归一成 `None`。
+    #[test]
+    fn osc_标题清洗去控制字符并归一空串() {
+        assert_eq!(sanitize_osc_title("  ~/repo/mini-term  ").as_deref(), Some("~/repo/mini-term"));
+        assert_eq!(
+            sanitize_osc_title("\u{1b}\u{7} ~/repo \u{7}").as_deref(),
+            Some("~/repo"),
+            "控制字符先砍再 trim —— 反过来的话 ESC/BEL 会把真空白挡在外面"
+        );
+        assert_eq!(sanitize_osc_title("").as_deref(), None);
+        assert_eq!(sanitize_osc_title("   \t  ").as_deref(), None);
+        assert_eq!(
+            sanitize_osc_title("\u{1b}\u{7}\u{0}").as_deref(),
+            None,
+            "纯控制字符与 ResetTitle 同归一档"
+        );
+        // 换行/制表符也是控制字符,不该在一行横排的 tab 上出现
+        assert_eq!(sanitize_osc_title("a\nb\tc").as_deref(), Some("abc"));
+    }
+
+    /// 截断按**字素**走:多字节字与 emoji 簇不许被切成半个字形。
+    #[test]
+    fn osc_标题按字素截断() {
+        let ascii = "x".repeat(100);
+        assert_eq!(
+            sanitize_osc_title(&ascii).unwrap().chars().count(),
+            MAX_OSC_TITLE_GRAPHEMES
+        );
+
+        // 多字节(每个汉字 3 字节):按字素算仍是 48 个
+        let cjk = "目".repeat(100);
+        let cut = sanitize_osc_title(&cjk).unwrap();
+        assert_eq!(cut.chars().count(), MAX_OSC_TITLE_GRAPHEMES);
+        assert_eq!(cut.len(), MAX_OSC_TITLE_GRAPHEMES * 3);
+
+        // 字素簇:ZWJ 家庭 emoji 与组合变音符各算**一个**,不许拆开
+        let cluster = "\u{1f469}\u{200d}\u{1f4bb}".repeat(60); // 👩‍💻
+        let cut = sanitize_osc_title(&cluster).unwrap();
+        assert_eq!(
+            UnicodeSegmentation::graphemes(cut.as_str(), true).count(),
+            MAX_OSC_TITLE_GRAPHEMES
+        );
+        assert!(
+            cut.ends_with('\u{1f4bb}'),
+            "末尾必须是完整的一簇,不能停在 ZWJ 上:{cut:?}"
+        );
+
+        let combining = "e\u{301}".repeat(60); // é 的组合形式
+        let cut = sanitize_osc_title(&combining).unwrap();
+        assert_eq!(
+            UnicodeSegmentation::graphemes(cut.as_str(), true).count(),
+            MAX_OSC_TITLE_GRAPHEMES
+        );
+        assert!(cut.ends_with('\u{301}'), "组合符不能与基字被切开:{cut:?}");
+
+        // 刚好 48 个字素:一个都不动
+        let exact = "y".repeat(MAX_OSC_TITLE_GRAPHEMES);
+        assert_eq!(sanitize_osc_title(&exact).as_deref(), Some(exact.as_str()));
+    }
+
+    /// 默认标题抑制表逐条。全部大小写不敏感,`Administrator: ` 前缀剥掉再比一次。
+    #[test]
+    fn 默认标题抑制表逐条() {
+        // 等于 shell 名
+        assert!(is_default_shell_title("pwsh", "pwsh"));
+        assert!(is_default_shell_title("PWSH", "pwsh"));
+        assert!(is_default_shell_title("Git Bash", "git bash"));
+        // 裸 pwsh:哪怕 pane 的 shell 名是别的
+        assert!(is_default_shell_title("pwsh", "Git Bash"));
+        // PowerShell 前缀
+        assert!(is_default_shell_title("PowerShell 7.5.3", "pwsh"));
+        assert!(is_default_shell_title("powershell 7.5.3", "pwsh"));
+        assert!(is_default_shell_title("PowerShell", "pwsh"));
+        assert!(is_default_shell_title("Windows PowerShell", "pwsh"));
+        // cmd
+        assert!(is_default_shell_title("Command Prompt", "cmd"));
+        assert!(is_default_shell_title("command prompt", "cmd"));
+        assert!(is_default_shell_title("cmd.exe", "cmd"));
+        assert!(is_default_shell_title(
+            "C:\\WINDOWS\\system32\\cmd.exe",
+            "cmd"
+        ));
+        assert!(is_default_shell_title(
+            "c:\\windows\\system32\\CMD.EXE",
+            "cmd"
+        ));
+        // 类 Unix shell 裸名
+        for s in ["bash", "zsh", "fish", "nu", "BASH", "Zsh"] {
+            assert!(is_default_shell_title(s, "pwsh"), "{s} 该被抑制");
+        }
+        // Administrator: 前缀剥掉再比
+        assert!(is_default_shell_title("Administrator: pwsh", "pwsh"));
+        assert!(is_default_shell_title(
+            "administrator: C:\\WINDOWS\\system32\\cmd.exe",
+            "cmd"
+        ));
+        assert!(is_default_shell_title(
+            "Administrator: Windows PowerShell",
+            "pwsh"
+        ));
+        // 空 / 纯空白
+        assert!(is_default_shell_title("", "pwsh"));
+        assert!(is_default_shell_title("   ", "pwsh"));
+
+        // 真正有信息的标题:一条都不许被抑制
+        for s in ["~/repo/mini-term", "D:\\Git\\mini-term", "npm run dev"] {
+            assert!(!is_default_shell_title(s, "pwsh"), "{s} 不该被抑制");
+        }
+        assert!(!is_default_shell_title("Administrator: ~/repo", "pwsh"));
+        assert!(
+            !is_default_shell_title("nushell", "pwsh"),
+            "只抑制裸 `nu`,`nushell` 是别的东西"
+        );
+        assert!(
+            is_default_shell_title("PowerShellery", "pwsh"),
+            "`以 PowerShell 开头` 是写死的口径,宁可多抑制一条也不让版本号糊上 tab"
+        );
+    }
+
+    fn titled(shell: &str, osc: Option<&str>, custom: Option<&str>) -> PaneState {
+        let mut pane = PaneState::new(shell);
+        pane.osc_title = osc.map(str::to_string);
+        pane.custom_title = custom.map(str::to_string);
+        pane
+    }
+
+    /// 副段四道闸:开关 / 自定义名 / 空标题 / 默认标题。
+    #[test]
+    fn 副段的四道闸() {
+        let p = titled("pwsh", Some("~/repo/mini-term"), None);
+        assert_eq!(osc_subtitle(&p, true).as_deref(), Some("~/repo/mini-term"));
+        assert_eq!(osc_subtitle(&p, false), None, "开关关着就没有副段");
+
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("~/repo"), Some("构建")), true),
+            None,
+            "用户命名了就尊重,不缀自动来的"
+        );
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("~/repo"), Some("")), true).as_deref(),
+            Some("~/repo"),
+            "空的自定义名等于没命名"
+        );
+        assert_eq!(osc_subtitle(&titled("pwsh", None, None), true), None);
+        assert_eq!(osc_subtitle(&titled("pwsh", Some("   "), None), true), None);
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("PowerShell 7.5.3"), None), true),
+            None,
+            "默认标题 = 没给信息"
+        );
+        assert_eq!(
+            osc_subtitle(&titled("pwsh", Some("pwsh"), None), true),
+            None
+        );
+    }
+
+    #[test]
+    fn 两段拼接() {
+        assert_eq!(join_title_parts("pwsh", Some("~/repo")), "pwsh · ~/repo");
+        assert_eq!(join_title_parts("pwsh", None), "pwsh");
+        assert_eq!(join_title_parts("pwsh", Some("")), "pwsh");
+    }
+
+    fn remote_project(conn_id: &str) -> ProjectConfig {
+        let mut p = project("r1", "远程项目");
+        p.ssh_connection_id = Some(conn_id.to_string());
+        p
+    }
+
+    fn connection(id: &str, name: &str) -> mt_config::SshConnection {
+        mt_config::SshConnection {
+            id: id.to_string(),
+            name: name.to_string(),
+            host: "example.com".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+        }
+    }
+
+    /// 主段三档 × 副段:自定义名 > 远程连接名 > shell 名,副段只缀在后两档上。
+    #[test]
+    fn 标题两段各档() {
+        let local = project("p1", "本地项目");
+        let remote = remote_project("c1");
+        let conns = vec![connection("c1", "生产机")];
+
+        // 本地:主段 = shell 名,副段 = OSC 标题
+        let pane = titled("pwsh", Some("~/repo/mini-term"), None);
+        assert_eq!(
+            pane_title_parts_of(Some(&local), &conns, &pane, true),
+            ("pwsh".to_string(), Some("~/repo/mini-term".to_string()))
+        );
+        // 开关关掉:主段一字不变,副段没了
+        assert_eq!(
+            pane_title_parts_of(Some(&local), &conns, &pane, false),
+            ("pwsh".to_string(), None)
+        );
+
+        // 远程:主段 = 连接名(不是 shell 名),副段照常
+        assert_eq!(
+            pane_title_parts_of(Some(&remote), &conns, &pane, true),
+            ("生产机".to_string(), Some("~/repo/mini-term".to_string()))
+        );
+        // 断链(连接被删):主段回落 "ssh",不许退回 shell 名
+        assert_eq!(
+            pane_title_parts_of(Some(&remote), &[], &pane, true).0,
+            "ssh"
+        );
+
+        // 自定义名:主段是它,副段**一律** None —— 用户命名了就尊重
+        let named = titled("pwsh", Some("~/repo/mini-term"), Some("构建"));
+        assert_eq!(
+            pane_title_parts_of(Some(&local), &conns, &named, true),
+            ("构建".to_string(), None)
+        );
+        assert_eq!(
+            pane_title_parts_of(Some(&remote), &conns, &named, true),
+            ("构建".to_string(), None),
+            "自定义名也盖过远程连接名"
+        );
+
+        // 没有项目上下文:退到 shell 名
+        assert_eq!(pane_title_parts_of(None, &conns, &pane, true).0, "pwsh");
+
+        // 没报过标题 / 报的是默认标题:只有主段
+        assert_eq!(
+            pane_title_parts_of(Some(&local), &conns, &titled("pwsh", None, None), true),
+            ("pwsh".to_string(), None)
+        );
+        assert_eq!(
+            pane_title_parts_of(
+                Some(&local),
+                &conns,
+                &titled("pwsh", Some("PowerShell 7.5.3"), None),
+                true
+            ),
+            ("pwsh".to_string(), None)
+        );
+
+        // 拼成一行(`pane_display_label` 的口径)
+        let (primary, sub) = pane_title_parts_of(Some(&local), &conns, &pane, true);
+        assert_eq!(
+            join_title_parts(&primary, sub.as_deref()),
+            "pwsh · ~/repo/mini-term"
+        );
     }
 }

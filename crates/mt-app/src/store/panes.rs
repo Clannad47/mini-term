@@ -15,8 +15,8 @@ use crate::tree::{
 };
 
 use super::pure::{
-    next_maximized, resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback,
-    terminal_style_from,
+    find_pane_of_pty, next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
+    resolve_scrollback, sanitize_osc_title, terminal_style_from,
 };
 use super::AppStore;
 
@@ -856,11 +856,61 @@ impl AppStore {
                 // `AppStore::global(cx).update` 就是同一实体的嵌套 update(gpui 直接 panic)。
                 // `cx.emit` 是延后派发的,天然绕开。
                 PaneEvent::AiMarks(batch) => store.add_markers(pty_id, batch.clone(), cx),
+                // OSC 0/2 标题。pane 侧已按 250ms 窗口合并过(见
+                // `pane::OSC_TITLE_PERIOD`),这里到的就是那一窗的最新值。
+                PaneEvent::Title(title) => {
+                    store.set_pane_osc_title_by_pty(pty_id, title.clone(), cx)
+                }
             }
         });
         self.pane_subs.insert(pty_id, sub);
         self.terminals.insert(pty_id, entity);
         pty_id
+    }
+
+    // === 页签标题跟随 shell(OSC 0/2)===
+
+    /// 记下 shell 报上来的窗口标题。`None` = `ResetTitle`(或标题收敛后为空)。
+    ///
+    /// 清洗在这里做一次就够(去控制字符 + trim + 按字素截到 48),
+    /// 见 [`sanitize_osc_title`];**值没变就一个字都不动** —— Claude Code 这类
+    /// CLI 的 spinner 每秒改好几次标题,pane 侧已经按 250ms 合并过一层,
+    /// 这里再挡一层「合并后仍然相同」的,避免白白 `notify` 整窗重绘。
+    ///
+    /// **不落盘**:`osc_title` 是运行时字段,`SavedPane` 里没有它。
+    pub fn set_pane_osc_title(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = title.as_deref().and_then(sanitize_osc_title);
+        let Some(state) = self.project_states.get_mut(project_id) else {
+            return;
+        };
+        let Some(pane) = state.pane_mut(pane_id) else {
+            return;
+        };
+        if pane.osc_title == next {
+            return;
+        }
+        pane.osc_title = next;
+        cx.notify();
+    }
+
+    /// [`Self::set_pane_osc_title`] 的 `pty_id` 入口 —— pane 只认得自己的 PTY 编号
+    /// (与 `clear_pane_attention_by_pty` 同一条反查路)。
+    pub fn set_pane_osc_title_by_pty(
+        &mut self,
+        pty_id: u32,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((project_id, pane_id)) = find_pane_of_pty(&self.project_states, pty_id) else {
+            return;
+        };
+        self.set_pane_osc_title(&project_id, &pane_id, title, cx);
     }
 
     /// 拖选停留自动复制的参数(`config.selectionAutoCopySecs`)。

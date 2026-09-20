@@ -143,6 +143,15 @@ pub struct PaneState {
     pub detected_agent: Option<String>,
     /// 本次 ai-idle 的成因是「需要用户确认」。
     pub attention: bool,
+    /// shell 通过 OSC 0/2 报上来的窗口标题(已清洗 + 限长),页签副段的来源。
+    ///
+    /// **运行时派生,不进磁盘格式** —— `SavedPane` 里没有这个字段,`persist.rs`
+    /// 一行不动(与 `resume_pending` 同一口径)。重启后由新起的 shell 自己重报,
+    /// 落盘一个上次的目录名只会在 PTY 起来前显示一段陈旧信息。
+    ///
+    /// `None` = 还没报过 / 收到了 `ResetTitle`。写入口唯一:
+    /// [`AppStore::set_pane_osc_title`](crate::store::AppStore::set_pane_osc_title)。
+    pub osc_title: Option<String>,
 }
 
 impl PaneState {
@@ -158,6 +167,7 @@ impl PaneState {
             resume_pending: false,
             detected_agent: None,
             attention: false,
+            osc_title: None,
         }
     }
 

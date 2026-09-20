@@ -29,6 +29,8 @@ export const settings = {
       scrollbackDesc: "每个终端保留的历史行数。这是内存占用的大头：约每行每 100 列 1.2 KB，且每个终端各算一份。改小立即生效并释放内存",
       animationsTitle: "启用动画",
       animationsDesc: "终端区的换场动画：切换标签 / 切换面板 / 最大化与还原 / 拆分终端。关闭后这些操作瞬时完成",
+      tabTitleFollowsShellTitle: "页签标题跟随 shell",
+      tabTitleFollowsShellDesc: "在页签名后面追加 shell 自己设置的窗口标题（oh-my-posh 之类会把当前目录写进去），用来区分同一种 shell 的多个页签。已手动改过名的页签不受影响；shell 报的是自身默认标题时也不显示",
     },
     clipboard: {
       copyPaste: "复制粘贴",
@@ -259,6 +261,8 @@ export const settings = {
       scrollbackDesc: "History lines kept per terminal. This dominates memory use: roughly 1.2 KB per line per 100 columns, counted separately for every terminal. Lowering it takes effect immediately and frees memory",
       animationsTitle: "Enable animations",
       animationsDesc: "Terminal-area transitions: switching tabs / panels, maximize & restore, splitting. When off these happen instantly",
+      tabTitleFollowsShellTitle: "Tab title follows the shell",
+      tabTitleFollowsShellDesc: "Append the window title the shell sets for itself (oh-my-posh and friends put the current directory there) after the tab name, so several tabs of the same shell can be told apart. Tabs you renamed by hand are left alone, and a shell reporting only its own default title shows nothing",
     },
     clipboard: {
       copyPaste: "Copy & paste",
