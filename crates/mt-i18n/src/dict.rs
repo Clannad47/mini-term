@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 863;
+pub const ZH_ENTRY_COUNT: usize = 869;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 863;
+pub const EN_ENTRY_COUNT: usize = 869;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -415,6 +415,12 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("externallyChanged", "文件已被外部修改"),
     ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
+    ("lightboxClose", "关闭（Esc）"),
+    ("lightboxFit", "适应窗口"),
+    ("lightboxHint", "滚轮缩放 · 拖动平移 · 双击适应窗口 · Esc 关闭"),
+    ("lightboxOpen", "点击放大查看"),
+    ("lightboxZoomIn", "放大"),
+    ("lightboxZoomOut", "缩小"),
     ("linkTargetMissing", "链接指向的文件不存在"),
     ("loading", "加载中..."),
     ("mermaidEmptyDiagram", "图表为空或语法不受支持"),
@@ -454,6 +460,12 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("externallyChanged", "File was modified externally"),
     ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
+    ("lightboxClose", "Close (Esc)"),
+    ("lightboxFit", "Fit to window"),
+    ("lightboxHint", "Scroll to zoom · Drag to pan · Double-click to fit · Esc to close"),
+    ("lightboxOpen", "Click to enlarge"),
+    ("lightboxZoomIn", "Zoom in"),
+    ("lightboxZoomOut", "Zoom out"),
     ("linkTargetMissing", "The linked file does not exist"),
     ("loading", "Loading..."),
     ("mermaidEmptyDiagram", "The diagram is empty or uses unsupported syntax"),

@@ -91,8 +91,11 @@ use mt_i18n::{
 /// 859 → 860：Markdown 预览链接指向的本地文件不存在时的提示（`fileViewer.linkTargetMissing`）。
 /// 860 → 863：Markdown 预览渲染 ```mermaid 图表（issue #80）：渲染中占位、
 /// 失败退回代码块的说明、空图 / 不支持语法的原因三条（`fileViewer.mermaid*`）。
+/// 863 → 869：Mermaid 图表点开放大浮层（滚轮缩放 / 拖动平移）：图表上的
+/// 「点击放大」提示、浮层工具栏四个按钮的 tooltip、底部操作提示一行
+/// （`fileViewer.lightbox*`）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 863;
+const EXPECTED_ENTRIES_PER_LANG: usize = 869;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
