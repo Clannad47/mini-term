@@ -199,7 +199,7 @@ impl StatusEmitter {
 ///
 /// 判定**不看 hook server 是否在运行**：`hook_enabled` 默认关闭，且 WSL / SSH /
 /// opencode / pi 这些 pane 即便 server 开着也从来没有 hook 上报，它们的徽章全
-/// 依赖这里的降级轮询（CLAUDE.md 「只靠输入检测识别的 agent 拿得到状态徽章」）。
+/// 依赖这里的降级轮询（AGENTS.md 「只靠输入检测识别的 agent 拿得到状态徽章」）。
 /// 曾短暂加过一条 `if !server_running { return "idle" }` 的「AI 感知总开关」，
 /// 在默认配置下等于把全部 AI 徽章、完成通知、托盘灯静默关掉，且没解决它声称
 /// 要解决的「降级轮询把等待授权谎报成完成」——那条 else-if 分支原样还在。

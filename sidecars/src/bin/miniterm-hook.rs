@@ -107,7 +107,7 @@ fn main() {
 /// （runner 注入的环境变量总是覆盖用户/插件的 extra_env），是可靠判据，必须先判：
 /// grok 会读 Claude 的 settings.json，payload 形状也与 Claude 相近，靠形状推断
 /// 会把 grok 事件标成 `claude-code`，镜像随后按 claude 去找会话文件，绑到同项目
-/// Claude 的最新对话上（串台，与 CLAUDE.md 对 opencode/pi 的警告同源）。
+/// Claude 的最新对话上（串台，与 AGENTS.md 对 opencode/pi 的警告同源）。
 fn detect_agent(body: &serde_json::Value, is_grok: bool) -> &'static str {
     if is_grok {
         return "grok";

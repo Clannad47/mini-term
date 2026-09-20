@@ -16,7 +16,7 @@
 //! macOS 有 `NSWorkspace.accessibilityDisplayShouldReduceMotion`、Linux 上是
 //! `org.gnome.desktop.interface enable-animations` 这类桌面环境私有设置,
 //! 两边都还没接 —— [`probe`] 在那些平台恒返回 `false`(= 不减少动画),
-//! 与 mt-ui 侧闸的默认值一致。平台支持现状见 CLAUDE.md。
+//! 与 mt-ui 侧闸的默认值一致。平台支持现状见 AGENTS.md。
 //!
 //! # 刷新时机
 //!
