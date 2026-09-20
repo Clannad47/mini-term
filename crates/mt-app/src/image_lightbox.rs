@@ -28,9 +28,9 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StatefulInteractiveElement,
-    Styled, StyledImage as _, Window, anchored, deferred, div, img, point,
-    prelude::FluentBuilder, px, size,
+    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StatefulInteractiveElement, Styled,
+    StyledImage as _, Window, anchored, deferred, div, img, point, prelude::FluentBuilder, px,
+    size,
 };
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -159,7 +159,10 @@ impl ImageLightbox {
     }
 
     fn display_size(&self) -> Size<f32> {
-        size(self.natural.width * self.zoom, self.natural.height * self.zoom)
+        size(
+            self.natural.width * self.zoom,
+            self.natural.height * self.zoom,
+        )
     }
 
     fn zoom_bounds(&self) -> (f32, f32) {
@@ -540,7 +543,9 @@ impl Render for ImageLightbox {
 fn fit_zoom(natural: Size<f32>, avail: Size<f32>) -> f32 {
     let w = natural.width.max(1.0);
     let h = natural.height.max(1.0);
-    (avail.width / w).min(avail.height / h).max(f32::MIN_POSITIVE)
+    (avail.width / w)
+        .min(avail.height / h)
+        .max(f32::MIN_POSITIVE)
 }
 
 /// 手动缩放的 `(下限, 上限)`:下限取 [`MIN_ZOOM`] 与 fit 的小者(超大图的 fit 本身
@@ -592,9 +597,15 @@ mod tests {
     #[test]
     fn 适应窗口按宽高各自够放取小() {
         // 宽是瓶颈
-        assert!(close(fit_zoom(size(1000.0, 200.0), size(500.0, 500.0)), 0.5));
+        assert!(close(
+            fit_zoom(size(1000.0, 200.0), size(500.0, 500.0)),
+            0.5
+        ));
         // 高是瓶颈
-        assert!(close(fit_zoom(size(200.0, 1000.0), size(500.0, 500.0)), 0.5));
+        assert!(close(
+            fit_zoom(size(200.0, 1000.0), size(500.0, 500.0)),
+            0.5
+        ));
         // 小图能放大
         assert!(close(fit_zoom(size(100.0, 100.0), size(500.0, 300.0)), 3.0));
         // 零尺寸不除零
@@ -640,7 +651,10 @@ mod tests {
         let on_image = point((cursor.x - offset.x) / from, (cursor.y - offset.y) / from);
         let new_offset = zoom_about(cursor, offset, from, to);
         // 缩放后同一图点的屏幕位置仍是光标
-        let screen = point(new_offset.x + on_image.x * to, new_offset.y + on_image.y * to);
+        let screen = point(
+            new_offset.x + on_image.x * to,
+            new_offset.y + on_image.y * to,
+        );
         assert!(close(screen.x, cursor.x) && close(screen.y, cursor.y));
     }
 
@@ -650,6 +664,9 @@ mod tests {
         assert!(close(wheel_zoom_factor(-WHEEL_NOTCH_PX), 1.0 / ZOOM_STEP));
         assert!(close(wheel_zoom_factor(0.0), 1.0));
         // 半格是开方,连续量平滑
-        assert!(close(wheel_zoom_factor(WHEEL_NOTCH_PX / 2.0), ZOOM_STEP.sqrt()));
+        assert!(close(
+            wheel_zoom_factor(WHEEL_NOTCH_PX / 2.0),
+            ZOOM_STEP.sqrt()
+        ));
     }
 }
