@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.3.3--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.3.4--pre-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -54,7 +54,7 @@
 | **Mobile support** | **Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). See the [deployment guide](docs/deploy-relay.md). |
 | **Cost statistics** | The "Stats" panel in the top bar aggregates Claude Code / Codex / Grok **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away.<br />Cost computation follows the approach of the ccusage project — [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **SSH support** | **SSH remote projects** — add a directory on a server as a project directly: the file tree lazy-loads over SFTP, the terminal connects via `ssh -t` and lands straight in the project directory, a one-click overlay reconnects after a drop, and the remote machine's Claude / Codex history is readable with full content. Remote cache keys mix in the connection id, so identical paths on two servers never cross-contaminate <br /><br />**WSL support** — `\\wsl$\<distro>\<path>` works as a project root, launching switches to `wsl.exe --cd` automatically so `pwd` really lands inside WSL instead of `C:\Windows`; Windows can also read Claude / Codex session history from inside WSL distros directly<br /><br />**Callable by agents** — a built-in Skill lets the AI run commands on your servers over SSH. Right-click a project → "Link SSH" and tick the connections to enable it per project |
-| **Markdown preview** | Open a `.md` from the file tree and it renders block-virtualized (long documents scroll without re-laying out the whole page): ```` ```mermaid ```` fences become diagrams through a pure-Rust pipeline (no browser or Node, follows light / dark theme, falls back to the code block on errors), local and remote images, GFM tables, links dispatched by kind (external links confirm first, anchors scroll to the heading, local files open as a new tab), and inline code in the theme accent (orange on an elevated background) |
+| **Markdown preview** | Open a `.md` from the file tree and it renders block-virtualized (long documents scroll without re-laying out the whole page): ```` ```mermaid ```` fences become diagrams through a pure-Rust pipeline (no browser or Node, follows light / dark theme, falls back to the code block on errors; click one to open a full-window lightbox with wheel zoom and drag-to-pan), local and remote images, GFM tables, links dispatched by kind (external links confirm first, anchors scroll to the heading, local files open as a new tab), and inline code in the theme accent (orange on an elevated background) |
 | **Git integration** | A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), plus **worktree management** (right-click a project → Manage Worktrees) |
 | **Long-text paste** | Clipboard text ≥10 lines or ≥2000 chars is spilled to a temp `.txt` and pasted as a quoted path — your AI tool never has to swallow a wall of text |
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
@@ -87,7 +87,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,844 Rust tests** (29 test targets) |
+| Tests | **1,850 Rust tests** (29 test targets) |
 
 ---
 
