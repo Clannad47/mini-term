@@ -208,27 +208,14 @@ impl AppStore {
         crate::ssh_conn::remote_connection(project, &self.config.ssh_connections).cloned()
     }
 
-    /// pane 显示名的**主段**:自定义名 > 远程连接名 > shell 名
-    /// (`remoteProject.ts::paneDisplayLabel`)。
-    ///
-    /// 这是「这个 pane 是什么」的身份段,**永远不含**终端自报的标题 ——
-    /// 改名弹窗的预填只该看它(拿 [`Self::pane_display_label`] 去预填的话,
-    /// 用户一点「重命名」就会把 shell 自动灌的那半截目录当成自己的名字存下来)。
-    ///
-    /// 目前还没有调用点:页签渲染与改名弹窗的接线由页签重做那一批落。
-    #[allow(dead_code)]
-    pub fn pane_primary_label(&self, project_id: &str, pane: &PaneState) -> String {
-        super::pure::pane_primary_label_of(
-            self.project(project_id),
-            &self.config.ssh_connections,
-            pane,
-        )
-    }
-
     /// pane 显示名的两段口径:`(主段, 副段)`。tab 栏、项目预览浮层、右键菜单
     /// 共用这一个出口,防各处漂移。
     ///
-    /// - **主段** = [`Self::pane_primary_label`](自定义名 > 远程连接名 > shell 名);
+    /// - **主段** = 自定义名 > 远程连接名 > shell 名(`remoteProject.ts::paneDisplayLabel`,
+    ///   算法在 `pure::pane_primary_label_of`)。这是「这个 pane 是什么」的身份段,
+    ///   **永远不含**终端自报的标题 —— 改名弹窗的预填只该看它(拿拼好的一行去
+    ///   预填的话,用户一点「重命名」就会把 shell 自动灌的那半截目录当成自己的
+    ///   名字存下来);
     /// - **副段** = shell 通过 OSC 0/2 报上来的窗口标题,`None` = 这个 pane 不显示副段。
     ///   四道闸见 [`osc_subtitle`]:开关(`config.tabTitleFollowsShell`,缺省开)、
     ///   有自定义名、标题为空、标题是 shell 自己的默认标题。

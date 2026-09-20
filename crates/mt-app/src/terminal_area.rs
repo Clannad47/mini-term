@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Task,
     Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
@@ -402,6 +402,46 @@ fn tab_label(
                     ))
                     .child(format!("· {secondary}")),
             )
+        })
+}
+
+/// tab 最左的图标槽:闲置 pane 画 shell 图标,其余状态画状态灯。
+///
+/// `idle` 那颗状态灯是个空心圈,一屏五个闲置终端就是五颗一模一样的 ○,占着
+/// 位置不带任何信息;换成 shell 图标至少能看出这是 pwsh 还是 bash。两个分支都
+/// 塞进同一个固定尺寸的盒子 —— 状态一变(idle ↔ ai-working)标题就跟着横跳
+/// 一格是绝对不行的。展开态 chip 与折叠标题条共用。
+///
+/// `contrast` 给挖空语义的笔画(fish 的眼睛)用,传图标所在容器的底色。
+fn tab_icon_slot(
+    status: PaneStatus,
+    shell_name: &str,
+    is_active: bool,
+    contrast: Hsla,
+) -> impl IntoElement {
+    div()
+        .w(px(TAB_ICON_SLOT))
+        .h(px(TAB_ICON_SLOT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        // 未激活 tab 上的图标压暗一档,与弱化的标题同调
+        .when(!is_active, |el| el.opacity(0.7))
+        .child(if status == PaneStatus::Idle {
+            ShellIcon::new(ShellKind::from_shell_name(shell_name))
+                .size(px(14.0))
+                // 「未知」那枚跟随主题色;其余八家写死品牌色
+                .color(if is_active {
+                    ui::text_primary()
+                } else {
+                    ui::text_muted()
+                })
+                .contrast(contrast)
+                .into_any_element()
+        } else {
+            // 动画相位来自进程级墙钟,不带逐元素状态,所以不需要 id
+            ui::status_dot(status).into_any_element()
         })
 }
 
@@ -1377,8 +1417,18 @@ impl TerminalArea {
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
         let pid = project_id.to_string();
         let leaf = leaf_id.clone();
-        // 显示数据先摘成 owned:下面每个 tab 都要往 move 闭包里搬,借着 store 走不了
-        let tabs: Vec<(String, String, PaneStatus, Option<AiVendor>, bool)> = panes
+        // 显示数据先摘成 owned:下面每个 tab 都要往 move 闭包里搬,借着 store 走不了。
+        // 字段口径与展开态 tab 逐字一致(见 render_leaf_tab_bar)
+        struct CollapsedTab {
+            pane_id: String,
+            primary: String,
+            secondary: Option<String>,
+            shell_name: String,
+            status: PaneStatus,
+            vendor: Option<AiVendor>,
+            unread: bool,
+        }
+        let tabs: Vec<CollapsedTab> = panes
             .iter()
             .map(|pane| {
                 // 品牌图标的取值口径与展开态 tab 逐字一致(见 render_leaf 的 vendors)
@@ -1390,22 +1440,25 @@ impl TerminalArea {
                         AiVendor::from_session_type(agent)
                             .or_else(|| AiVendor::infer(Some(agent), None))
                     });
-                (
-                    pane.id.clone(),
-                    store.pane_display_label(&pid, pane),
-                    pane.status,
+                let (primary, secondary) = store.pane_title_parts(&pid, pane);
+                CollapsedTab {
+                    pane_id: pane.id.clone(),
+                    primary,
+                    secondary,
+                    shell_name: pane.shell_name.clone(),
+                    status: pane.status,
                     vendor,
-                    store.is_pane_unread_done(&pane.id),
-                )
+                    unread: store.is_pane_unread_done(&pane.id),
+                }
             })
             .collect();
 
         // 焦点句柄与展开态共用 `tab_focus` 那张表(它按整棵树保留,见 render 里的
         // retain):折叠 ↔ 展开来回切时 Tab 焦点不丢
-        for (pane_id, ..) in &tabs {
-            if !self.tab_focus.contains_key(pane_id) {
+        for tab in &tabs {
+            if !self.tab_focus.contains_key(&tab.pane_id) {
                 let handle = cx.focus_handle();
-                self.tab_focus.insert(pane_id.clone(), handle);
+                self.tab_focus.insert(tab.pane_id.clone(), handle);
             }
         }
 
@@ -1432,13 +1485,23 @@ impl TerminalArea {
             }));
 
         let this_area = cx.entity();
-        for (pane_id, label, status, vendor, unread) in tabs {
+        for CollapsedTab {
+            pane_id,
+            primary,
+            secondary,
+            shell_name,
+            status,
+            vendor,
+            unread,
+        } in tabs
+        {
             let is_active = pane_id == active_id;
             let focus = self.tab_focus.get(&pane_id).cloned();
             let (pid_click, pane_click) = (pid.clone(), pane_id.clone());
             let (pid_key, pane_key) = (pid.clone(), pane_id.clone());
+            // 右键菜单的「重命名」只预填主段(理由见展开态 tab 的同一处注释)
             let (pid_menu, pane_menu, label_menu) =
-                (pid.clone(), pane_id.clone(), label.clone());
+                (pid.clone(), pane_id.clone(), primary.clone());
             let pane_hover = pane_id.clone();
             let pane_rect = pane_id.clone();
             let this_rect = this_area.clone();
@@ -1512,7 +1575,8 @@ impl TerminalArea {
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
-                    .child(ui::status_dot(status))
+                    // 折叠条底色是 bg_elevated(悬停 bg_overlay),挖空笔画取前者
+                    .child(tab_icon_slot(status, &shell_name, is_active, ui::bg_elevated()))
                     .when_some(vendor, |el, vendor| {
                         el.child(BrandIcon::new(Some(vendor)).size(px(12.0)).color(
                             if is_active {
@@ -1522,7 +1586,20 @@ impl TerminalArea {
                             },
                         ))
                     })
-                    .child(div().child(label))
+                    // 与展开态同一套两段式标题;折叠条上的 tab 没有 max_w,
+                    // 副段再长也别把整条撑爆
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .max_w(px(TAB_CHIP_MAX_W))
+                            .flex()
+                            .items_center()
+                            .child(tab_label(
+                                primary.into(),
+                                secondary.map(SharedString::from),
+                                is_active,
+                            )),
+                    )
                     .when(unread, |el| {
                         el.child(
                             div()
@@ -1743,12 +1820,17 @@ impl TerminalArea {
             let pid_close = project_id.to_string();
             let pid_rename = project_id.to_string();
             let pid_menu = project_id.to_string();
-            // tab 标题走 store 的统一口径:自定义名 > 远程连接名 > shell 名。
+            // tab 标题走 store 的两段口径:主段 = 自定义名 > 远程连接名 > shell 名,
+            // 副段 = shell 自报的 OSC 标题(`AppStore::pane_title_parts`)。
             // 恢复布局时远程 pane 的 shellName 会被映射成本地 shell 名、**不可信**,
             // 所以远程那一档必须由 store 查连接表补上(`remoteProject.ts::paneDisplayLabel`)
-            let label = store.pane_display_label(project_id, pane);
-            let label_menu = label.clone();
-            let label_text = label.clone();
+            let (primary, secondary) = store.pane_title_parts(project_id, pane);
+            // 右键菜单的「重命名」与双击改名只预填**主段**:拿拼好的一行去预填,
+            // 用户一点重命名就会把 shell 灌进来的那半截目录当成自己的名字存下来
+            let label_menu = primary.clone();
+            let label_rename = primary.clone();
+            // 拖影只有一行文本可用,走拼好的一行
+            let label_text = store.pane_display_label(project_id, pane);
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
             let this_area = cx.entity();
@@ -1893,7 +1975,7 @@ impl TerminalArea {
                         cx.stop_propagation();
                         this.close_tab_preview(cx);
                         if click_count(event) >= 2 {
-                            let (label, store) = (label.clone(), this.store.clone());
+                            let (label, store) = (label_rename.clone(), this.store.clone());
                             modal::open_rename_pane(
                                 store,
                                 pid_rename.clone(),
@@ -1931,36 +2013,17 @@ impl TerminalArea {
                     //
                     // 动画 id 拿 pane id 拼(跨帧稳定、逐 tab 唯一);**不能用循环
                     // 下标** —— 删掉中间一个 tab 会让后面所有状态灯的动画进度跳一格
-                    .child(
-                        div()
-                            .w(px(TAB_ICON_SLOT))
-                            .h(px(TAB_ICON_SLOT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            // 未激活 chip 上的图标压暗一档,与弱化的标题同调
-                            .when(!is_active, |el| el.opacity(0.7))
-                            .child(if pane.status == PaneStatus::Idle {
-                                ShellIcon::new(ShellKind::from_shell_name(&pane.shell_name))
-                                    .size(px(14.0))
-                                    // 「未知」那枚跟随主题色;其余八家写死品牌色
-                                    .color(if is_active {
-                                        ui::text_primary()
-                                    } else {
-                                        ui::text_muted()
-                                    })
-                                    // fish 的眼睛是挖空语义,给它 chip 的底色
-                                    .contrast(if is_active {
-                                        ui::bg_elevated()
-                                    } else {
-                                        ui::bg_terminal()
-                                    })
-                                    .into_any_element()
-                            } else {
-                                ui::status_dot(pane.status).into_any_element()
-                            }),
-                    )
+                    .child(tab_icon_slot(
+                        pane.status,
+                        &pane.shell_name,
+                        is_active,
+                        // fish 的眼睛是挖空语义,给它 chip 的底色
+                        if is_active {
+                            ui::bg_elevated()
+                        } else {
+                            ui::bg_terminal()
+                        },
+                    ))
                     // AI 品牌图标(原版 `PaneGroup.tsx` 的 `aiActive && <BrandIcon/>`):
                     // 只在这个 pane 真有 AI 会话身份时出现,认不出厂商就不占位
                     .when_some(vendor, |el, vendor| {
@@ -1975,8 +2038,11 @@ impl TerminalArea {
                                 }),
                         )
                     })
-                    // TODO(tab-title): 副段由 store.pane_title_parts() 提供,合并时接上
-                    .child(tab_label(label_text.clone().into(), None, is_active))
+                    .child(tab_label(
+                        primary.into(),
+                        secondary.map(SharedString::from),
+                        is_active,
+                    ))
                     // 未读完成标(窗口没聚焦时完成的任务)
                     .when(has_unread, |el| {
                         el.child(
