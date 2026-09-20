@@ -85,6 +85,12 @@ pub enum PaneEvent {
     /// 调用路径是 `AppStore::write_to_pane`(在 `store.update` 里调),那里再去
     /// `AppStore::global(cx).update` 就是同一实体的嵌套 update,gpui 直接 panic。
     AiMarks(MarkerBatch),
+    /// shell 通过 OSC 0/2 设置的窗口标题(`None` = `ResetTitle`)——
+    /// store 据此更新 pane 的副段标题(`AppStore::set_pane_osc_title_by_pty`)。
+    ///
+    /// **已按 [`OSC_TITLE_PERIOD`] 合并过**:发上来的是一个窗口内的最新值,
+    /// 不是每次 OSC 序列都发一条。清洗与去重在 store 侧。
+    Title(Option<String>),
 }
 
 /// reader / watcher 线程 → 主线程的信号。
@@ -136,6 +142,14 @@ pub struct TerminalPane {
     pending_marks: Vec<MarkerSubmit>,
     /// 待定标记的定锚计时器。掉了任务就没了,必须存着。
     _marks_timer: Option<Task<()>>,
+    /// 限流窗口里待推的 OSC 标题。
+    ///
+    /// 外层 `Option` = **有没有在途的窗口**(`Some` 即表示定时器已经排上了,
+    /// 到点会来取这里的值),内层 `Option` = 标题本身(`None` = `ResetTitle`)。
+    /// 两层分开是因为「要推一个 None 上去」与「没有要推的」是两件事。
+    pending_osc_title: Option<Option<String>>,
+    /// OSC 标题限流窗口的计时器。掉了任务就没了,必须存着。
+    _osc_title_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -163,6 +177,15 @@ const MARK_SETTLE_DELAY: Duration = Duration::from_millis(200);
 /// (PtyWrite / DA / DSR)走它,晚一拍对面的 TUI 就多等一拍,所以它跟着读节奏走、
 /// **不随窗口前后台变**。
 const DRAIN_PERIOD: Duration = Duration::from_millis(16);
+
+/// OSC 0/2 标题推给 store 的**最小间隔**(每个 pane 各算各的)。
+///
+/// Claude Code 这类 CLI 会把 spinner 帧写进窗口标题,一秒能改好几次;每次都推
+/// 就是每次一趟 store 写 + `cx.notify()` 整窗重绘。窗口内只留最新值 ——
+/// 标题是「当前是什么」的显示量,中间帧丢掉没有任何损失。
+///
+/// 代价是首个标题最多晚 250ms 上屏,而那 250ms 里 shell 多半还在打 banner。
+const OSC_TITLE_PERIOD: Duration = Duration::from_millis(250);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -407,6 +430,8 @@ impl TerminalPane {
             _flash_timer: None,
             pending_marks: Vec::new(),
             _marks_timer: None,
+            pending_osc_title: None,
+            _osc_title_timer: None,
             _wake: wake,
         }
     }
@@ -723,9 +748,40 @@ impl TerminalPane {
         self.emulator.visible_lines().get(row as usize).cloned()
     }
 
+    /// 把 shell 报上来的窗口标题排进限流窗口(见 [`OSC_TITLE_PERIOD`])。
+    ///
+    /// 窗口内只留**最新**值:第一条标题起一个 250ms 的定时器,窗口期内再来的
+    /// 标题只覆盖 `pending_osc_title`、**不重排定时器**(所以是固定窗口节流,
+    /// 不是每来一条就顺延的去抖 —— 后者在 spinner 一直改标题时永远不会到点)。
+    ///
+    /// 到点由任务 `take()` 走 pending 并 `cx.emit`,**不在任务里清自己的句柄** ——
+    /// 从运行中的任务里丢掉自己的 `Task` 是在给自己拆脚手架;下次排窗口时
+    /// 句柄自然被新任务顶掉。
+    fn note_osc_title(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        let armed = self.pending_osc_title.is_some();
+        self.pending_osc_title = Some(title);
+        if armed {
+            return;
+        }
+        self._osc_title_timer = Some(cx.spawn(async move |pane, cx| {
+            cx.background_executor().timer(OSC_TITLE_PERIOD).await;
+            let _ = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                if let Some(title) = pane.pending_osc_title.take() {
+                    cx.emit(PaneEvent::Title(title));
+                }
+            });
+        }));
+    }
+
     /// alacritty 内部产生的事件。**`PtyWrite` 必须处理** —— DA/DSR/光标位置查询
     /// 这些是终端要回给程序的应答,吞掉会让 shell 与 TUI 程序卡在等回应上。
-    fn drain_term_events(&mut self, cx: &mut App) {
+    ///
+    /// ⚠️ 标题这两条**不只**来自 OSC 0/2:`Term::set_options`(改回滚行数时)
+    /// 会把**当前**标题原样再发一次(有标题发 `Title`、没有发 `ResetTitle`,
+    /// 见 alacritty_terminal 0.26 `term/mod.rs:505`)。所以它是幂等的 ——
+    /// 改一次设置不会把已经收到的标题抹掉,store 侧「值没变就不动」还会把
+    /// 这次重发整个吃掉。
+    fn drain_term_events(&mut self, cx: &mut Context<Self>) {
         for event in self.emulator.events().drain() {
             match event {
                 // 这些是终端自己的应答,不是用户键入:直接写,不走 AI 输入旁路
@@ -754,6 +810,10 @@ impl TerminalPane {
                     });
                     self.write_raw(payload.as_bytes());
                 }
+                // 页签副段的数据源。两条都走同一个限流窗口,顺序即最终值:
+                // 窗口内先 Title 后 ResetTitle,推上去的就是 `None`。
+                TermEvent::Title(title) => self.note_osc_title(Some(title), cx),
+                TermEvent::ResetTitle => self.note_osc_title(None, cx),
                 _ => {}
             }
         }

@@ -25,12 +25,13 @@ impl SettingsView {
     pub(super) fn render_terminal_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let list = self.store.read(cx).shell_list();
         let editing = self.shell_editing;
-        let animations = self
-            .store
-            .read(cx)
-            .config()
-            .terminal_animations
-            .unwrap_or(true);
+        let (animations, title_follows_shell) = {
+            let config = self.store.read(cx).config();
+            (
+                config.terminal_animations.unwrap_or(true),
+                config.tab_title_follows_shell.unwrap_or(true),
+            )
+        };
 
         let mut rows = div().flex().flex_col().gap(px(8.0));
         for (idx, shell) in list.shells.iter().enumerate() {
@@ -159,6 +160,22 @@ impl SettingsView {
                         |this, next, _window, cx| {
                             this.store.update(cx, |store, cx| {
                                 store.patch_config(|c| c.terminal_animations = Some(next), cx)
+                            });
+                        },
+                        cx,
+                    ))
+                    // 页签标题跟随 shell 的 OSC 0/2 窗口标题。⚠️ 关掉只是**不显示**
+                    // 副段 —— 标题照常收着(下一次 shell 改标题就会刷新),
+                    // 重新打开开关立刻就有,不必重开终端
+                    .child(toggle_row(
+                        "tab-title-follows-shell",
+                        "terminal.tabTitleFollowsShellTitle",
+                        "terminal.tabTitleFollowsShellDesc",
+                        title_follows_shell,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.tab_title_follows_shell = Some(next), cx)
                             });
                         },
                         cx,

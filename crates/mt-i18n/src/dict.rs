@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 869;
+pub const ZH_ENTRY_COUNT: usize = 871;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 869;
+pub const EN_ENTRY_COUNT: usize = 871;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1303,6 +1303,8 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("terminal.newNamePlaceholder", "名称（如 pwsh）"),
     ("terminal.scrollback", "回滚行数"),
     ("terminal.scrollbackDesc", "每个终端保留的历史行数。这是内存占用的大头：约每行每 100 列 1.2 KB，且每个终端各算一份。改小立即生效并释放内存"),
+    ("terminal.tabTitleFollowsShellDesc", "在页签名后面追加 shell 自己设置的窗口标题（oh-my-posh 之类会把当前目录写进去），用来区分同一种 shell 的多个页签。已手动改过名的页签不受影响；shell 报的是自身默认标题时也不显示"),
+    ("terminal.tabTitleFollowsShellTitle", "页签标题跟随 shell"),
     ("themes.addPack", "添加皮肤"),
     ("themes.applyFailed", "皮肤应用失败：{detail}"),
     ("themes.browseGallery", "更多皮肤"),
@@ -1500,6 +1502,8 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("terminal.newNamePlaceholder", "Name (e.g. pwsh)"),
     ("terminal.scrollback", "Scrollback lines"),
     ("terminal.scrollbackDesc", "History lines kept per terminal. This dominates memory use: roughly 1.2 KB per line per 100 columns, counted separately for every terminal. Lowering it takes effect immediately and frees memory"),
+    ("terminal.tabTitleFollowsShellDesc", "Append the window title the shell sets for itself (oh-my-posh and friends put the current directory there) after the tab name, so several tabs of the same shell can be told apart. Tabs you renamed by hand are left alone, and a shell reporting only its own default title shows nothing"),
+    ("terminal.tabTitleFollowsShellTitle", "Tab title follows the shell"),
     ("themes.addPack", "Add skin"),
     ("themes.applyFailed", "Failed to apply skin: {detail}"),
     ("themes.browseGallery", "More skins"),

@@ -94,8 +94,10 @@ use mt_i18n::{
 /// 863 → 869：Mermaid 图表点开放大浮层（滚轮缩放 / 拖动平移）：图表上的
 /// 「点击放大」提示、浮层工具栏四个按钮的 tooltip、底部操作提示一行
 /// （`fileViewer.lightbox*`）。
+/// 869 → 871：页签标题跟随 shell 通过 OSC 0/2 报上来的窗口标题，
+/// 设置页终端行为组加一个开关：`settings.terminal.tabTitleFollowsShell{Title,Desc}`。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 869;
+const EXPECTED_ENTRIES_PER_LANG: usize = 871;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
