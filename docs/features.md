@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.3.4--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.3.5--pre-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -136,6 +136,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
 - **Project descriptions** — Right-click "Edit description" to add a one-line note, shown in gray after the project name; tell a row of worktree sub-projects apart at a glance.
 - **Project row icons** — Project rows show tech-stack icons and the brand icons of the AIs currently running there (deduplicated by vendor, alphabetical, monochrome brand icons tinted in brand colors); pane tabs and the session list show the same brand icons.
+- **Terminal tab bar redesign** — Workbench tabs (terminal page / document pages) and terminal tabs now read as two distinct layers: the page level keeps its 2px accent top line and matches the height of the sidebar's "Projects" header, while terminal tabs become rounded chips (active: elevated background with a border; inactive: transparent with hover feedback) whose close button always reserves its slot but only shows on the active or hovered chip, so switching never shifts the layout; the collapsed title strip in maximized mode follows the same conventions. Idle terminals lead with a shell icon (pwsh / Windows PowerShell / cmd / bash / zsh / fish / nu / WSL, recognized from the shell name, hand-drawn vectors) and switch back to the status dot while an AI session runs or an error is pending. **Tab titles follow the shell**: the window title the shell reports through OSC 0/2 is appended after the shell name as a smaller, dimmer subtitle (oh-my-posh's default `pwsh in <dir>` template is stripped down to the directory), throttled to 250ms per pane, sanitized of control characters, and truncated to 48 graphemes; the shell's own default titles (`PowerShell 7.x`, `Windows PowerShell`, `Command Prompt`, a `cmd.exe` path, …) are hidden, tabs you renamed by hand are left alone, and the subtitle collapses whenever an AI brand icon is on the tab (Claude Code writing its own name into the title would just say the same thing twice). Context menus, drag previews, and preview cards use the joined one-line text, and the rename dialog pre-fills only the shell name so a directory pushed by the shell never gets saved as a custom name. Toggle it under Settings → Terminal → Terminal behavior → "Tab title follows shell".
 - **Hover pane preview** — **Only for projects running an AI session** (the same test as the row's AI brand icons: if the icon is lit, the preview exists; the overlay closes as soon as the AI exits, and hovering a plain shell project just shows the absolute path as a tooltip instead of interrupting you with a card). Hover such a project row for 250ms and a **miniature layout puzzle** of its terminal area pops up: real split proportions reproduced from the SplitNode tree, in a fixed-width overlay that never runs off screen, matching what you'd see after switching; it redraws every 500ms while open, so the preview is live. It's implemented by reading the terminal grid and painting a miniature bitmap — cell contents come through the same rendering pipeline as the main terminal (same-color run extraction, bold standard colors brightened, 256-color / truecolor resolved), drawn onto a cell grid and scaled proportionally, so even a hidden pane's content is available in real time. Each split leaf shows its active tab's picture (bottom-left anchored, preserving the newest output and the TUI input area); hidden tabs are summarized by a "+N" badge carrying the highest-priority status among them (error > ai-working > ai-idle, the same ordering as status aggregation), so AI activity buried in an inactive tab isn't missed; panes without a PTY show a "Not started" placeholder (the project's absolute path stays visible in the card header). **Inactive pane tabs** also pop a single-cell thumbnail overlay after a 250ms hover (same rendering pipeline, redrawn every 500ms while open; the "Not started" placeholder and remote-disconnect veil follow the same conventions), with **no AI gate** — a hidden tab's content is invisible until you switch to it anyway, and the preview answers exactly "what's on that tab right now". The trigger timing matches the project-row preview; it closes on mouse-out / click / context menu / scroll, and the card clamps to the horizontal edges, flipping above the tab when a bottom split leaves no room below.
 - **Drag to add projects** — Drag a folder from the file explorer onto the project list to add it quickly, with automatic detection of files / folders / duplicate projects and visual feedback.
 - **Adding a project opens it** — All five entry points (the dialog, a group's right-click menu, dropping a folder onto the list, add remote project, worktree "add as project") switch to the new project and open its first terminal with the default shell. A path that already exists just switches without adding a duplicate, and a project that already has terminals doesn't get another one. Switching projects by hand still never auto-creates a terminal — an empty state you closed yourself is intentional
@@ -207,7 +208,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,850 Rust tests** (29 test targets) + relay-server protocol boundary tests |
+| Tests | **1,866 Rust tests** (29 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -348,7 +349,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (29 test targets, 1,850 cases)
+# Workspace-wide Rust tests (29 test targets, 1,866 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

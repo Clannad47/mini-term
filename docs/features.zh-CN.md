@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.3.4--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.3.5--pre-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -136,6 +136,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **项目列表** — 左侧边栏管理多个项目目录，一键切换工作区，重启自动恢复上次激活项目
 - **项目描述** — 右键「编辑描述」给项目补一行说明，项目名后灰色小字展示；一排 worktree 子项目各自在干什么一眼分清
 - **项目行图标** — 项目行显示技术栈图标与该项目正在跑的 AI 品牌图标（按厂商去重、字母序排列，单色品牌图标上品牌色），pane 标签与会话列表同步展示品牌图标
+- **终端页签重做** — 工作台页签（终端页 / 文档页）与终端页签拉开层级：页级保留 2px 强调色顶线并与左栏「项目」栏头等高，终端页签改成圆角胶囊（激活项浅底描边、未激活透明底带悬停反馈），关闭按钮常驻占位只在激活或悬停时可见，切换时零布局跳动；最大化态的折叠标题条同口径。闲置终端在页签最左显示 shell 图标（pwsh / Windows PowerShell / cmd / bash / zsh / fish / nu / WSL，按 shell 名识别、自绘矢量），有 AI 会话或报错时换回状态灯。**页签标题跟随 shell**：shell 通过 OSC 0/2 报上来的窗口标题作为副段以小一号灰字缀在 shell 名后（oh-my-posh 默认模板报的「pwsh in 目录」剥掉前缀只留目录），每个 pane 按 250ms 节流、去控制字符后按字素截断到 48 字；shell 自己的默认标题（`PowerShell 7.x`、`Windows PowerShell`、`Command Prompt`、`cmd.exe` 路径等）不显示，用户手动改过名的页签不受影响，页签上挂着 AI 品牌图标时副段收起（Claude Code 把自己的名字写进标题只是把同一件事说第二遍）；右键菜单 / 拖影 / 预览卡用拼好的一行文本，改名弹窗只预填 shell 名，不会把 shell 灌进来的目录当成自定义名存下。设置「终端 → 终端行为 → 页签标题跟随 shell」可关闭
 - **悬停 pane 预览** — **仅限跑着 AI 会话的项目**（判定与项目行 AI 品牌图标同口径：行上亮着图标才有预览；AI 退出后浮层随即收起，普通 shell 项目悬停只出绝对路径 tooltip，不弹卡打断视线）。悬停项目行 250ms 弹出该项目终端区的**微缩布局拼图**：按 SplitNode 树复现真实分屏比例，浮层固定宽度永不超屏，与切过去看到的所见即所得；打开期间 500ms 重画，预览是活的。实现为读取终端 grid 自绘微缩位图——与主终端同一条渲染链路取格子内容（同色 run 提取、粗体标准色亮化、256 色 / truecolor 解析），按 cell 网格绘制位图再等比缩放，隐藏 pane 的内容照样实时可得。每个分屏叶子显示当前 tab 的画面（左下锚定，保住最新输出与 TUI 输入区），隐藏 tab 以「+N」徽章示数并附其中最高优先级的状态点（error > ai-working > ai-idle，与状态聚合同口径）——藏在非激活 tab 里的 AI 状态不漏报；未起 PTY 的 pane 显示「未启动」占位（项目绝对路径在卡头可见）。**非激活的 pane tab** 悬停 250ms 同样弹单格缩略图浮层（同一渲染链路，打开期间 500ms 重画；未启动占位与远程断线遮罩同口径），且**不做 AI 开闸**——隐藏 tab 的内容不切过去本来就看不见，预览回答的就是「那个 tab 里现在是什么」。触发时序与项目行预览同一套，移出/点击/右键/滚动即关；卡片钳制左右边界，底部分屏放不下时翻到 tab 上方
 - **拖拽添加项目** — 从资源管理器拖拽文件夹到项目列表即可快速添加，自动识别文件 / 文件夹 / 重复项目并给出视觉反馈
 - **添加项目即打开** — 弹窗、分组右键、拖目录进列表、添加远程项目、Worktree「设为项目」五条入口添加完都直接切到新项目并用默认 shell 开好第一个终端；路径撞上既有项目时只切过去不重复添加，已有终端的项目不再多开。手动点项目切换仍不自动补终端——用户自己关光的空态是有意的
@@ -207,7 +208,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1850 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1866 个 Rust 测试**（29 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -348,7 +349,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（29 个测试目标、1850 例）
+# 全工作区 Rust 测试（29 个测试目标、1866 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
