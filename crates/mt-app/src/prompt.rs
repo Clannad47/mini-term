@@ -105,10 +105,20 @@ where
     let on_close = Rc::new(on_close);
     window.open_dialog(cx, move |dialog, window, cx| {
         let on_close = on_close.clone();
+        // on_ok 垫在 build **之前**,设了自己 on_ok 的弹窗(prompt / confirm /
+        // 重命名…)照常覆盖;没设的(设置 / SSH / 移动端这类面板)回车就什么都
+        // 不发生。gpui-component 0.6 把 `on_ok` 的默认值从「无」改成了
+        // 「返回 true」(`dialog.rs:46`),而 Enter 在 `Dialog` 上下文里绑的是
+        // `Confirm`、单行输入框的 enter 处理器又以 `cx.propagate()` 收尾 ——
+        // 三条凑一起,0.5.1 靠「没 on_ok 就不处理」白嫖的行为在 0.6 变成
+        // 「输入框里一回车整个面板关掉」(添加远程项目那条更糟:窗关了、
+        // 回车标志等下一帧 builder 消费却再也没有下一帧,路径静默丢失)。
+        // Esc 走 `on_cancel`,默认仍关窗,不受影响。
+        //
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
         // close_button 一律关掉,判据见 [`dialog_title`] 的注释。
-        build(dialog, window, cx)
+        build(dialog.on_ok(|_, _, _| false), window, cx)
             .close_button(false)
             .on_close(move |_: &ClickEvent, window, cx| {
                 overlay::pop(overlay::key(kind));
@@ -223,7 +233,9 @@ pub fn is_open(kind: &'static str) -> bool {
 /// 焦点落到输入框后,Esc / 回车照旧管用:单行 `InputState` 的 `escape` /
 /// `enter` 处理器都以 `cx.propagate()` 收尾(注释原话 "e.g.: In a dialog to
 /// confirm"),动作继续沿 dispatch tree 冒到外层 Dialog 的 `Cancel` / `Confirm`。
-/// 唯一会吞掉 Esc 的是 `clean_on_escape`,本仓一处没用。
+/// 唯一会吞掉 Esc 的是 `clean_on_escape`,本仓一处没用。回车冒上去之后
+/// 关不关窗由 `on_ok` 说了算 —— 没设的一律不关([`open_guarded`] 垫的默认值),
+/// 面板型弹窗里回车才不会把整个面板收掉。
 pub fn autofocus(input: &Entity<InputState>, window: &mut Window, cx: &mut App) {
     let input = input.clone();
     window.defer(cx, move |window, cx| {
@@ -390,6 +402,10 @@ pub fn show_alert(
             .w(px(360.0))
             .footer(confirm_footer(t("prompt", "ok"), None::<SharedString>))
             .child(body(&message, &[]))
+            // 「知道了」按钮与回车都派发 `Confirm`,要它关窗就得显式说:
+            // `open_guarded` 已把默认 on_ok 垫成「不关」(0.5.1 这条是靠
+            // `has_footer` 分支关的)
+            .on_ok(|_, _, _| true)
     });
 }
 
