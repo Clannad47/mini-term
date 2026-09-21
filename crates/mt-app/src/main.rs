@@ -79,6 +79,7 @@ mod image_lightbox;
 mod logfile;
 mod markers;
 mod menu;
+mod mermaid_compat;
 mod mobile_panel;
 mod mobile_relay;
 mod modal;

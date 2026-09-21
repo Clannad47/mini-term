@@ -2318,7 +2318,8 @@ fn render_mermaid_image(
 /// Mermaid 文本 → SVG 字符串。走三段式管线而不是一把梭的 `render`,是为了
 /// 在排版结果上判空(见 [`MERMAID_EMPTY_CANVAS`])与截住它自己的「语法错误」
 /// 炸弹图(`DiagramData::Error`,mermaid.js 那张 bomb 图的复刻)—— 两种都退回
-/// 代码块,比画一张看不出所以然的图强。
+/// 代码块,比画一张看不出所以然的图强;解析与排版之间还垫了一层
+/// [`crate::mermaid_compat`],把渲染器与 mermaid.js 不一致的几处掰回来。
 fn render_mermaid_svg(key: &MermaidKey) -> Result<String, MermaidError> {
     use mermaid_rs_renderer::layout::DiagramData;
     use mermaid_rs_renderer::{
@@ -2332,15 +2333,17 @@ fn render_mermaid_svg(key: &MermaidKey) -> Result<String, MermaidError> {
     };
     theme.background = format!("#{:06X}", key.background);
     let config = LayoutConfig::default();
-    let parsed =
+    let mut parsed =
         parse_mermaid_strict(&key.code).map_err(|err| MermaidError(err.to_string().into()))?;
-    let layout = compute_layout(&parsed.graph, &theme, &config);
+    let compat = crate::mermaid_compat::Compat::apply(&mut parsed.graph);
+    let mut layout = compute_layout(&parsed.graph, &theme, &config);
     if let DiagramData::Error(error) = &layout.diagram {
         return Err(MermaidError(error.message.clone().into()));
     }
     if layout.width <= MERMAID_EMPTY_CANVAS && layout.height <= MERMAID_EMPTY_CANVAS {
         return Err(MermaidError(t("fileViewer", "mermaidEmptyDiagram").into()));
     }
+    compat.restore(&mut layout);
     Ok(render_svg(&layout, &theme, &config))
 }
 
