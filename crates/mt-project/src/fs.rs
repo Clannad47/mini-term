@@ -534,7 +534,99 @@ pub fn copy_entry(
         .map(strip_verbatim_prefix)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
     let source = verify_under_project_root(project_root, source, true)?;
-    let source_meta = fs::symlink_metadata(&source)
+    copy_entry_from_verified_source(&root, &source, project_root, destination, policy)
+}
+
+/// 从系统文件管理器导入一个文件或目录到项目内。
+///
+/// 源路径可以位于项目根之外,但目标路径必须位于项目根内。源条目及其
+/// 子树中的符号链接/特殊文件仍然拒绝,避免外部拖放跟随不透明的文件系统对象。
+pub fn copy_external_entry(
+    project_root: &Path,
+    source: &Path,
+    destination: &Path,
+    policy: CopyConflictPolicy,
+) -> Result<PathBuf> {
+    let root = project_root
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
+    let source = resolve_external_source(source)?;
+    copy_entry_from_verified_source(&root, &source, project_root, destination, policy)
+}
+/// 批量导入的结果统计。逐个条目独立处理,单条失败不放弃其余条目。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalCopySummary {
+    /// 已复制到目标的条目数。
+    pub completed: usize,
+    /// 落盘前源条目已消失 / 没有可用文件名 —— 没有可复制的对象,不算失败。
+    pub skipped: usize,
+    /// 复制失败的条目数。
+    pub failed: usize,
+    /// 逐条明细(`路径: 原因`),顺序与 `sources` 一致。
+    pub warnings: Vec<String>,
+}
+
+/// 批量从系统文件管理器导入条目到项目内,每个条目保留原文件名。
+///
+/// 目标目录必须已经在项目根内 —— 这一层不过关是整批的错,直接返回 `Err`;
+/// 单条失败只累加进 [`ExternalCopySummary`],后续条目照常处理(拖进来一批
+/// 文件时,一个坏条目不该吞掉其余全部)。同名条目按 `policy` 处理,
+/// `KeepBoth` 生成 ` copy` 后缀的新名字。
+pub fn copy_external_entries(
+    project_root: &Path,
+    sources: &[PathBuf],
+    target_dir: &Path,
+    policy: CopyConflictPolicy,
+) -> Result<ExternalCopySummary> {
+    let target_dir = verify_under_project_root(project_root, target_dir, true)?;
+    if !target_dir.is_dir() {
+        bail!("目标不是目录: {}", target_dir.display());
+    }
+
+    let mut summary = ExternalCopySummary::default();
+    for source in sources {
+        let Some(name) = source.file_name().map(|name| name.to_os_string()) else {
+            summary.skipped += 1;
+            summary
+                .warnings
+                .push(format!("已跳过没有文件名的条目: {}", source.display()));
+            continue;
+        };
+        match fs::symlink_metadata(source) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                summary.skipped += 1;
+                summary
+                    .warnings
+                    .push(format!("已跳过已消失的条目: {}", source.display()));
+                continue;
+            }
+            Err(e) => {
+                summary.failed += 1;
+                summary.warnings.push(format!("{}: {e}", source.display()));
+                continue;
+            }
+        }
+        match copy_external_entry(project_root, source, &target_dir.join(&name), policy) {
+            Ok(_) => summary.completed += 1,
+            Err(e) => {
+                summary.failed += 1;
+                summary.warnings.push(format!("{}: {e:#}", source.display()));
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn copy_entry_from_verified_source(
+    root: &Path,
+    source: &Path,
+    project_root: &Path,
+    destination: &Path,
+    policy: CopyConflictPolicy,
+) -> Result<PathBuf> {
+    let source_meta = fs::symlink_metadata(source)
         .with_context(|| format!("读取源条目失败: {}", source.display()))?;
     if source == root {
         bail!("不能复制项目根目录");
@@ -548,7 +640,7 @@ pub fn copy_entry(
 
     let requested_target = verify_under_project_root(project_root, destination, false)?;
     let requested_exists = path_entry_exists(&requested_target)?;
-    ensure_copyable_tree(&source, &source_meta)?;
+    ensure_copyable_tree(source, &source_meta)?;
 
     if policy == CopyConflictPolicy::KeepBoth {
         let mut target = if requested_exists {
@@ -557,12 +649,10 @@ pub fn copy_entry(
             requested_target.clone()
         };
         loop {
-            validate_copy_target(&root, &source, source_meta.is_dir(), &target)?;
-            match copy_entry_to_new(&source, &source_meta, &target) {
+            validate_copy_target(root, source, source_meta.is_dir(), &target)?;
+            match copy_entry_to_new(source, &source_meta, &target) {
                 Ok(()) => return Ok(target),
                 Err(e) if error_is_already_exists(&e) => {
-                    // 列目录/选名之后的竞态由排他创建裁决;被抢占就重新生成
-                    // 下一后缀,不能把并发者的条目静默覆盖掉。
                     target = keep_both_path(&requested_target, source_meta.is_dir())?;
                 }
                 Err(e) => return Err(e),
@@ -570,21 +660,43 @@ pub fn copy_entry(
         }
     }
 
-    validate_copy_target(&root, &source, source_meta.is_dir(), &requested_target)?;
+    validate_copy_target(root, source, source_meta.is_dir(), &requested_target)?;
     if path_entry_exists(&requested_target)? {
-        overwrite_entry(&source, &source_meta, &requested_target)?;
+        overwrite_entry(source, &source_meta, &requested_target)?;
     } else {
-        match copy_entry_to_new(&source, &source_meta, &requested_target) {
+        match copy_entry_to_new(source, &source_meta, &requested_target) {
             Ok(()) => {}
             Err(e) if error_is_already_exists(&e) => {
-                // 预检后出现的新冲突仍遵循 Overwrite,而不是随机报
-                // AlreadyExists。
-                overwrite_entry(&source, &source_meta, &requested_target)?;
+                overwrite_entry(source, &source_meta, &requested_target)?;
             }
             Err(e) => return Err(e),
         }
     }
     Ok(requested_target)
+}
+
+fn resolve_external_source(source: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("读取源条目失败: {}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("不支持复制符号链接: {}", source.display());
+    }
+    let parent = source
+        .parent()
+        .ok_or_else(|| anyhow!("无法获取源路径父目录: {}", source.display()))?
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("源路径父目录不可访问: {}: {}", source.display(), e))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| anyhow!("缺少源文件名: {}", source.display()))?;
+    let resolved = parent.join(name);
+    let resolved_metadata = fs::symlink_metadata(&resolved)
+        .with_context(|| format!("读取源条目失败: {}", source.display()))?;
+    if resolved_metadata.file_type().is_symlink() {
+        bail!("不支持复制符号链接: {}", source.display());
+    }
+    Ok(resolved)
 }
 
 fn validate_copy_target(
@@ -1545,6 +1657,203 @@ mod tests {
         );
         assert!(operation_artifacts(&root).is_empty());
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_external_entries_imports_multiple_files_and_keeps_sources() {
+        let (root, _) = make_test_project();
+        let sources = root.join("outside-sources");
+        let target = root.join("target");
+        fs::create_dir_all(&sources).unwrap();
+        fs::create_dir(&target).unwrap();
+        let first = sources.join("first.txt");
+        let second = sources.join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+
+        let summary = copy_external_entries(
+            &root,
+            &[first.clone(), second.clone()],
+            &target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.warnings.is_empty());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert_eq!(fs::read_to_string(target.join("first.txt")).unwrap(), "first");
+        assert_eq!(fs::read_to_string(target.join("second.txt")).unwrap(), "second");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 一个坏条目不该吞掉整批:失败的那条记进统计,后面的照常复制。
+    #[cfg(unix)]
+    #[test]
+    fn copy_external_entries_keeps_going_after_a_failed_entry() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _) = make_test_project();
+        let sources = root.join("outside-sources");
+        let target = root.join("target");
+        fs::create_dir_all(&sources).unwrap();
+        fs::create_dir(&target).unwrap();
+        let first = sources.join("first.txt");
+        fs::write(&first, "first").unwrap();
+        // 含符号链接的目录会被整条拒绝(见 `ensure_copyable_tree`)。
+        let hostile = sources.join("hostile");
+        fs::create_dir_all(&hostile).unwrap();
+        fs::write(hostile.join("ok.txt"), "ok").unwrap();
+        symlink(hostile.join("ok.txt"), hostile.join("link.txt")).unwrap();
+        let last = sources.join("last.txt");
+        fs::write(&last, "last").unwrap();
+
+        let summary = copy_external_entries(
+            &root,
+            &[first.clone(), hostile, last.clone()],
+            &target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.warnings.len(), 1);
+        assert!(summary.warnings[0].contains("符号链接"));
+        assert_eq!(fs::read_to_string(target.join("first.txt")).unwrap(), "first");
+        assert_eq!(fs::read_to_string(target.join("last.txt")).unwrap(), "last");
+        assert!(
+            fs::symlink_metadata(target.join("hostile")).is_err(),
+            "整条拒绝的目录不该留下半成品"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 拖起之后、松手之前源文件被删掉:算跳过而不是失败,其余条目照常。
+    #[test]
+    fn copy_external_entries_skips_sources_that_vanished() {
+        let (root, _) = make_test_project();
+        let sources = root.join("outside-sources");
+        let target = root.join("target");
+        fs::create_dir_all(&sources).unwrap();
+        fs::create_dir(&target).unwrap();
+        let kept = sources.join("kept.txt");
+        fs::write(&kept, "kept").unwrap();
+        let vanished = sources.join("vanished.txt");
+
+        let summary = copy_external_entries(
+            &root,
+            &[vanished, kept.clone()],
+            &target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(fs::read_to_string(target.join("kept.txt")).unwrap(), "kept");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_external_entry_keeps_both_when_target_name_exists() {
+        let (root, _) = make_test_project();
+        let source_dir = root.join("external");
+        let target_dir = root.join("target");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let source = source_dir.join("note.txt");
+        fs::write(&source, "new").unwrap();
+        fs::write(target_dir.join("note.txt"), "old").unwrap();
+
+        let copied = copy_external_entry(
+            &root,
+            &source,
+            &target_dir.join("note.txt"),
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+
+        assert_eq!(copied, target_dir.join("note copy.txt"));
+        assert_eq!(fs::read_to_string(target_dir.join("note.txt")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "new");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_external_entry_rejects_destination_outside_project() {
+        let (root, _) = make_test_project();
+        let outside = std::env::temp_dir().join(format!(
+            "mini-term-fs-external-copy-outside-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("source.txt");
+        fs::write(&source, "source").unwrap();
+
+        assert!(copy_external_entry(
+            &root,
+            &source,
+            &outside.join("copied.txt"),
+            CopyConflictPolicy::KeepBoth,
+        )
+        .is_err());
+        assert!(source.exists());
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// 需求本体:源可以完全在项目根之外(系统文件管理器拖进来的路径都是这样),
+    /// 目标仍在项目根内。旧口径(`copy_entry` 要求源也在项目根内)在这里会报
+    /// 「路径不在项目根目录内」。
+    #[test]
+    fn copy_external_entry_accepts_source_outside_project_root() {
+        let (root, _) = make_test_project();
+        let outside = std::env::temp_dir().join(format!(
+            "mini-term-fs-external-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = outside.join("pkg");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("deep.txt"), "deep").unwrap();
+        let loose = outside.join("loose.txt");
+        fs::write(&loose, "loose").unwrap();
+        let target = root.join("imported");
+        fs::create_dir(&target).unwrap();
+
+        let summary = copy_external_entries(
+            &root,
+            &[loose.clone(), nested.clone()],
+            &target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 2);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert_eq!(
+            fs::read_to_string(target.join("loose.txt")).unwrap(),
+            "loose"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("pkg").join("deep.txt")).unwrap(),
+            "deep"
+        );
+        assert!(
+            loose.exists() && nested.join("deep.txt").exists(),
+            "源条目必须原样保留(复制不是移动)"
+        );
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

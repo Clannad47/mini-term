@@ -76,7 +76,7 @@ use menu::{background_menu, file_menu, header_action_capabilities, mod_label};
 use move_to::MoveSource;
 use ops::{
     choose_upload_paths, confirm_move, new_entry_prompt, paste_file_clipboard, start_download,
-    start_upload,
+    start_external_copy, start_upload,
 };
 
 /// 拖拽悬停命中的落点(高亮用)。资源管理器拖进来的上传与树内拖拽移动共用:
@@ -1829,15 +1829,37 @@ impl Render for FileTree {
                             let Some(context) = drop_context.clone() else {
                                 return;
                             };
-                            // listener 里 FileTree 正被 update,start_upload 一进门就
-                            // tree.read 会 double-lease panic;且此刻栈在 OLE Drop 的
-                            // COM 回调上,panic 不可展开、整个进程直接 abort。defer 到
-                            // 租约释放后再跑。
                             let tree = cx.entity();
                             let target = drop_target.clone();
                             let paths = paths.paths().to_vec();
                             window.defer(cx, move |window, cx| {
                                 start_upload(tree, context, target, paths, window, cx);
+                            });
+                        },
+                    ))
+                })
+                .when(!is_remote, |el| {
+                    let move_target = background_target.clone();
+                    let drop_target = background_target.clone();
+                    let move_id = background_drop_id.clone();
+                    let drop_context = background_context.clone();
+                    el.on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                            this.note_external_drop_target(&move_id, &move_target, event, cx);
+                        },
+                    ))
+                    .on_drop(cx.listener(
+                        move |this, paths: &ExternalPaths, window, cx| {
+                            this.drop_target = None;
+                            cx.notify();
+                            let Some(context) = drop_context.clone() else {
+                                return;
+                            };
+                            let tree = cx.entity();
+                            let target = drop_target.clone();
+                            let paths = paths.paths().to_vec();
+                            window.defer(cx, move |window, cx| {
+                                start_external_copy(tree, context, target, paths, window, cx);
                             });
                         },
                     ))
@@ -2153,13 +2175,37 @@ impl FileTree {
                         let Some(context) = drop_context.clone() else {
                             return;
                         };
-                        // 同背景落点:实体租约未释放前不能进 start_upload(double-lease
-                        // 会在 COM 拖放栈上 abort),defer 一拍。
                         let tree = cx.entity();
                         let target = drop_target.clone();
                         let paths = paths.paths().to_vec();
                         window.defer(cx, move |window, cx| {
                             start_upload(tree, context, target, paths, window, cx);
+                        });
+                    },
+                ))
+            })
+            .when(!remote, |el| {
+                let move_target = upload_target.clone();
+                let drop_target = upload_target.clone();
+                let move_id = row_drop_id.clone();
+                let drop_context = drop_context.clone();
+                el.on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                        this.note_external_drop_target(&move_id, &move_target, event, cx);
+                    },
+                ))
+                .on_drop(cx.listener(
+                    move |this, paths: &ExternalPaths, window, cx| {
+                        this.drop_target = None;
+                        cx.notify();
+                        let Some(context) = drop_context.clone() else {
+                            return;
+                        };
+                        let tree = cx.entity();
+                        let target = drop_target.clone();
+                        let paths = paths.paths().to_vec();
+                        window.defer(cx, move |window, cx| {
+                            start_external_copy(tree, context, target, paths, window, cx);
                         });
                     },
                 ))

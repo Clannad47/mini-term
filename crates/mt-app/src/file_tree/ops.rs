@@ -591,6 +591,68 @@ pub(super) fn start_upload(
         .detach();
 }
 
+/// 将系统文件管理器拖入的本地条目批量复制到文件树目标目录。
+///
+/// 外部源路径不要求属于项目根;目标目录仍由 `mt-project` 做项目根校验。
+pub(super) fn start_external_copy(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    target_dir: PathBuf,
+    sources: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if sources.is_empty()
+        || tree.read(cx).operation_context(cx).as_ref() != Some(&context)
+        || !matches!(&context.backend, FileBackendIdentity::Local)
+    {
+        return;
+    }
+    let root = context.root.clone();
+    let destination = target_dir.clone();
+    spawn_tree_op(
+        tree,
+        context,
+        Some(target_dir),
+        true,
+        None,
+        t("fileTree", "operation.copying").into(),
+        move || {
+            let summary = mt_project::fs::copy_external_entries(
+                &root,
+                &sources,
+                &destination,
+                mt_project::fs::CopyConflictPolicy::KeepBoth,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            Ok(external_copy_summary(&summary))
+        },
+        window,
+        cx,
+    );
+}
+
+/// 拖入的条目全部复制成功时**不弹窗** —— 目标目录会在操作结束后展开并重列,
+/// 新条目本身就是反馈(与「粘贴」同一条口径)。有跳过/失败才汇总一句,
+/// 逐条明细跟在后面。
+fn external_copy_summary(summary: &mt_project::fs::ExternalCopySummary) -> Option<String> {
+    if summary.failed == 0 && summary.skipped == 0 {
+        return None;
+    }
+    let mut text = tr!(
+        "fileTree",
+        "operation.summary",
+        completed = summary.completed,
+        skipped = summary.skipped,
+        failed = summary.failed
+    );
+    if !summary.warnings.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&summary.warnings.join("\n"));
+    }
+    Some(text)
+}
+
 pub(super) fn choose_upload_paths(
     tree: Entity<FileTree>,
     context: FileOperationContext,
