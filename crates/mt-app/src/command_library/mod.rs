@@ -233,28 +233,30 @@ const fn cu(v: f32) -> f32 {
 }
 const STROKE: f32 = 1.3 / 16.0;
 
-/// 控制条上的「命令」钮:圆角框里一个 `>_` 提示符。
+/// 控制条上的「命令」钮:「播放列表」——三条横线 + 右下角一枚实心 ▶。
+///
+/// 第一版画的是圆角框里的 `>_`,与右缘「终端面板」那颗几乎同形,用户点名换掉;
+/// 「一列可以跑的东西」正是这个功能本身,而且簇里其余图标都是线框,实心三角
+/// 一眼能分出来。
 pub const ICON_COMMANDS: &[Shape] = &[
     Shape::line(
         Ink::Current,
         STROKE,
-        Geom::Rect {
-            x: cu(1.5),
-            y: cu(3.0),
-            w: cu(13.0),
-            h: cu(10.0),
-            round: cu(1.5),
-        },
+        Geom::Polyline(&[(cu(2.0), cu(4.0)), (cu(14.0), cu(4.0))]),
     ),
     Shape::line(
         Ink::Current,
         STROKE,
-        Geom::Polyline(&[(cu(4.5), cu(6.0)), (cu(7.0), cu(8.0)), (cu(4.5), cu(10.0))]),
+        Geom::Polyline(&[(cu(2.0), cu(8.0)), (cu(14.0), cu(8.0))]),
     ),
     Shape::line(
         Ink::Current,
         STROKE,
-        Geom::Polyline(&[(cu(8.5), cu(10.0)), (cu(11.5), cu(10.0))]),
+        Geom::Polyline(&[(cu(2.0), cu(12.0)), (cu(8.0), cu(12.0))]),
+    ),
+    Shape::fill(
+        Ink::Current,
+        Geom::Polygon(&[(cu(10.5), cu(9.5)), (cu(14.5), cu(12.0)), (cu(10.5), cu(14.5))]),
     ),
 ];
 
