@@ -256,7 +256,11 @@ pub const ICON_COMMANDS: &[Shape] = &[
     ),
     Shape::fill(
         Ink::Current,
-        Geom::Polygon(&[(cu(10.5), cu(9.5)), (cu(14.5), cu(12.0)), (cu(10.5), cu(14.5))]),
+        Geom::Polygon(&[
+            (cu(10.5), cu(9.5)),
+            (cu(14.5), cu(12.0)),
+            (cu(10.5), cu(14.5)),
+        ]),
     ),
 ];
 
