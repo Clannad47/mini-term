@@ -34,14 +34,15 @@ use std::collections::HashMap;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Task,
-    Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
+    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, ShellIcon, ShellKind, VectorIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::branch_family;
+use crate::command_library::{self, CommandPopover, PopoverEvent};
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
 use crate::markers;
@@ -191,6 +192,17 @@ pub struct TerminalArea {
     /// 点一下终端才能继续 —— 与 `pane.rs::dismiss_search` 那句 `window.focus` 同一条红线
     /// (原版这个浮层压根不收焦点,所以没有这个问题)。
     marker_prev_focus: Option<FocusHandle>,
+    /// 命令库浮层(issue #81)本体。**懒建、常驻**:分组折叠态要跨次打开记住,
+    /// 而且它自带一个 `InputState`,每次开都重建等于每次都丢焦点句柄。
+    cmd_popover: Option<Entity<CommandPopover>>,
+    /// 命令库浮层开在哪个 pane 上:`(project_id, pane_id, pty_id)`。`None` = 没开。
+    /// 存活判据与 marker 浮层同一条([`marker_popover_alive`]):切 tab / 关 pane
+    /// 就无条件关。
+    cmd_open: Option<(String, String, u32)>,
+    /// 开命令库浮层前焦点在谁身上(理由同 [`Self::marker_prev_focus`])。
+    cmd_prev_focus: Option<FocusHandle>,
+    /// 对浮层事件的订阅(Close / Edit / NewGroup / RenameGroup)。
+    _cmd_sub: Option<Subscription>,
     /// 正拖着文件悬停在哪个 pane 上(文件树的 `DragFilePath` 与系统的
     /// `ExternalPaths` 共用)。`on_drop` 不带位置,高亮只能从这里来。
     file_drop_pane: Option<String>,
@@ -319,28 +331,42 @@ enum AreaExitSrc {
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离(最大化钮不在场时)。
 ///
-/// 簇是 `.gap(2).px(6)` 后跟四个 22×22 的方钮(终端内查找 / 分屏右 / 分屏下 /
-/// 关整组,与原版 `PaneGroup.tsx:489-541` 同序),marker 按钮排在它们之前,
-/// 自己还带 4px 右外边距(原版的 `mr-1`)。查找按钮与 marker 按钮同以
-/// 「pane 有 pty」为前提 —— 凡是 marker 浮层要用这个锚点的场景四钮必然齐。
+/// 簇是 `.gap(2).px(6)` 后跟五个 22×22 的方钮(终端内查找 / 命令库 / 分屏右 /
+/// 分屏下 / 关整组,前四颗与原版 `PaneGroup.tsx:489-541` 同序,命令库钮是
+/// issue #81 加的),marker 按钮排在它们之前,自己还带 4px 右外边距(原版的
+/// `mr-1`)。查找、命令库与 marker 三颗同以「pane 有 pty」为前提 —— 凡是
+/// marker 浮层要用这个锚点的场景五钮必然齐。
 /// 原版是 `getBoundingClientRect()` 量出来的,这里由布局常量算 ——
 /// 加减控件时**必须同步改这个常量**,有单测钉着组成。
 const MARKER_ANCHOR_INSET: f32 =
-    CTRL_CLUSTER_PAD + 4.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
+    CTRL_CLUSTER_PAD + 5.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
 const CTRL_CLUSTER_PAD: f32 = 6.0;
 const CTRL_BTN: f32 = 22.0;
 const CTRL_GAP: f32 = 2.0;
 const MARKER_BTN_MARGIN_RIGHT: f32 = 4.0;
 
+/// 命令库钮**右缘**到叶子右边缘的距离(最大化钮不在场时):它右边还有
+/// 分屏右 / 分屏下 / 关整组三颗。浮层的右缘对齐这颗钮的右缘。
+const CMD_ANCHOR_INSET: f32 = CTRL_CLUSTER_PAD + 3.0 * (CTRL_BTN + CTRL_GAP);
+
 /// marker 锚点的实际内缩。**最大化钮是条件出现的**(只有真分了屏才画,
-/// `PaneGroup.tsx:686` 的 `layoutIsSplit || isMaximized`),在场时簇里就是五个
-/// 方钮而不是四个,锚点要多让出一颗的宽度 —— 原版量 DOM 天然不会错,这边
+/// `PaneGroup.tsx:686` 的 `layoutIsSplit || isMaximized`),在场时簇里就是六个
+/// 方钮而不是五个,锚点要多让出一颗的宽度 —— 原版量 DOM 天然不会错,这边
 /// 靠常量算就必须显式分档。
 fn marker_anchor_inset(has_maximize: bool) -> f32 {
     if has_maximize {
         MARKER_ANCHOR_INSET + CTRL_BTN + CTRL_GAP
     } else {
         MARKER_ANCHOR_INSET
+    }
+}
+
+/// 命令库钮锚点的实际内缩,分档理由同 [`marker_anchor_inset`]。
+fn cmd_anchor_inset(has_maximize: bool) -> f32 {
+    if has_maximize {
+        CMD_ANCHOR_INSET + CTRL_BTN + CTRL_GAP
+    } else {
+        CMD_ANCHOR_INSET
     }
 }
 
@@ -783,6 +809,10 @@ impl TerminalArea {
             marker_open: None,
             marker_focus: cx.focus_handle(),
             marker_prev_focus: None,
+            cmd_popover: None,
+            cmd_open: None,
+            cmd_prev_focus: None,
+            _cmd_sub: None,
             file_drop_pane: None,
             pane_enter: HashMap::new(),
             tab_focus: HashMap::new(),
@@ -950,6 +980,159 @@ impl TerminalArea {
             window.focus(&prev, cx);
         }
         cx.notify();
+    }
+
+    // ─── 命令库浮层(issue #81)────────────────────────────────
+
+    /// 开 / 关命令库浮层(按钮是 toggle;Ctrl+Shift+K 也走这里)。
+    ///
+    /// 开的一刻把目标 pane 交给浮层:命令要写进**打开时**的那个 pane,
+    /// 而不是运行那一刻的焦点 pane —— 浮层开着时焦点在它自己的搜索框上。
+    pub fn toggle_command_popover(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cmd_open.is_some() {
+            self.close_command_popover(window, cx);
+            return;
+        }
+        // 没 pty 的 pane 写不进命令,按钮也不会画 —— 只有快捷键能走到这里
+        let Some(pty_id) = self
+            .store
+            .read(cx)
+            .project_state(project_id)
+            .and_then(|s| s.pane(pane_id))
+            .and_then(|p| p.pty_id)
+        else {
+            return;
+        };
+        if !overlay::push(overlay::key(overlay::kind::COMMAND_LIBRARY)) {
+            return;
+        }
+        let popover = match self.cmd_popover.clone() {
+            Some(p) => p,
+            None => {
+                let store = self.store.clone();
+                let popover = cx.new(|cx| CommandPopover::new(store, window, cx));
+                self._cmd_sub =
+                    Some(cx.subscribe_in(&popover, window, Self::on_command_popover_event));
+                self.cmd_popover = Some(popover.clone());
+                popover
+            }
+        };
+        self.cmd_open = Some((project_id.to_string(), pane_id.to_string(), pty_id));
+        self.cmd_prev_focus = window.focused(cx);
+        let (pid, pane) = (project_id.to_string(), pane_id.to_string());
+        popover.update(cx, |popover, cx| popover.open_for(pid, pane, window, cx));
+        cx.notify();
+    }
+
+    /// 收起命令库浮层(幂等),焦点还回去。
+    pub fn close_command_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmd_open.take().is_none() {
+            return;
+        }
+        overlay::pop(overlay::key(overlay::kind::COMMAND_LIBRARY));
+        if let Some(prev) = self.cmd_prev_focus.take() {
+            window.focus(&prev, cx);
+        }
+        cx.notify();
+    }
+
+    /// 浮层要开弹窗时**先关浮层再开**:顺序反了,Dialog 抢到的焦点会被
+    /// [`Self::close_command_popover`] 的焦点还原覆盖掉(键落进终端而不是表单)。
+    ///
+    /// 「再开」还要**等一帧**:弹窗的毛玻璃背板抓的是 DWM 的上一帧
+    /// (`main.rs` 的 frost 段),同一轮里开的话浮层还没从屏幕上消失,会被一起
+    /// 糊进背景 —— 真机截到过一张带浮层残影的编辑弹窗。50ms 够两帧,肉眼无感。
+    fn on_command_popover_event(
+        &mut self,
+        _popover: &Entity<CommandPopover>,
+        event: &PopoverEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_command_popover(window, cx);
+        if matches!(event, PopoverEvent::Close) {
+            return;
+        }
+        let store = self.store.clone();
+        let event = event.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+            let _ = cx.update(|window, cx| match event {
+                PopoverEvent::Close => {}
+                PopoverEvent::Edit { existing, group } => {
+                    command_library::open_editor(store, existing, group, window, cx);
+                }
+                PopoverEvent::NewGroup => command_library::prompt_new_group(store, window, cx),
+                PopoverEvent::RenameGroup(name) => {
+                    command_library::prompt_rename_group(store, name, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 命令库浮层。层级与锚定套路照 [`Self::render_marker_popover`]:
+    /// `deferred(priority 1)` → 全窗透明遮罩(按下即关)→ `anchored(按钮下缘)`
+    /// → 面板实体。
+    fn render_command_popover(
+        &mut self,
+        layout: &SplitNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (_, pane_id, pty_id) = self.cmd_open.clone()?;
+        if !marker_popover_alive(layout, &pane_id, pty_id) {
+            self.close_command_popover(window, cx);
+            return None;
+        }
+        let popover = self.cmd_popover.clone()?;
+        let rect = self.pane_rects.get(&pane_id)?;
+        let inset = cmd_anchor_inset(matches!(layout, SplitNode::Split { .. }));
+        let panel_width = ui::font_px(command_library::popover::PANEL_WIDTH);
+        let anchor = point(
+            px(rect.left + rect.width - inset - f32::from(panel_width)),
+            px(rect.top + 2.0),
+        );
+
+        let size = window.viewport_size();
+        Some(
+            deferred(
+                anchored().position(point(px(0.0), px(0.0))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                this.close_command_popover(window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                this.close_command_popover(window, cx);
+                            }),
+                        )
+                        .child(
+                            anchored()
+                                .position(anchor)
+                                .snap_to_window_with_margin(px(4.0))
+                                .child(popover),
+                        ),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn split_state(&mut self, node_id: &str, cx: &mut App) -> Entity<ResizableState> {
@@ -2228,6 +2411,26 @@ impl TerminalArea {
                 }
             }))
         });
+        // 命令库(issue #81):与查找同一道「有 pty 才画」的闸 —— 没 pty 的 pane
+        // 命令写不进去。开着时钮常亮,提示「浮层就是从我这弹出来的」
+        let cmd_open_here = self
+            .cmd_open
+            .as_ref()
+            .is_some_and(|(_, pane, _)| *pane == active.id);
+        let pid_cmd = project_id.to_string();
+        let pane_cmd = active.id.clone();
+        let cmd_btn = active.pty_id.map(|_| {
+            ctrl_icon(
+                gpui::SharedString::from(format!("term-cmds-{leaf_id}")),
+                command_library::ICON_COMMANDS,
+            )
+            .when(cmd_open_here, |el| el.opacity(1.0).bg(ui::border_subtle()))
+            .tip(t("commandLibrary", "buttonTooltip"))
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                cx.stop_propagation();
+                this.toggle_command_popover(&pid_cmd, &pane_cmd, window, cx);
+            }))
+        });
         // ⚑ N:图标是**文本字符**,不是 SVG(与 menu.rs 的 `✓ ` 同一套理由);
         // 宽度不固定,所以不复用上面那个 22×22 的方钮。
         let marker_pty = active.pty_id.filter(|_| marker_count > 0);
@@ -2301,6 +2504,7 @@ impl TerminalArea {
             .px(px(CTRL_CLUSTER_PAD))
             .children(marker_btn)
             .children(search_btn)
+            .children(cmd_btn)
             .children(maximize_btn)
             .child(
                 ctrl_icon(
@@ -3274,6 +3478,9 @@ impl Render for TerminalArea {
         if self.marker_open.is_some() && self.store.read(cx).active_layout().is_none() {
             self.close_marker_popover(window, cx);
         }
+        if self.cmd_open.is_some() && self.store.read(cx).active_layout().is_none() {
+            self.close_command_popover(window, cx);
+        }
 
         let store = self.store.read(cx);
         let Some(project) = store.active_project() else {
@@ -3676,6 +3883,7 @@ impl Render for TerminalArea {
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
+        let command_popover = self.render_command_popover(&layout, window, cx);
         let tab_preview = self.render_tab_preview(&layout, window, cx);
         let this = cx.entity();
         div()
@@ -3866,6 +4074,7 @@ impl Render for TerminalArea {
                 }
             }))
             .children(marker_popover)
+            .children(command_popover)
             // 非激活 tab 的悬停缩略图。卡不带 `.id()` → 无 hitbox → 不吃鼠标
             .children(tab_preview)
     }
@@ -4142,19 +4351,33 @@ mod tests {
     /// 加减控件时这条会提醒同步改 [`MARKER_ANCHOR_INSET`] / [`marker_anchor_inset`]。
     #[test]
     fn 标记浮层锚点按控件簇布局算() {
-        // 右侧簇:px-6 + 四个 22×22 方钮(查找/分屏右/分屏下/关整组,各带 2px gap)
-        // + marker 自己的 4px 右边距;查找钮与 marker 同以「有 pty」为前提,
-        // 浮层用到锚点时四钮必然齐
-        assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 4.0 * 24.0 + 4.0);
-        assert_eq!(MARKER_ANCHOR_INSET, 106.0);
-        assert_eq!(marker_anchor_inset(false), 106.0);
+        // 右侧簇:px-6 + 五个 22×22 方钮(查找/命令库/分屏右/分屏下/关整组,各带
+        // 2px gap)+ marker 自己的 4px 右边距;查找、命令库钮与 marker 同以
+        // 「有 pty」为前提,浮层用到锚点时五钮必然齐
+        assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 5.0 * 24.0 + 4.0);
+        assert_eq!(MARKER_ANCHOR_INSET, 130.0);
+        assert_eq!(marker_anchor_inset(false), 130.0);
         // 分了屏时簇里多一颗「最大化 / 还原」(22 + 2 gap),锚点跟着往左让
-        assert_eq!(marker_anchor_inset(true), 106.0 + 24.0);
-        assert_eq!(marker_anchor_inset(true), 130.0);
+        assert_eq!(marker_anchor_inset(true), 130.0 + 24.0);
+        assert_eq!(marker_anchor_inset(true), 154.0);
         // 面板右缘贴按钮右缘 → 左缘 = 叶右缘 - inset - 面板宽
         let leaf_right = 1000.0_f32;
         let left = leaf_right - marker_anchor_inset(false) - MARKER_PANEL_WIDTH;
-        assert_eq!(left, 1000.0 - 106.0 - 300.0);
+        assert_eq!(left, 1000.0 - 130.0 - 300.0);
+    }
+
+    /// 命令库钮的锚点:它右边只剩分屏右 / 分屏下 / 关整组三颗(+ 条件出现的最大化)。
+    #[test]
+    fn 命令库浮层锚点按控件簇布局算() {
+        assert_eq!(CMD_ANCHOR_INSET, 6.0 + 3.0 * 24.0);
+        assert_eq!(cmd_anchor_inset(false), 78.0);
+        assert_eq!(cmd_anchor_inset(true), 102.0);
+        // 命令库钮紧挨在查找钮右侧:两者右缘差正好一颗钮 + gap,marker 再往左
+        // 4px 边距 + 查找钮一颗
+        assert_eq!(
+            MARKER_ANCHOR_INSET - cmd_anchor_inset(false),
+            2.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT
+        );
     }
 
     /// 浮层里那些写死的像素尺寸**必须跟着界面字号一起缩放**。

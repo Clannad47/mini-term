@@ -10,11 +10,11 @@
 use crate::Namespace;
 
 /// 命名空间总数（生成器对账用，测试断言防漂移）
-pub const NAMESPACE_COUNT: usize = 32;
+pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 871;
+pub const ZH_ENTRY_COUNT: usize = 905;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 871;
+pub const EN_ENTRY_COUNT: usize = 905;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -113,6 +113,79 @@ static APP_EN: &[(&str, &str)] = &[
     ("update.badge", "New version {version}"),
     ("update.title", "New version {version} available, click to download"),
     ("wslOverride", "WSL project detected, launching terminal with wsl.exe ({path})"),
+];
+
+#[rustfmt::skip]
+static COMMAND_LIBRARY_ZH: &[(&str, &str)] = &[
+    ("addCommand", "新增命令"),
+    ("buttonTooltip", "命令库"),
+    ("cancel", "取消"),
+    ("confirmDelete", "确认删除"),
+    ("copied", "已复制"),
+    ("copy", "复制命令"),
+    ("delete", "删除"),
+    ("dissolveGroup", "解散分组（命令回到未分组）"),
+    ("edit", "编辑"),
+    ("editor.cancel", "取消"),
+    ("editor.commandHint", "运行时原样写进当前终端并回车"),
+    ("editor.commandLabel", "命令"),
+    ("editor.commandPlaceholder", "如：cd /opt/app && ./start.sh"),
+    ("editor.errorRequired", "名称和命令都不能为空"),
+    ("editor.groupHint", "输入新组名即新建分组；点右侧 ▾ 从已有分组里选"),
+    ("editor.groupLabel", "分组"),
+    ("editor.groupPlaceholder", "留空 = 未分组"),
+    ("editor.nameLabel", "名称"),
+    ("editor.namePlaceholder", "如：启动服务"),
+    ("editor.save", "保存"),
+    ("editor.titleEdit", "编辑命令"),
+    ("editor.titleNew", "新增命令"),
+    ("empty", "还没有保存的命令"),
+    ("emptyHint", "点下方「新增命令」保存第一条，以后一点就跑"),
+    ("footerHint", "↵ 运行 · Ctrl+↵ 只粘贴不回车"),
+    ("group.newPlaceholder", "分组名"),
+    ("group.newTitle", "新建分组"),
+    ("group.renameTitle", "重命名分组"),
+    ("newGroup", "新建分组"),
+    ("noMatch", "没有匹配的命令"),
+    ("renameGroup", "重命名分组"),
+    ("searchPlaceholder", "搜索命令…"),
+    ("ungrouped", "未分组"),
+];
+#[rustfmt::skip]
+static COMMAND_LIBRARY_EN: &[(&str, &str)] = &[
+    ("addCommand", "Add command"),
+    ("buttonTooltip", "Command library"),
+    ("cancel", "Cancel"),
+    ("confirmDelete", "Confirm delete"),
+    ("copied", "Copied"),
+    ("copy", "Copy command"),
+    ("delete", "Delete"),
+    ("dissolveGroup", "Dissolve group (commands become ungrouped)"),
+    ("edit", "Edit"),
+    ("editor.cancel", "Cancel"),
+    ("editor.commandHint", "Typed into the focused terminal as-is, followed by Enter"),
+    ("editor.commandLabel", "Command"),
+    ("editor.commandPlaceholder", "e.g. cd /opt/app && ./start.sh"),
+    ("editor.errorRequired", "Name and command are both required"),
+    ("editor.groupHint", "Type a new name to create a group; click ▾ to pick an existing one"),
+    ("editor.groupLabel", "Group"),
+    ("editor.groupPlaceholder", "Leave empty for ungrouped"),
+    ("editor.nameLabel", "Name"),
+    ("editor.namePlaceholder", "e.g. Start service"),
+    ("editor.save", "Save"),
+    ("editor.titleEdit", "Edit Command"),
+    ("editor.titleNew", "Add Command"),
+    ("empty", "No saved commands yet"),
+    ("emptyHint", "Click \"Add command\" below to save your first one; run it with a single click later"),
+    ("footerHint", "↵ Run · Ctrl+↵ Paste without Enter"),
+    ("group.newPlaceholder", "Group name"),
+    ("group.newTitle", "New Group"),
+    ("group.renameTitle", "Rename Group"),
+    ("newGroup", "New group"),
+    ("noMatch", "No matching commands"),
+    ("renameGroup", "Rename group"),
+    ("searchPlaceholder", "Search commands…"),
+    ("ungrouped", "Ungrouped"),
 ];
 
 #[rustfmt::skip]
@@ -1244,6 +1317,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.aiTaskMarks", "AI 任务标记"),
     ("shortcuts.clipboard", "复制粘贴"),
     ("shortcuts.closePane", "关闭当前分屏区域"),
+    ("shortcuts.commandLibrary", "打开命令库"),
     ("shortcuts.copyDesc", "复制选中文本（无选区时中断程序）"),
     ("shortcuts.copySelected", "复制终端选中文本"),
     ("shortcuts.focusDown", "焦点移到下方分屏"),
@@ -1443,6 +1517,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.aiTaskMarks", "AI task markers"),
     ("shortcuts.clipboard", "Copy & paste"),
     ("shortcuts.closePane", "Close current pane"),
+    ("shortcuts.commandLibrary", "Open the command library"),
     ("shortcuts.copyDesc", "Copy selected text (interrupt program when no selection)"),
     ("shortcuts.copySelected", "Copy selected terminal text"),
     ("shortcuts.focusDown", "Focus pane below"),
@@ -1988,6 +2063,11 @@ pub static NAMESPACES: &[Namespace] = &[
         name: "app",
         zh: APP_ZH,
         en: APP_EN,
+    },
+    Namespace {
+        name: "commandLibrary",
+        zh: COMMAND_LIBRARY_ZH,
+        en: COMMAND_LIBRARY_EN,
     },
     Namespace {
         name: "commitDiff",

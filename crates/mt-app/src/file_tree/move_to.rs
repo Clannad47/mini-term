@@ -66,10 +66,10 @@ use super::ops::start_move;
 /// 列表区最大高度;超过就滚(与 `branch_family` 同一档)。
 const MAX_LIST_HEIGHT: f32 = 320.0;
 
-/// 子面板浮层的 `deferred` 优先级。菜单层自己是 1(`menu.rs` 那句
-/// `.with_priority(1)`),浮在它之上要更大 —— `paint_deferred_draws` 按 priority
-/// **稳定**排序(`window.rs:3682-3687`),同级才轮到「后压入的在上」。
-const PANEL_PRIORITY: usize = 2;
+/// 子面板浮层的 `deferred` 优先级。菜单层自己是 [`menu::MENU_PRIORITY`],浮在它
+/// 之上要更大 —— `paint_deferred_draws` 按 priority **稳定**排序
+/// (`window.rs:3682-3687`),同级才轮到「后压入的在上」。
+const PANEL_PRIORITY: usize = menu::MENU_PRIORITY + 1;
 
 /// 最深能展开到第几层(根面板是第 0 层)。
 ///

@@ -51,6 +51,7 @@ mod activity_bar;
 mod ai;
 mod branch_family;
 mod clipboard;
+mod command_library;
 mod date_picker;
 mod dnd;
 mod env_vars;
@@ -204,6 +205,8 @@ actions!(
         MarkerPrev,
         /// 跳到下一个 AI 任务标记(Ctrl+Shift+↓)
         MarkerNext,
+        /// 开合命令库浮层(Ctrl+Shift+K,issue #81)
+        ToggleCommandLibrary,
     ]
 );
 
@@ -1066,6 +1069,34 @@ impl Workspace {
         };
         let Some(pane) = pane else { return };
         pane.update(cx, |pane, cx| pane.open_search(window, cx));
+    }
+
+    /// Ctrl+Shift+K:开合命令库浮层(issue #81)。落在**当前焦点 pane** 上,
+    /// 与控制条那颗钮同一个入口(`TerminalArea::toggle_command_popover`)。
+    ///
+    /// toggle 的「关」这一半要排在 `yields_to_overlay` **之前**:浮层开着时它自己
+    /// 就在覆盖物栈里,先判让路的话第二次按永远关不掉(全局搜索那条踩过同一个坑)。
+    fn on_toggle_command_library(
+        &mut self,
+        _: &ToggleCommandLibrary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if overlay::is_top(overlay::key(overlay::kind::COMMAND_LIBRARY)) {
+            self.terminal_area.update(cx, |area, cx| {
+                area.close_command_popover(window, cx);
+            });
+            return;
+        }
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.terminal_area.update(cx, |area, cx| {
+            area.toggle_command_popover(&project_id, &pane_id, window, cx);
+        });
     }
 
     /// Ctrl+Shift+F:开合全局搜索。
@@ -1999,6 +2030,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_switch_project))
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))
+            .on_action(cx.listener(Self::on_toggle_command_library))
             // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
             // —— 等价于原版往 document 上挂 mousemove/mouseup
             .when(self.drawer_drag.is_some(), |el| {

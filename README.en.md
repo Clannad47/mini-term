@@ -61,6 +61,7 @@
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
+| **Command library** | The "Commands" button on the terminal control bar (or `Ctrl+Shift+K`) opens a global command library: save frequently used commands by group, click one to type it into the focused terminal and press Enter, `Ctrl+Enter` / `Ctrl+click` pastes without Enter so you can tweak arguments first; search, add, edit, delete and group right inside the popover. It is independent of projects and SSH connections — the same list on every machine |
 | **Global search** | `Ctrl+Shift+F` for filename or content search (a `/` in the query matches against the path), substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | On by default: copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly; large Windows pastes are chunked so ConPTY doesn't drop lines |

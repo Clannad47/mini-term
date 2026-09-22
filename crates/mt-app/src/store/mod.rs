@@ -53,6 +53,7 @@ use crate::persist;
 use crate::tree::{PaneState, PaneStatus, ProjectPanel, SplitNode};
 
 mod ai;
+mod commands;
 mod config_writer;
 mod layout;
 mod panes;
