@@ -31,8 +31,8 @@ use gpui::{App, KeyBinding, NoAction};
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
-    SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleMiddleColumn, ToggleSessions,
-    ToggleUsage, git_changes, project_switcher,
+    SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
+    ToggleSessions, ToggleUsage, command_library, git_changes, project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -279,6 +279,15 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         G_GLOBAL,
         "shortcuts.jumpAttention",
     ),
+    // 命令库(issue #81)。裸 Ctrl+K 在 bash 里是 kill-line,按开头的原则走 Ctrl+Shift
+    def(
+        "commandLibrary",
+        Some("ctrl-shift-k"),
+        combo(true, true, false, "K"),
+        Scope::Global,
+        G_GLOBAL,
+        "shortcuts.commandLibrary",
+    ),
     // ── AI 任务标记(`hotkeys.ts:73-74`)──
     //
     // 键名 `up`/`down` 与项目切换器那两条一致。原版这两条**不走 useGlobalHotkeys**
@@ -420,6 +429,29 @@ pub fn bind_keys(cx: &mut App) {
         Some("ProjectSwitcher > Input"),
     ));
 
+    // 命令库浮层的方向键 / Ctrl+↵(issue #81)。与项目切换器同一套理由:
+    // 弹窗内部键位不进表,谓词要与 `Input` 同深度才压得过它自带的 up/down。
+    bindings.push(KeyBinding::new(
+        "up",
+        command_library::popover::CommandLibraryPrev,
+        Some("CommandLibrary > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        command_library::popover::CommandLibraryNext,
+        Some("CommandLibrary > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-enter",
+        command_library::popover::CommandLibraryPasteOnly,
+        Some("CommandLibrary > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-enter",
+        command_library::popover::CommandLibraryPasteOnly,
+        Some("CommandLibrary > Input"),
+    ));
+
     // Git 提交框的 Ctrl/Cmd+Enter(`GitChanges.tsx:411-415`)。**不进快捷键表** ——
     // 原版它是 textarea 的 onKeyDown,不在 hotkeys.ts 里。谓词同上要与 `Input` 同深度。
     bindings.push(KeyBinding::new(
@@ -479,6 +511,7 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "toggleSessions" => KeyBinding::new(keystroke, ToggleSessions, Some(WORKSPACE)),
         "toggleUsage" => KeyBinding::new(keystroke, ToggleUsage, Some(WORKSPACE)),
         "jumpAttention" => KeyBinding::new(keystroke, JumpAttention, Some(WORKSPACE)),
+        "commandLibrary" => KeyBinding::new(keystroke, ToggleCommandLibrary, Some(WORKSPACE)),
         "markerPrev" => KeyBinding::new(keystroke, MarkerPrev, Some(WORKSPACE)),
         "markerNext" => KeyBinding::new(keystroke, MarkerNext, Some(WORKSPACE)),
         _ => return None,

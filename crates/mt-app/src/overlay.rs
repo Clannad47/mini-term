@@ -107,6 +107,12 @@ pub mod kind {
     /// 图片放大浮层(Markdown 预览里点 Mermaid 图表打开)。种类唯一:整窗遮罩,
     /// 同时只可能看一张。`main.rs` 也按它在不在栈里决定要不要垫毛玻璃快照。
     pub const IMAGE_LIGHTBOX: &str = "image-lightbox";
+    /// 命令库浮层(issue #81,tab 栏控件簇里那颗「命令」钮弹出来的)。
+    /// 登记理由与 [`MARKER_LIST`] 同:不登记的话浮层开着时全局快捷键照样穿透。
+    pub const COMMAND_LIBRARY: &str = "command-library";
+    /// 「新增 / 编辑命令」弹窗。与浮层**不共存**(宿主先关浮层再开它),
+    /// 但仍是独立种类 —— 分组的新建 / 改名走通用 [`PROMPT`],三者互不叠。
+    pub const COMMAND_EDITOR: &str = "command-editor";
 }
 
 /// 栈里的一条。

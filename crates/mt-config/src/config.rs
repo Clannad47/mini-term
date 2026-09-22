@@ -258,6 +258,45 @@ pub struct AppConfig {
     /// custom range 截止日 `"YYYY-MM-DD"`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_custom_to: Option<String>,
+    /// 命令库(issue #81):全局一份常用命令,终端控制条的「命令」浮层按分组列出,
+    /// 点一下写进当前焦点终端并回车。**不按项目 / 连接绑定** —— 一条部署命令在
+    /// 哪台机器上都是同一句。空库序列化跳过,旧配置缺字段按空库读。
+    #[serde(default, skip_serializing_if = "CommandLibrary::is_empty")]
+    pub command_library: CommandLibrary,
+}
+
+/// 命令库里的一条(`commandLibrary.commands[]`)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedCommand {
+    pub id: String,
+    /// 展示名(浮层里的标题行)。
+    pub name: String,
+    /// 原样写进终端的那一句;运行时由调用方补回车。
+    pub command: String,
+    /// 分组名;`None` / 空 = 未分组。与 SSH 连接的 `group` 同一口径:
+    /// **组名即键**,不另设分组 id —— 改名 = 逐条改字段,由 store 层保证一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// 命令库整体。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandLibrary {
+    #[serde(default)]
+    pub commands: Vec<SavedCommand>,
+    /// 显式创建的分组名(允许空分组存在)。命令上的 `group` 字段仍是归属的
+    /// 单一来源,这里只补充「还没有命令的分组」—— 与 `sshGroups` 同一套语义。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+}
+
+impl CommandLibrary {
+    /// 一条命令、一个空分组都没有。`skip_serializing_if` 用它保持文件干净。
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty() && self.groups.is_empty()
+    }
 }
 
 /// 自记账的会话分支边（与 `mt-ai` 侧 `LineageEdge` 同构，独立定义避免
@@ -640,6 +679,7 @@ impl Default for AppConfig {
             usage_auto_refresh: None,
             usage_custom_from: None,
             usage_custom_to: None,
+            command_library: CommandLibrary::default(),
         }
     }
 }
@@ -2062,6 +2102,59 @@ mod tests {
         assert!(
             !serialized_old.contains("sshGroups"),
             "空 sshGroups 不应序列化进 JSON: {serialized_old}"
+        );
+    }
+
+    /// 命令库(issue #81)的磁盘形状:camelCase、未分组不写 `group`、空库整个不写。
+    #[test]
+    fn command_library_round_trip_and_absent_default() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "commandLibrary": {
+                "commands": [
+                    {"id": "cmd-1", "name": "启动 hc", "command": "cd /opt/hc && ./start.sh", "group": "部署"},
+                    {"id": "cmd-2", "name": "看日志", "command": "tail -f app.log"}
+                ],
+                "groups": ["部署", "Docker"]
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let lib = &config.command_library;
+        assert_eq!(lib.commands.len(), 2);
+        assert_eq!(lib.commands[0].group.as_deref(), Some("部署"));
+        assert_eq!(lib.commands[1].group, None);
+        assert_eq!(lib.groups, vec!["部署", "Docker"]);
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("\"commandLibrary\""));
+        // 未分组那条不该带 `"group":null`
+        assert!(!serialized.contains("\"group\":null"), "{serialized}");
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.command_library, config.command_library);
+
+        // 旧配置无该字段 → 空库,且空库不序列化
+        let old: AppConfig = serde_json::from_str(
+            r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,"terminalFontSize":14}"#,
+        )
+        .unwrap();
+        assert!(old.command_library.is_empty());
+        let serialized_old = serde_json::to_string(&old).unwrap();
+        assert!(
+            !serialized_old.contains("commandLibrary"),
+            "空命令库不应序列化进 JSON: {serialized_old}"
+        );
+        // 只有空分组、没有命令,也算「非空」—— 用户刚建的组不能在重启后消失
+        let mut only_group = AppConfig::default();
+        only_group.command_library.groups.push("部署".into());
+        assert!(!only_group.command_library.is_empty());
+        assert!(
+            serde_json::to_string(&only_group)
+                .unwrap()
+                .contains("commandLibrary")
         );
     }
 

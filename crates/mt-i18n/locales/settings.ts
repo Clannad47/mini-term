@@ -209,6 +209,7 @@ export const settings = {
       toggleSessions: "开合 AI 会话面板",
       toggleUsage: "开合用量统计面板",
       jumpAttention: "跳到下一件待办",
+      commandLibrary: "打开命令库",
       footer: "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」仅在终端内生效",
     },
     menu: {
@@ -441,6 +442,7 @@ export const settings = {
       toggleSessions: "Toggle the AI session panel",
       toggleUsage: "Toggle the usage stats panel",
       jumpAttention: "Jump to the next pending task",
+      commandLibrary: "Open the command library",
       footer: "App shortcuts yield to text fields while typing; \"Copy & paste\" applies inside the terminal only",
     },
     menu: {

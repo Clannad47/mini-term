@@ -96,13 +96,17 @@ use mt_i18n::{
 /// （`fileViewer.lightbox*`）。
 /// 869 → 871：页签标题跟随 shell 通过 OSC 0/2 报上来的窗口标题，
 /// 设置页终端行为组加一个开关：`settings.terminal.tabTitleFollowsShell{Title,Desc}`。
-const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 871;
+/// 871 → 905（32 → 33 个命名空间）：命令库（issue #81）新增 `commandLibrary` 命名空间
+/// 33 条（浮层 17 条 + 编辑弹窗 13 条 + 分组弹窗 3 条），外加快捷键页的
+/// `settings.shortcuts.commandLibrary` 一条。
+const EXPECTED_NAMESPACES: usize = 33;
+const EXPECTED_ENTRIES_PER_LANG: usize = 905;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
 const TS_NAMESPACES: &[&str] = &[
     "app",
+    "commandLibrary",
     "commitDiff",
     "diffModal",
     "envVars",

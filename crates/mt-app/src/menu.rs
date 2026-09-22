@@ -25,7 +25,7 @@
 //! # 层级与定位
 //!
 //! ```text
-//! deferred(priority 1)                  ← 画在所有常规内容之上
+//! deferred(priority MENU_PRIORITY)      ← 画在所有常规内容与 Dialog 之上
 //!  └─ anchored(0,0)
 //!      └─ 全窗口透明遮罩(occlude + on_mouse_down = 关闭)
 //!          └─ anchored(鼠标点).snap_to_window_with_margin(4px)  ← 贴边自动收拢
@@ -113,6 +113,18 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::overlay;
 use crate::ui;
+
+/// 菜单层的 `deferred` 优先级。
+///
+/// **必须压过 Dialog**:gpui-base 0.6 的 `Dialog` 自己也是 `deferred`,优先级
+/// `10 + 层号`(`gpui-base/src/dialog.rs` 的 `with_priority(10 + self.layer)`),
+/// 0.5.1 时代它是普通 `anchored`、不 deferred,菜单用 1 就够。升到 0.6 之后
+/// 菜单还停在 1 的话,弹窗里弹出来的菜单(SSH 表单的分组 ▾、搜索结果右键、
+/// 命令库编辑弹窗的分组 ▾ …)会**画在弹窗底下**:hover 态亮了、菜单却看不见,
+/// 焦点还被它收走,下一发 Esc 关的是这个看不见的菜单而不是弹窗(真机截到过)。
+/// 菜单是所有覆盖物里最后开、最先关的那层,永远画在最上面没有反例。
+/// `paint_deferred_draws` 按 priority 稳定排序,与嵌套 deferred 的深度预算无关。
+pub const MENU_PRIORITY: usize = 100;
 
 /// 菜单项被点中时跑的动作。
 pub type MenuHandler = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -1161,7 +1173,7 @@ impl Render for ContextMenu {
                         ),
                 ),
             )
-            .with_priority(1),
+            .with_priority(MENU_PRIORITY),
         )
     }
 }
