@@ -191,6 +191,34 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 把一条连接拖到另一条连接的前 / 后(右栏行间排序)。落到别的桶里的连接
+    /// 前后 = 顺带改归属。算法与「为什么按桶拍平」见
+    /// [`crate::ssh_conn::reorder_connection`];那边返回 `None`(原位 / id 不存在)
+    /// 时这里什么都不动、也不落盘。
+    ///
+    /// 不作废池里的 session:顺序与分组都不在
+    /// [`crate::ssh_conn::ssh_session_identity_changed`] 的判据里。
+    pub fn reorder_ssh_connection(
+        &mut self,
+        dragged_id: &str,
+        target_id: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(next) = crate::ssh_conn::reorder_connection(
+            &self.config.ssh_connections,
+            &self.config.ssh_groups,
+            dragged_id,
+            target_id,
+            after,
+        ) else {
+            return;
+        };
+        self.config.ssh_connections = next;
+        self.save_config_now();
+        cx.notify();
+    }
+
     // --- 远程项目 ---
 
     /// 这个项目是 SSH 远程项目吗(`remoteProject.ts::isRemoteProject`)。

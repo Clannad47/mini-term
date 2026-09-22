@@ -1,7 +1,7 @@
 //! 「SSH 连接」面板(对照 `src/components/SshModal.tsx` 777 行)。
 //!
 //! 左栏分组列表 + 右栏连接列表:连接的增删改、分组的新建/改名/解散、把连接
-//! 拖进分组。数据层全在 [`crate::store::AppStore`] 的 SSH 段(每一步立即落盘),
+//! 拖进分组、在右栏行间拖拽排序。数据层全在 [`crate::store::AppStore`] 的 SSH 段(每一步立即落盘),
 //! 分组归类走 [`crate::ssh_conn`] 的纯函数 —— 「一处实现三处用」是原版的刻意
 //! 安排,三个弹窗(本面板 / [`crate::ssh_assoc`] / [`crate::remote_project`])
 //! 共用同一份桶顺序与空组处理。
@@ -33,6 +33,15 @@
 //! [`copyable_name`] —— 只长在本面板的行上。另两个弹窗共用 [`conn_text`],
 //! 它们的**整行**点击是勾选 / 单选,名字上再接一个点击语义就打架了。
 //!
+//! # 本面板独有:右栏行间拖拽排序
+//!
+//! 同一个 [`DragSshConn`] 载荷有两种落点:左栏分组行(改归属)与右栏另一条连接
+//! 的上 / 下半(排序,落到别的桶里顺带改归属)。落点档位在 `on_drag_move` 里算好
+//! 存进 [`SshPanel::drop_indicator`],`on_drop` 只读它 —— gpui 的 `on_drop` 不带
+//! 坐标(见 [`crate::dnd`] 模块注释第 1 条),指示线也照项目列表画 2px accent 横线。
+//! 顺序落盘走 [`crate::store::AppStore::reorder_ssh_connection`],按桶拍平以保住
+//! 左栏组序(理由见 [`crate::ssh_conn::reorder_connection`])。
+//!
 //! # 防叠开
 //!
 //! [`crate::overlay::kind::SSH_PANEL`]。删除连接的确认框是**另一种类**
@@ -48,6 +57,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
 
+use crate::dnd::{self, DropPosition};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
 use crate::prompt::{Confirm, autofocus, kind, open_guarded};
@@ -501,9 +511,18 @@ pub(crate) fn build_connection(
 
 // ─── 拖拽载荷 ─────────────────────────────────────────────────
 
-/// 把一条连接拖到左栏某个分组上。载荷只带连接 id —— 目标分组由落点决定。
+/// 把一条连接拖到左栏某个分组上(改归属)或右栏另一条连接的上 / 下(排序)。
+/// 载荷只带连接 id —— 目标分组 / 插入位由落点决定。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DragSshConn(pub String);
+
+/// 右栏行间的落点指示:悬在哪一行、上半(`Before`)还是下半(`After`)。
+/// 只在 `on_drag_move` 里写、`on_drop` 里读,拖拽结束即清。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropIndicator {
+    id: String,
+    position: DropPosition,
+}
 
 /// 拖影:一张只有连接名的小卡(与 [`crate::dnd::preview`] 同款配色)。
 struct ConnDragPreview(String);
@@ -556,8 +575,10 @@ pub struct SshPanel {
     creating: Option<Entity<InputState>>,
     /// 正被拖的连接 id(源卡据此变淡,「未分组」落点行据此恒显)。
     dragging: Option<String>,
-    /// 鼠标正悬在哪个落点上(`None` = 未分组桶那一行)。
+    /// 鼠标正悬在左栏哪个分组行上(`None` = 未分组桶那一行)。
     drag_over: Option<GroupKey>,
+    /// 鼠标正悬在右栏哪条连接的上 / 下半(行间排序的落点)。
+    drop_indicator: Option<DropIndicator>,
     /// 刚复制过名字的那条连接 id —— 该行亮一枚「已复制」回执。`None` = 不亮。
     copied: Option<String>,
     /// 回执自撤任务的句柄。存着是为了「连着复制两条」时上一个计时器被丢弃 ——
@@ -644,6 +665,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
         creating: None,
         dragging: None,
         drag_over: None,
+        drop_indicator: None,
         copied: None,
         _copied_timer: None,
         _subs: Vec::new(),
@@ -661,6 +683,17 @@ pub fn open(window: &mut Window, cx: &mut App) {
             // 面板里有连接表单(含密码 / 私钥路径),误点遮罩关掉会丢未保存内容;
             // Esc 仍可退(原版 `closeOnOverlay={false}`)
             .overlay_closable(false)
+            // 拖着连接时按 Esc = 取消这次拖拽,**不关面板**。Workspace 根上那道
+            // `capture_key_down`(见 `main.rs`)管不到这里:Dialog 画在 Root 层、
+            // 不在 Workspace 的派发路径上,Esc 直接进了 Dialog 自己的 `Cancel`。
+            // 真机验过:不垫这一层,拖到一半按 Esc 是面板关掉、拖影还钉在屏上。
+            .on_cancel(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                if cx.has_active_drag() {
+                    cx.stop_active_drag(window);
+                    return false;
+                }
+                true
+            })
             .child(body)
     });
 }
@@ -969,7 +1002,62 @@ fn move_to_group(state: &Entity<SshPanel>, conn_id: &str, group: Option<&str>, c
         });
         panel.dragging = None;
         panel.drag_over = None;
+        panel.drop_indicator = None;
         cx.notify();
+    });
+}
+
+/// 右栏某行的 `on_drag_move`:命中就按上下半记落点档位,没命中只收自己那一份。
+///
+/// ⚠️ 与 [`group_drop_target`] 同一条:这个回调会打给**每一行**,命中判定自己做。
+/// 拖到自己身上不给指示(与项目列表同口径)。
+fn on_row_drag_move(
+    state: &Entity<SshPanel>,
+    row_id: &str,
+    event: &gpui::DragMoveEvent<DragSshConn>,
+    cx: &mut App,
+) {
+    let dragged = event.drag(cx).0.clone();
+    let next = dnd::hit_ratio(event.bounds, event.event.position)
+        .filter(|_| dragged != row_id)
+        .map(|ratio| DropIndicator {
+            id: row_id.to_string(),
+            position: dnd::drop_position(ratio, false),
+        });
+    state.update(cx, |panel, cx| {
+        let changed = match &next {
+            Some(next) => panel.drop_indicator.as_ref() != Some(next),
+            None => panel
+                .drop_indicator
+                .as_ref()
+                .is_some_and(|d| d.id == row_id),
+        };
+        if changed {
+            panel.drop_indicator = next;
+            cx.notify();
+        }
+    });
+}
+
+/// 右栏某行的 `on_drop`:位置来自上一次 `on_drag_move` 存下的指示 ——
+/// gpui 的 `on_drop` 不带坐标。指示对不上号(没悬停过 / 别的行的)就什么都不做。
+fn reorder_conn(state: &Entity<SshPanel>, dragged_id: &str, target_id: &str, cx: &mut App) {
+    let (dragged_id, target_id) = (dragged_id.to_string(), target_id.to_string());
+    state.update(cx, |panel, cx| {
+        let indicator = panel.drop_indicator.take();
+        panel.dragging = None;
+        panel.drag_over = None;
+        cx.notify();
+        let Some(indicator) = indicator else {
+            return;
+        };
+        if indicator.id != target_id || dragged_id == target_id {
+            return;
+        }
+        let after = indicator.position == DropPosition::After;
+        panel.store.update(cx, |store, cx| {
+            store.reorder_ssh_connection(&dragged_id, &target_id, after, cx)
+        });
     });
 }
 
@@ -990,6 +1078,7 @@ struct Frame {
     creating: bool,
     dragging: Option<String>,
     drag_over: Option<GroupKey>,
+    drop_indicator: Option<DropIndicator>,
     copied: Option<String>,
     notice: Option<SharedString>,
 }
@@ -1021,6 +1110,7 @@ fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
         creating: panel.creating.is_some(),
         dragging: panel.dragging.clone(),
         drag_over: panel.drag_over.clone(),
+        drop_indicator: panel.drop_indicator.clone(),
         copied: panel.copied.clone(),
         notice: panel.notice.clone(),
     }
@@ -1034,6 +1124,7 @@ fn render_body(state: &Entity<SshPanel>, total: gpui::Pixels, cx: &mut App) -> A
         state.update(cx, |panel, _cx| {
             panel.dragging = None;
             panel.drag_over = None;
+            panel.drop_indicator = None;
         });
     }
     let frame = read_frame(state, cx);
@@ -1385,7 +1476,7 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
     let conn_for_del = conn.clone();
     let drag_label = conn.name.clone();
 
-    conn_card(SharedString::from(format!("ssh-row-{id}")), false)
+    let card = conn_card(SharedString::from(format!("ssh-row-{id}")), false)
         .when(is_source, |el| el.opacity(0.4))
         .cursor_pointer()
         .on_drag(DragSshConn(id.clone()), {
@@ -1394,6 +1485,21 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
                 let dragged = item.0.clone();
                 state.update(cx, |panel, _cx| panel.dragging = Some(dragged));
                 cx.new(|_| ConnDragPreview(drag_label.clone()))
+            }
+        })
+        // 行同时也是落点:另一条连接拖到本行上 / 下半 = 插到本行前 / 后
+        .on_drag_move({
+            let state = state.clone();
+            let id = id.clone();
+            move |event: &gpui::DragMoveEvent<DragSshConn>, _window: &mut Window, cx: &mut App| {
+                on_row_drag_move(&state, &id, event, cx);
+            }
+        })
+        .on_drop({
+            let state = state.clone();
+            let id = id.clone();
+            move |item: &DragSshConn, _window: &mut Window, cx: &mut App| {
+                reorder_conn(&state, &item.0, &id, cx);
             }
         })
         .child(conn_text_with_name(
@@ -1430,8 +1536,40 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
                         }
                     }),
                 ),
-        )
+        );
+
+    // 指示线是绝对定位的,要挂在卡片**外面**的一层 relative 上 —— 卡片本身是
+    // flex 行,横线不能进它的子项序列
+    div()
+        .relative()
+        .child(card)
+        .children(drop_line(frame, &id, DropPosition::Before))
+        .children(drop_line(frame, &id, DropPosition::After))
         .into_any_element()
+}
+
+/// 行间落点指示线:2px accent 横线,画在卡片与相邻卡片之间的 6px 间隙正中
+/// (`render_conn_buckets` 的桶内 gap),before 贴上沿、after 贴下沿。
+/// 项目列表那条是 `top(-1)`,这里行与行之间有间隙,线要落在间隙里才不压卡片边框。
+fn drop_line(frame: &Frame, id: &str, position: DropPosition) -> Option<AnyElement> {
+    let indicator = frame.drop_indicator.as_ref()?;
+    if indicator.id != id || indicator.position != position {
+        return None;
+    }
+    Some(
+        div()
+            .absolute()
+            .left(px(4.0))
+            .right(px(4.0))
+            .h(px(2.0))
+            .rounded_full()
+            .bg(ui::accent())
+            .map(|el| match position {
+                DropPosition::Before => el.top(px(-4.0)),
+                _ => el.bottom(px(-4.0)),
+            })
+            .into_any_element(),
+    )
 }
 
 /// 连接名做成「点一下复制名字」的按钮 + 复制后那一秒的行内回执。

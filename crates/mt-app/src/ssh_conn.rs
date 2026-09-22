@@ -129,6 +129,67 @@ pub fn merge_ssh_groups_on_rename(groups: &[String], old_name: &str, new_name: &
     out
 }
 
+/// 把连接 `dragged_id` 挪到连接 `target_id` 的前面 / 后面(`after`),返回**整张**
+/// 连接表的新顺序;什么都不用改(拖到自己身上、id 不存在、落点就是原位)时 `None`。
+///
+/// # 为什么不是「在 `connections` 里先删后插」
+///
+/// 分组的**展示顺序**是「连接里首次出现的顺序」([`build_group_buckets`]),直接在
+/// 平铺表里搬一条会连带改掉组序:`[a1(A), b1(B), a2(A)]` 里把 a1 挪到 a2 之后,
+/// 平铺表变成 `[b1, a2, a1]`,左栏的 A/B 就对调了 —— 用户只是在 A 组里换了个位置。
+/// 所以这里按桶操作:先归桶、在目标桶里插位、再按桶序拍平回去。顺带把平铺表
+/// 归一成「桶序」(与右栏画出来的一致),往后每次拖拽都是同一把尺。
+///
+/// 落到**另一个桶**的某条连接前后 = 顺带改归属(与拖到左栏分组上同义,只是多了
+/// 个位置);归属写的是桶名(已 trim),与 `move_ssh_connection_to_group` 同款。
+pub fn reorder_connection(
+    connections: &[SshConnection],
+    ssh_groups: &[String],
+    dragged_id: &str,
+    target_id: &str,
+    after: bool,
+) -> Option<Vec<SshConnection>> {
+    if dragged_id == target_id {
+        return None;
+    }
+    let mut dragged = connections.iter().find(|c| c.id == dragged_id)?.clone();
+    let target_group = normalize_group(
+        connections
+            .iter()
+            .find(|c| c.id == target_id)?
+            .group
+            .as_deref(),
+    )
+    .map(str::to_string);
+
+    let mut buckets = build_group_buckets(connections, ssh_groups);
+    for (_, items) in &mut buckets.named {
+        items.retain(|c| c.id != dragged_id);
+    }
+    buckets.ungrouped.retain(|c| c.id != dragged_id);
+
+    dragged.group = target_group.clone();
+    let slot = match &target_group {
+        Some(g) => &mut buckets.named.iter_mut().find(|(name, _)| name == g)?.1,
+        None => &mut buckets.ungrouped,
+    };
+    let target_idx = slot.iter().position(|c| c.id == target_id)?;
+    slot.insert(if after { target_idx + 1 } else { target_idx }, dragged);
+
+    let next: Vec<SshConnection> = buckets
+        .named
+        .into_iter()
+        .flat_map(|(_, items)| items)
+        .chain(buckets.ungrouped)
+        .collect();
+    let unchanged = next.len() == connections.len()
+        && next
+            .iter()
+            .zip(connections)
+            .all(|(n, o)| n.id == o.id && n.group == o.group);
+    if unchanged { None } else { Some(next) }
+}
+
 /// 「添加远程项目」的项目名兜底(`AddRemoteProjectModal.tsx:69-70`)。
 ///
 /// 用户填了就用用户的(trim);没填取远程路径的**末段**;末段也取不到
@@ -395,6 +456,120 @@ mod tests {
         // 全部有组时不产生空的未分组桶
         let only = build_group_buckets(&[conn("a", Some("g"))], &[]).display_order();
         assert_eq!(only.len(), 1);
+    }
+
+    // --- 拖拽排序 ---
+
+    fn order_of(list: &[SshConnection]) -> Vec<(String, Option<String>)> {
+        list.iter()
+            .map(|c| (c.id.clone(), c.group.clone()))
+            .collect()
+    }
+
+    fn pair(id: &str, group: Option<&str>) -> (String, Option<String>) {
+        (id.to_string(), group.map(str::to_string))
+    }
+
+    #[test]
+    fn reorder_within_group_keeps_group_order() {
+        // A 组里把 a1 挪到 a2 之后:平铺表里 b1 夹在中间,直接先删后插会让 B 组
+        // 跑到 A 组前面 —— 这里按桶序拍平,A 仍然在前
+        let list = vec![
+            conn("a1", Some("A")),
+            conn("b1", Some("B")),
+            conn("a2", Some("A")),
+        ];
+        let next = reorder_connection(&list, &[], "a1", "a2", true).expect("有变化");
+        assert_eq!(
+            order_of(&next),
+            vec![
+                pair("a2", Some("A")),
+                pair("a1", Some("A")),
+                pair("b1", Some("B"))
+            ]
+        );
+        assert_eq!(
+            build_group_buckets(&next, &[]).group_names(),
+            vec!["A".to_string(), "B".into()],
+            "组序不能因为组内换位而变"
+        );
+    }
+
+    #[test]
+    fn reorder_before_and_after_target() {
+        let list = vec![conn("a", None), conn("b", None), conn("c", None)];
+        let before = reorder_connection(&list, &[], "c", "a", false).unwrap();
+        assert_eq!(
+            order_of(&before),
+            vec![pair("c", None), pair("a", None), pair("b", None)]
+        );
+        let after = reorder_connection(&list, &[], "a", "c", true).unwrap();
+        assert_eq!(
+            order_of(&after),
+            vec![pair("b", None), pair("c", None), pair("a", None)]
+        );
+    }
+
+    #[test]
+    fn reorder_into_another_bucket_changes_group() {
+        let list = vec![conn("a", Some("A")), conn("b", Some("B")), conn("u", None)];
+        // 未分组的 u 拖到 B 组的 b 前面 → 进 B 组、排在 b 前
+        let next = reorder_connection(&list, &[], "u", "b", false).unwrap();
+        assert_eq!(
+            order_of(&next),
+            vec![
+                pair("a", Some("A")),
+                pair("u", Some("B")),
+                pair("b", Some("B"))
+            ]
+        );
+        // 反过来:有组的 a 拖到未分组的 u 之后 → 变未分组
+        let next = reorder_connection(&list, &[], "a", "u", true).unwrap();
+        assert_eq!(
+            order_of(&next),
+            vec![pair("b", Some("B")), pair("u", None), pair("a", None)]
+        );
+    }
+
+    #[test]
+    fn reorder_target_group_name_is_trimmed() {
+        // 目标连接的组名带空白(手改配置的存量):写进去的是桶名(已 trim)
+        let list = vec![conn("a", Some(" A ")), conn("u", None)];
+        let next = reorder_connection(&list, &[], "u", "a", true).unwrap();
+        assert_eq!(next[1].group.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn reorder_noop_returns_none() {
+        let list = vec![conn("a", None), conn("b", None)];
+        assert!(
+            reorder_connection(&list, &[], "a", "a", true).is_none(),
+            "拖到自己身上"
+        );
+        assert!(
+            reorder_connection(&list, &[], "x", "a", true).is_none(),
+            "被拖的不存在"
+        );
+        assert!(
+            reorder_connection(&list, &[], "a", "x", true).is_none(),
+            "目标不存在"
+        );
+        assert!(
+            reorder_connection(&list, &[], "a", "b", false).is_none(),
+            "落点就是原位"
+        );
+        assert!(
+            reorder_connection(&list, &[], "b", "a", true).is_none(),
+            "落点就是原位"
+        );
+    }
+
+    #[test]
+    fn reorder_leaves_explicit_empty_groups_alone() {
+        // 显式空组只住在 `ssh_groups` 里,拍平回去不会凭空多出连接
+        let list = vec![conn("a", None), conn("b", None)];
+        let next = reorder_connection(&list, &ids(&["空组"]), "b", "a", false).unwrap();
+        assert_eq!(order_of(&next), vec![pair("b", None), pair("a", None)]);
     }
 
     // --- 分组改名 / 远程项目名 ---
