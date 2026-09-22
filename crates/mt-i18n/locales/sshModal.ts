@@ -38,7 +38,7 @@ export const sshModal = {
     addGroupPlaceholder: "分组名",
     addConnection: "+ 添加连接",
     footerHint: "在终端中右键「SSH 连接」即可快速选择并连接",
-    groupOpsHint: "右键左侧列表可新增分组，右键分组可重命名或解散；拖动连接到分组上可调整归属",
+    groupOpsHint: "右键左侧列表可新增分组，右键分组可重命名或解散；拖动连接到分组上可调整归属，拖到其他连接上下可调整顺序",
     copyNameHint: "点击连接名即可复制该名称",
   },
   en: {
@@ -80,7 +80,7 @@ export const sshModal = {
     addGroupPlaceholder: "Group name",
     addConnection: "+ Add Connection",
     footerHint: "Right-click \"SSH Connections\" in the terminal to quickly select and connect",
-    groupOpsHint: "Right-click the left list to add a group, right-click a group to rename or dissolve it; drag a connection onto a group to move it",
+    groupOpsHint: "Right-click the left list to add a group, right-click a group to rename or dissolve it; drag a connection onto a group to move it, or above/below another connection to reorder",
     copyNameHint: "Click a connection name to copy it",
   },
 } as const;
