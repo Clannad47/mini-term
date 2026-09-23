@@ -9,7 +9,7 @@
 //!                  ▼
 //!        RelayBridge 的前台泵(主线程)──► AppStore / Window
 //!
-//!  AppStore ──cx.observe──► 150ms 去抖 ──► 内容去重 ──► update_sessions
+//!  AppStore ──StoreEvent──► 150ms 去抖 ──► 内容去重 ──► update_sessions
 //!                                   └──► 镜像快照(启动器 / 项目 / 活 PTY)
 //!                                        ▲
 //!                            RelayHost 在 tokio 线程上只读它
@@ -56,15 +56,18 @@ use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
 use crate::i18n::tr;
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::tree::PaneStatus;
 
 /// 结构同步的去抖(原版 `mobileSessionSync.ts:101` 的 150ms)。
 ///
-/// **两道闸一个都不能省**(坑 9):`cx.observe(&store)` 在每次 `cx.notify()` 时
-/// 都会触发,而 store 的 notify 频率远高于 zustand 的 `subscribe`(终端状态、
-/// 焦点、布局全在同一个 entity 上)。去掉去抖或内容去重,WebSocket 上就会出现
-/// 每秒几十条 `SessionsDelta`。
+/// **两道闸一个都不能省**(坑 9):store 的变化频率远高于 zustand 的 `subscribe`
+/// (终端状态、焦点、布局全在同一个 entity 上)。去掉去抖或内容去重,WebSocket
+/// 上就会出现每秒几十条 `SessionsDelta`。
+///
+/// 触发源已从 `cx.observe(&store)`(每次 notify 都醒)收窄为订阅 [`StoreEvent`]
+/// 里快照真正读的那几类(OSC 标题、焦点、主题字号这些不再触发),但 AI 状态本身
+/// 就可能每秒反复上报,两道闸照旧保留。
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(150);
 
 // ─── 跨线程信号 ───────────────────────────────────────────────
@@ -561,7 +564,8 @@ pub struct RelayBridge {
     sync_generation: u64,
     _sync_task: Option<Task<()>>,
     _pump: Task<()>,
-    _observer: Subscription,
+    /// store 事件订阅(结构同步的触发源)。
+    _store_events: Subscription,
 }
 
 impl RelayBridge {
@@ -873,7 +877,18 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
     let manager = Arc::new(MobileRelayManager::new(host, events));
 
     let entity = cx.new(|cx: &mut Context<RelayBridge>| {
-        let observer = cx.observe(&store, |this: &mut RelayBridge, _, cx| this.schedule_sync(cx));
+        // 只订阅快照真正读的那几类变化(见 `StoreEvent::touches_relay_sync`)。
+        // 此前挂在 notify 上,多个 pane 的 OSC 标题(约 4Hz/pane)会把 150ms 去抖
+        // 一直往后推 —— 四个 pane 交错改标题时间隔常在 100ms 以内,AI 状态变化
+        // 反而迟迟推不出去。
+        let store_events = cx.subscribe(
+            &store,
+            |this: &mut RelayBridge, _, event: &StoreEvent, cx| {
+                if event.touches_relay_sync() {
+                    this.schedule_sync(cx);
+                }
+            },
+        );
         // 泵要 `spawn_in`:发起会话得建 pane(要 `&mut Window`)、弹 toast
         // (`window.push_notification`)也得有窗口
         let pump = cx.spawn_in(window, async move |this, cx| {
@@ -898,7 +913,7 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
             sync_generation: 0,
             _sync_task: None,
             _pump: pump,
-            _observer: observer,
+            _store_events: store_events,
         }
     });
     cx.set_global(GlobalRelay(entity.clone()));

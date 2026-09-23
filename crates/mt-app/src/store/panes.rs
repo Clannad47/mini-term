@@ -14,12 +14,13 @@ use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
 };
 
-use super::AppStore;
+use super::events::StoreChanged;
 use super::pure::{
     apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, next_maximized,
     resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback, sanitize_osc_title,
     terminal_style_from,
 };
+use super::{AppStore, StoreEvent};
 
 /// 启动恢复交给 [`AppStore::start_pty_with`] 的续接反查参数(在后台兑现)。
 struct ResumeLookup {
@@ -362,7 +363,7 @@ impl AppStore {
             return;
         }
         state.maximized_pane_id = next;
-        cx.notify();
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 无条件还原(分屏 / 拖拽移动落地前调),不 notify —— 调用方随后都会走
@@ -395,6 +396,8 @@ impl AppStore {
                 .and_then(|s| s.active_layout())
                 .and_then(|l| l.first_active_pane())
                 .map(|p| p.id.clone());
+            // notify 由下面的 `after_layout_change` 统一收尾
+            cx.emit(StoreEvent::FocusedPaneChanged);
         }
         // 关掉的可能是活动面板的最后一个 pane → 活动指针挪到了邻位面板,
         // 而那个面板可能是恢复出来、从没显示过的(pane 还没有 PTY)—— 补起来
@@ -455,6 +458,8 @@ impl AppStore {
             && let Some(layout) = state.layout_of_pane_mut(pane_id)
         {
             layout.activate_pane(pane_id);
+            // 活动 tab 变了是布局变化;notify 由下面的 `focus_pane` 收尾
+            cx.emit(StoreEvent::LayoutChanged);
         }
         self.focus_pane(project_id, pane_id, window, cx);
         self.save_project_layout_soon(project_id, cx);
@@ -529,7 +534,7 @@ impl AppStore {
         if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)) {
             entity.update(cx, |pane, cx| pane.focus(window, cx));
         }
-        cx.notify();
+        cx.changed(StoreEvent::FocusedPaneChanged);
     }
 
     /// 当前项目里该操作哪个 pane:焦点 pane → 布局里第一个激活 pane
@@ -673,6 +678,8 @@ impl AppStore {
                     && let Some(pane) = state.pane_mut(&item.pane_id)
                 {
                     pane.status = PaneStatus::Error;
+                    // notify 在循环后统一收尾
+                    cx.emit(StoreEvent::PaneStatusChanged);
                 }
                 continue;
             };
@@ -725,7 +732,8 @@ impl AppStore {
             // pane 才会正常进入 AI 会话状态(检测照旧当场跑,不等回填)。
             self.write_to_pane(project_id, &item.pane_id, &format!("{command}\r"), cx);
         }
-        cx.notify();
+        // PTY 绑定 + 续接标记都是布局数据(中转的活 PTY 镜像、pane 的 PTY 编号靠它)
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 起 PTY 并拼出 `PaneState`。
@@ -967,7 +975,7 @@ impl AppStore {
             return;
         }
         pane.osc_title = next;
-        cx.notify();
+        cx.changed(StoreEvent::PaneTitleChanged);
     }
 
     /// [`Self::set_pane_osc_title`] 的 `pty_id` 入口 —— pane 只认得自己的 PTY 编号

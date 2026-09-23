@@ -20,7 +20,7 @@ use crate::file_viewer::{DocumentSource, FileViewer};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_alert};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::terminal_area::TerminalArea;
 use crate::ui;
 
@@ -367,7 +367,15 @@ impl WorkbenchArea {
         terminal_area: Entity<TerminalArea>,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&store, |this, store, cx| {
+        // render 读活动项目等 store 数据,任何变化都照旧重画
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 页签的回收与远程来源校验只看「项目还在不在 / 路径 / SSH 连接」
+        // (见 `StoreEvent::touches_document_sources`)。此前挂在 notify 上,AI 工作时
+        // OSC 标题约 4Hz/pane 就把每个文档页签的校验全跑一遍。
+        cx.subscribe(&store, |this, store, event: &StoreEvent, cx| {
+            if !event.touches_document_sources() {
+                return;
+            }
             let project_ids = store
                 .read(cx)
                 .projects()

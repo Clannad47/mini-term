@@ -150,7 +150,7 @@ use crate::focus_nav::Direction;
 use crate::i18n::{t, tr};
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
-use crate::store::{AppStore, DoneScope, PendingAlert};
+use crate::store::{AppStore, DoneScope, PendingAlert, StoreEvent};
 use crate::terminal_area::TerminalArea;
 use crate::title_bar::TitleBar;
 use crate::tray::{Tray, TrayEvent};
@@ -428,14 +428,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // store 的每一次 notify 都顺带刷一遍托盘。**推送时机就这一处** ——
-        // 原版在七个调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 /
-        // 关项目 / 改布局 / 清未读 / 焦点变化 / 托盘配置变化 …),而这些在 GPUI
-        // 侧无一例外都以 `cx.notify()` 收尾,挂观察者等于把七处一次覆盖全。
-        // 代价是会被无关变化(改个字号)带着跑一遍,由 [`Tray::push`] 的签名去重挡住。
-        cx.observe(&store, |this, _, cx| {
-            this.sync_tray(cx);
-            cx.notify();
+        // 根视图的 render 直接读 store(三栏比例、徽标、未读数、背景……),
+        // 任何变化都照旧重画。
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 托盘只在它读的数据变了时才重算快照。**推送时机就这一处** —— 原版在七个
+        // 调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 / 关项目 / 改布局 /
+        // 清未读 / 焦点变化 / 托盘配置变化 …),对应的正是
+        // [`StoreEvent::touches_tray`] 放行的那几类事件。此前挂在 notify 上,AI 工作时
+        // 每个 pane 的 OSC 标题约 4Hz 就把快照白算一遍(再由 [`Tray::push`] 的签名
+        // 去重挡掉);签名去重仍留着,挡的是「事件来了但灯色菜单没变」。
+        cx.subscribe(&store, |this, _, event: &StoreEvent, cx| {
+            if event.touches_tray() {
+                this.sync_tray(cx);
+            }
         })
         .detach();
 

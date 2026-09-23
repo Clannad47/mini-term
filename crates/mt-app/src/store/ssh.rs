@@ -8,7 +8,8 @@ use mt_config::{ProjectConfig, SshConnection};
 
 use crate::tree::{PaneState, PaneStatus};
 
-use super::{AppStore, ProjectState, SshAssocOutcome};
+use super::events::StoreChanged;
+use super::{AppStore, ConfigSection, ProjectState, SshAssocOutcome, StoreEvent};
 
 // ===========================================================================
 // SSH(audit #28,BB-a 批)
@@ -85,7 +86,7 @@ impl AppStore {
             crate::remote_ssh::invalidate_connection(&id);
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         match seal_error {
             Some(err) => Err(err),
             None => Ok(()),
@@ -108,7 +109,7 @@ impl AppStore {
         }
         crate::remote_ssh::invalidate_connection(id);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 新建一个空分组(重名则只切选中态,由调用方处理)。返回是否真的新建了。
@@ -132,7 +133,7 @@ impl AppStore {
         }
         self.config.ssh_groups.push(name.to_string());
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         true
     }
 
@@ -151,7 +152,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 解散分组:组里的连接回落「未分组」,组名从 `sshGroups` 移除(连接不删)。
@@ -163,7 +164,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 把一条连接挪进某个分组(`group = None` = 挪到未分组)。
@@ -188,7 +189,7 @@ impl AppStore {
         }
         conn.group = target.map(str::to_string);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 把一条连接拖到另一条连接的前 / 后(右栏行间排序)。落到别的桶里的连接
@@ -216,7 +217,7 @@ impl AppStore {
         };
         self.config.ssh_connections = next;
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     // --- 远程项目 ---
@@ -311,7 +312,8 @@ impl AppStore {
             self.move_item(&id, Some(group_id), None, cx);
         }
         self.save_config_now();
-        cx.notify();
+        cx.emit(StoreEvent::ProjectTreeChanged);
+        cx.changed(StoreEvent::ProjectsChanged);
         id
     }
 
@@ -336,7 +338,7 @@ impl AppStore {
         project.ssh_cli_token = if enabled { project_token } else { None };
         project.ssh_connection_ids = if enabled { Some(scope) } else { None };
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 「关联 SSH」保存的**完整**动作:算计划 → 后台跑注册器 → 回主线程落配置。
@@ -475,7 +477,8 @@ impl AppStore {
         let pane = state.pane_mut(pane_id)?;
         pane.pty_id = Some(new_pty);
         pane.status = PaneStatus::Idle;
-        state.status = state.highest_status();
+        // notify 由 `after_layout_change` 收尾(它另发 `LayoutChanged`)
+        cx.emit(StoreEvent::PaneStatusChanged);
         self.after_layout_change(project_id, cx);
         Some(new_pty)
     }

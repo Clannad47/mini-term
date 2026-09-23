@@ -170,7 +170,9 @@ impl ProjectSwitcher {
                     name: project.name.clone(),
                     path: project.path.clone(),
                     group_path,
-                    status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
+                    status: state
+                        .map(|s| s.highest_status())
+                        .unwrap_or(PaneStatus::Idle),
                     needs_attention: state.is_some_and(|s| s.needs_attention),
                     hits: Vec::new(),
                 })

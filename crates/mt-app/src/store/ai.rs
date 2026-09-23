@@ -13,11 +13,12 @@ use crate::markers::{self, AiMarker, MarkerBatch};
 use crate::notify::{NotifyPrefs, PaneRef, StatusTransition};
 use crate::tree::{AiSessionRef, PaneStatus};
 
+use super::events::StoreChanged;
 use super::pure::{
     collect_ai_projects, compute_title_bar_light, push_lineage_edge, resolve_fork_edge, AiProjects,
     DoneScope, PendingFork, TitleBarLight,
 };
-use super::{AppStore, PendingAlert};
+use super::{AppStore, PendingAlert, StoreEvent};
 
 impl AppStore {
     // === AI 任务标记(⚑)===
@@ -64,7 +65,7 @@ impl AppStore {
             self.markers_by_pty.remove(&pty_id);
             self.marker_cursor.remove(&pty_id);
         }
-        cx.notify();
+        cx.changed(StoreEvent::MarkersChanged);
     }
 
     /// 收拾一遍某个 pane 的标记:**失效的处置 + 挂着的补锚**,返回「列表变过没有」。
@@ -109,7 +110,7 @@ impl AppStore {
     /// 那条处理掉的话,这次补锚就能让它从「灰的、点不动」变回可跳。
     pub fn refresh_markers_for_pty(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         if self.refresh_markers(pty_id, cx) {
-            cx.notify();
+            cx.changed(StoreEvent::MarkersChanged);
         }
     }
 
@@ -135,7 +136,7 @@ impl AppStore {
         // 锚点已经不可信的宁可什么都不做,也不能跳到错的行上 —— 见
         // [`Self::refresh_markers`] 与 [`crate::markers`] 模块注释
         if self.refresh_markers(pty_id, cx) {
-            cx.notify();
+            cx.changed(StoreEvent::MarkersChanged);
         }
         let Some(anchor) = self
             .markers_for_pty(pty_id)
@@ -247,19 +248,13 @@ impl AppStore {
         self.clear_pending_fork(pty_id);
         // 原版 `App.tsx:359` 的 `markPtyExited`:与状态落 error 同一时机
         self.exited_ptys.insert(pty_id);
-        let mut touched: Option<String> = None;
-        for (pid, state) in self.project_states.iter_mut() {
-            let hit = state
+        let touched = self.project_states.values_mut().any(|state| {
+            state
                 .layouts_mut()
-                .any(|layout| layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None));
-            if hit {
-                state.status = state.highest_status();
-                touched = Some(pid.clone());
-                break;
-            }
-        }
-        if touched.is_some() {
-            cx.notify();
+                .any(|layout| layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None))
+        });
+        if touched {
+            cx.changed(StoreEvent::PaneStatusChanged);
         }
     }
 
@@ -316,7 +311,6 @@ impl AppStore {
                         break;
                     }
                     if hit {
-                        state.status = state.highest_status();
                         owner = Some(pid.clone());
                         break 'projects;
                     }
@@ -341,7 +335,8 @@ impl AppStore {
                 {
                     state.needs_attention = true;
                 }
-                cx.notify();
+                // 完成账本与项目行提示点随状态一起变,同一个事件覆盖(见 `StoreEvent`)
+                cx.changed(StoreEvent::PaneStatusChanged);
 
                 if plan.is_empty() {
                     return None;
@@ -373,7 +368,7 @@ impl AppStore {
                 // 会话身份随布局落盘 —— 重启后据此续接
                 if let Some(owner) = owner {
                     self.save_project_layout_soon(&owner, cx);
-                    cx.notify();
+                    cx.changed(StoreEvent::PaneSessionChanged);
                 }
                 // 分支自记账:这个 pane 是 fork 出来的话,新身份到手即落边。
                 // **必须在这里**而不是等 pane 变 ai-working —— 身份只上报一次,
@@ -408,7 +403,7 @@ impl AppStore {
         if focused {
             self.done.clear_unread();
         }
-        cx.notify();
+        cx.changed(StoreEvent::WindowFocusChanged);
     }
 
     /// 主窗口是否聚焦。托盘的闪烁策略要看它(聚焦不闪),而托盘的推送发生在
@@ -425,18 +420,14 @@ impl AppStore {
     /// 全局 AI 状态(边条上那颗徽标点)。逐条对照 `ActivityBar.tsx` 的 `globalStatus`:
     /// 取所有项目里优先级最高的一档,**`error` 先压成 `idle`** —— 某个 shell
     /// `exit 1` 不该让整条边栏亮红点,那会盖住真正在跑的 AI。
+    ///
+    /// 各项目的聚合状态读时现算([`ProjectState::highest_status`],缓存字段已撤)。
+    /// 这里在根视图的 render 上、终端刷屏时每帧一次,代价是遍历全部 pane 做
+    /// 几十次比较,不值得为它再养一份要五处同步的缓存。
+    ///
+    /// [`ProjectState::highest_status`]: super::ProjectState::highest_status
     pub fn global_ai_status(&self) -> PaneStatus {
-        let mut highest = PaneStatus::Idle;
-        for state in self.project_states.values() {
-            let status = match state.status {
-                PaneStatus::Error => PaneStatus::Idle,
-                other => other,
-            };
-            if status.priority() > highest.priority() {
-                highest = status;
-            }
-        }
-        highest
+        global_ai_status_of(self.project_states.values().map(|s| s.highest_status()))
     }
 
     /// 全部(或某个项目的)pane 的一份只读快照。
@@ -523,7 +514,7 @@ impl AppStore {
 
     pub fn clear_unread_done(&mut self, cx: &mut Context<Self>) {
         self.done.clear_unread();
-        cx.notify();
+        cx.changed(StoreEvent::DoneChanged);
     }
 
     /// 「下一件该我做的事」在哪个 pane。`only_project` 限定项目内挑。
@@ -584,7 +575,7 @@ impl AppStore {
             pane.resume_pending = false;
             pty_id = pane.pty_id;
             self.save_project_layout_soon(project_id, cx);
-            cx.notify();
+            cx.changed(StoreEvent::PaneSessionChanged);
         }
         // 与 hook 上报那条路同一个消费点(原版两条都走 `setPaneAiSessionByPty`)。
         // 走到这里的多半是 resume/跳转,没有登记 → 空操作。
@@ -639,5 +630,160 @@ impl AppStore {
         if push_lineage_edge(&mut self.config.session_lineage, edge) {
             self.save_config_soon(cx);
         }
+    }
+}
+
+/// [`AppStore::global_ai_status`] 的纯函数版:入参是各项目的聚合状态。
+///
+/// `error` 先压成 `idle` 再取最高档(理由见那个方法的注释)。
+fn global_ai_status_of(project_statuses: impl IntoIterator<Item = PaneStatus>) -> PaneStatus {
+    let mut highest = PaneStatus::Idle;
+    for status in project_statuses {
+        let status = match status {
+            PaneStatus::Error => PaneStatus::Idle,
+            other => other,
+        };
+        if status.priority() > highest.priority() {
+            highest = status;
+        }
+    }
+    highest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ProjectState;
+    use crate::tree::{PaneState, ProjectPanel, SplitDirection, SplitNode};
+
+    const ALL: [PaneStatus; 4] = [
+        PaneStatus::Idle,
+        PaneStatus::AiIdle,
+        PaneStatus::AiWorking,
+        PaneStatus::Error,
+    ];
+
+    fn pane(status: PaneStatus) -> PaneState {
+        let mut p = PaneState::new("pwsh");
+        p.status = status;
+        p
+    }
+
+    /// 按「面板 → 该面板的 pane 状态」造一个项目。每个面板第一个 pane 起根叶子,
+    /// 其余的轮流「并进 tab 栏」与「分屏」,让树里既有多 tab 叶子也有 split。
+    /// 活动面板是第一个 —— 后面的面板都是后台面板。
+    fn project(panels: &[&[PaneStatus]]) -> ProjectState {
+        let mut state = ProjectState::new();
+        for statuses in panels {
+            let (first, rest) = statuses.split_first().expect("面板至少一个 pane");
+            let root = pane(*first);
+            let root_id = root.id.clone();
+            let mut layout = SplitNode::leaf(root);
+            for (i, status) in rest.iter().enumerate() {
+                if i % 2 == 0 {
+                    assert!(layout.append_pane(Some(&root_id), pane(*status)));
+                } else {
+                    let leaf = SplitNode::leaf(pane(*status));
+                    assert!(layout.insert_split(&root_id, SplitDirection::Horizontal, leaf));
+                }
+            }
+            state.panels.push(ProjectPanel::new(layout));
+        }
+        state.active_panel_id = state.panels.first().map(|p| p.id.clone());
+        state
+    }
+
+    /// 改造前的口径逐字搬来当对照:每个状态写入点都 `state.status = state.highest_status()`,
+    /// 全局徽标再逐个项目读那份缓存、`error` 压成 `idle` 取最高。
+    fn old_global(cached: &[PaneStatus]) -> PaneStatus {
+        let mut highest = PaneStatus::Idle;
+        for status in cached {
+            let status = match status {
+                PaneStatus::Error => PaneStatus::Idle,
+                other => *other,
+            };
+            if status.priority() > highest.priority() {
+                highest = status;
+            }
+        }
+        highest
+    }
+
+    /// 项目级状态现算:跨**全部面板**(后台面板里的 AI 一样要亮灯)按
+    /// error > ai-working > ai-idle > idle 取最高。
+    #[test]
+    fn 项目状态现算跨全部面板取最高档() {
+        use PaneStatus::*;
+        let cases: [(&[&[PaneStatus]], PaneStatus); 6] = [
+            (&[&[Idle]], Idle),
+            (&[&[Idle, AiIdle, Idle]], AiIdle),
+            // 后台面板(第二个)里在跑的 AI 也算
+            (&[&[Idle, Idle], &[AiWorking]], AiWorking),
+            (&[&[AiWorking, AiIdle], &[Error, Idle]], Error),
+            (&[&[AiIdle], &[Idle, AiIdle, AiWorking, Idle]], AiWorking),
+            (&[&[Idle, Idle, Idle], &[Idle], &[Idle, Idle]], Idle),
+        ];
+        for (panels, expected) in cases {
+            assert_eq!(project(panels).highest_status(), expected, "{panels:?}");
+        }
+        // 没有任何面板的项目(还没开终端)
+        assert_eq!(ProjectState::new().highest_status(), Idle);
+    }
+
+    /// 与原缓存结果逐一对照:三个项目、每项目两个面板共 3 个 pane,四种状态穷举
+    /// (4^3 种组合 × 三个项目的搭配),新旧两条路算出的全局徽标必须一模一样。
+    ///
+    /// 旧路 = 写入点当场缓存 `highest_status()` 再读缓存;新路 = 读时现算。
+    /// 两者只在「写入点漏了刷新缓存」时才会分叉 —— 见下一条。
+    #[test]
+    fn 现算与原缓存口径逐组合一致() {
+        let mut combos = Vec::new();
+        for a in ALL {
+            for b in ALL {
+                for c in ALL {
+                    combos.push([a, b, c]);
+                }
+            }
+        }
+        // 三个项目各取一种组合;步长错开,覆盖到跨项目的各种高低搭配
+        for (i, p1) in combos.iter().enumerate() {
+            let p2 = combos[(i * 7 + 3) % combos.len()];
+            let p3 = combos[(i * 13 + 5) % combos.len()];
+            let states: Vec<ProjectState> = [p1, &p2, &p3]
+                .iter()
+                .map(|[a, b, c]| project(&[&[*a, *b], &[*c]]))
+                .collect();
+            let cached: Vec<PaneStatus> = states.iter().map(|s| s.highest_status()).collect();
+            let fresh = global_ai_status_of(states.iter().map(|s| s.highest_status()));
+            assert_eq!(fresh, old_global(&cached), "{p1:?} {p2:?} {p3:?}");
+            // 单个项目的现算值 = 旧缓存会写进去的那个值
+            for (state, old) in states.iter().zip(&cached) {
+                assert_eq!(state.highest_status(), *old);
+            }
+        }
+    }
+
+    /// 全局徽标把 error 压成 idle:一个 `exit 1` 的 shell 不该盖住别处在跑的 AI,
+    /// 全是 error 时整条边栏是安静的。
+    #[test]
+    fn 全局徽标把error压成idle() {
+        use PaneStatus::*;
+        assert_eq!(global_ai_status_of([Error, AiIdle]), AiIdle);
+        assert_eq!(global_ai_status_of([Error, Error]), Idle);
+        assert_eq!(global_ai_status_of([Error, AiWorking, AiIdle]), AiWorking);
+        assert_eq!(global_ai_status_of(std::iter::empty()), Idle);
+    }
+
+    /// 旧缓存唯一会陈旧的一处:启动补 PTY 找不到 shell 时把 pane 标成 error,
+    /// 那条路没刷新 `status` 缓存,项目行的灯要等下一次布局变化才跟上。
+    /// 现算没有这个窗口。
+    #[test]
+    fn 补pty标error之后现算立即可见() {
+        let mut state = project(&[&[PaneStatus::Idle, PaneStatus::Idle]]);
+        let stale_cache = state.highest_status();
+        let pane_id = state.all_panes()[1].id.clone();
+        state.pane_mut(&pane_id).unwrap().status = PaneStatus::Error;
+        assert_eq!(stale_cache, PaneStatus::Idle);
+        assert_eq!(state.highest_status(), PaneStatus::Error);
     }
 }

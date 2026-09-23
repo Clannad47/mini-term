@@ -10,7 +10,8 @@ use mt_config::{CommandLibrary, SavedCommand};
 
 use crate::command_library::{merge_groups_on_rename, normalize_group, run_payload};
 
-use super::AppStore;
+use super::events::StoreChanged;
+use super::{AppStore, ConfigSection, StoreEvent};
 
 impl AppStore {
     /// 整个命令库(只读)。
@@ -39,7 +40,7 @@ impl AppStore {
             None => lib.commands.push(next),
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::CommandLibrary));
         true
     }
 
@@ -52,7 +53,7 @@ impl AppStore {
             return;
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::CommandLibrary));
     }
 
     /// 新建一个空分组。重名(显式列表里有 / 已有命令归在该组下)返回 `false`。
@@ -71,7 +72,7 @@ impl AppStore {
         }
         self.config.command_library.groups.push(name.to_string());
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::CommandLibrary));
         true
     }
 
@@ -91,7 +92,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::CommandLibrary));
     }
 
     /// 解散分组:组里的命令回落「未分组」,组名从显式列表移除(命令不删)。
@@ -104,7 +105,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::CommandLibrary));
     }
 
     /// 把一条命令写进某个 pane。`newline = true` 连回车一起(= 运行),

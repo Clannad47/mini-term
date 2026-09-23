@@ -6,7 +6,7 @@
 //! AppStore
 //!  ├─ config: AppConfig            ← mt-config 加载/保存(带写盘令牌)
 //!  ├─ active_project_id
-//!  ├─ project_states: {projectId → ProjectState{ layout: Option<SplitNode>, status }}
+//!  ├─ project_states: {projectId → ProjectState{ panels, active_panel_id, … }}
 //!  ├─ terminals:      {ptyId → Entity<TerminalPane>}   ← 旧版的 terminalCache
 //!  ├─ focused_pane_id                                   ← 旧版靠 DOM 焦点推,这里显式记
 //!  └─ ai: AiBridge                                      ← hook / monitor / 输入输出旁路
@@ -16,6 +16,10 @@
 //! `cx.observe(&store)` 订阅变化 —— 等价于 zustand 的 `useAppStore(selector)`,
 //! 只是粒度粗一档(整棵重画,终端内容不受影响:那一层在 `TerminalPane` 自己的
 //! entity 上,不随 store 的 notify 重跑)。
+//!
+//! 「要做事」的观察者(同步托盘、推中转、校验文档页签、重拉面板数据……)不走
+//! `observe`,改订阅类型化的 [`StoreEvent`](`cx.subscribe(&store, ..)`)按类过滤 ——
+//! 见 [`events`] 模块注释里那张「数据 → 事件」表。
 //!
 //! # 文件布局(纯拆分,逻辑一行未改)
 //!
@@ -28,6 +32,7 @@
 //!  ├─ prefs.rs    面板视图 / 用量 / 主题 / 各类配置 / 感知 / 语言 / 重命名 / 中转
 //!  ├─ ssh.rs      SSH 连接表、远程项目、「关联 SSH」、断线重连
 //!  ├─ layout.rs   项目级终端面板、三栏与抽屉、文件树展开、布局与配置落盘
+//!  ├─ events.rs   类型化变更事件(`StoreEvent`)、改完即发的收口、各观察者的过滤判定
 //!  └─ pure.rs     无 `self` 的纯函数与它们的类型,连同全部单测
 //! ```
 //!
@@ -57,6 +62,7 @@ use crate::tree::{PaneState, PaneStatus, ProjectPanel, SplitNode};
 mod ai;
 mod commands;
 mod config_writer;
+mod events;
 mod layout;
 mod panes;
 mod prefs;
@@ -65,6 +71,8 @@ mod pure;
 mod ssh;
 
 use config_writer::ConfigWriter;
+
+pub use events::{ConfigSection, StoreEvent};
 
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,
 // `crate::store::Xxx` 这条对外路径一字不变(全仓其它文件零改动的前提)。
@@ -77,8 +85,11 @@ pub struct ProjectState {
     pub panels: Vec<ProjectPanel>,
     /// 活动面板 id。列表非空时恒有效([`Self::active_panel`] 兜底取第一个)。
     pub active_panel_id: Option<String>,
-    /// 由**全部面板**聚合出的项目级状态(error > ai-working > ai-idle > idle)。
-    pub status: PaneStatus,
+    // 项目级聚合状态**不再缓存**:读的时候由 [`Self::highest_status`] 现算
+    // (全部面板、error > ai-working > ai-idle > idle)。原先那个 `status` 字段有
+    // 五处写入、三处读取,漏一处写就是「项目行的灯不跟着变」—— 补 PTY 时把
+    // 起不来的 pane 标成 error 那条路就漏了。现算的代价是遍历该项目的 pane,
+    // 最热的读点(根视图每帧的 `global_ai_status`)也只是几十次比较。
     /// 非激活项目里有 AI 任务完成 —— 项目行上的提示点。
     pub needs_attention: bool,
     /// 双击最大化的 pane:终端区只渲染它所在的那个叶子。
@@ -95,7 +106,6 @@ impl ProjectState {
         Self {
             panels: Vec::new(),
             active_panel_id: None,
-            status: PaneStatus::Idle,
             needs_attention: false,
             maximized_pane_id: None,
         }
@@ -595,7 +605,6 @@ impl AppStore {
                 let (panels, active) = persist::restore_layout(saved, &config);
                 state.panels = panels;
                 state.active_panel_id = active;
-                state.status = state.highest_status();
             }
             project_states.insert(project.id.clone(), state);
             expanded_dirs.insert(

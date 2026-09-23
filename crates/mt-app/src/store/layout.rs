@@ -14,8 +14,9 @@ use mt_config::ShellConfig;
 use crate::persist;
 use crate::tree::{ProjectPanel, SplitNode};
 
+use super::events::StoreChanged;
 use super::pure::collect_node_ids;
-use super::AppStore;
+use super::{AppStore, ConfigSection, StoreEvent};
 
 impl AppStore {
     /// 移动端发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
@@ -109,7 +110,7 @@ impl AppStore {
         state.maximized_pane_id = None;
         self.hydrate_project(project_id, cx);
         self.save_project_layout_soon(project_id, cx);
-        cx.notify();
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 换活动面板并把键盘焦点交给它当前激活的 pane(竖条点击的落点)。
@@ -188,7 +189,7 @@ impl AppStore {
                 Some(title.to_string())
             };
             self.save_project_layout_soon(project_id, cx);
-            cx.notify();
+            cx.changed(StoreEvent::LayoutChanged);
         }
     }
 
@@ -218,7 +219,7 @@ impl AppStore {
         }
         self.config.git_changes_view_mode = mode.to_string();
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::View));
     }
 
     pub fn set_right_drawer_width(&mut self, width: f64, cx: &mut Context<Self>) {
@@ -262,7 +263,7 @@ impl AppStore {
             project.expanded_dirs = dirs;
         }
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ExpandedDirsChanged);
     }
 
     // === 三栏尺寸 ===
@@ -286,7 +287,7 @@ impl AppStore {
     pub fn toggle_middle_column(&mut self, cx: &mut Context<Self>) {
         self.config.middle_column_visible = !self.config.middle_column_visible;
         self.save_layout_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::View));
     }
 
     // === 终端列表竖条 ===
@@ -299,7 +300,7 @@ impl AppStore {
     pub fn toggle_terminals_panel(&mut self, cx: &mut Context<Self>) {
         self.terminals_panel_visible = !self.terminals_panel_visible;
         self.save_layout_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::View));
     }
 
     // === 持久化 ===
@@ -307,7 +308,6 @@ impl AppStore {
     // 拆分前是私有方法;调用点在 `store::panes` 与 `store::ssh`,升到 `pub(super)`。
     pub(super) fn after_layout_change(&mut self, project_id: &str, cx: &mut Context<Self>) {
         if let Some(state) = self.project_states.get_mut(project_id) {
-            state.status = state.highest_status();
             // 被最大化的那个 pane 关掉了(或随面板切换离开了活动面板)→ 自动回落
             // 显示整树。原版是在渲染处「按 id 查不到叶子就退回整树」,这里顺手把
             // 陈旧 id 也清掉:留着它只会让 `maximized_pane_id()` 每帧多查一次,
@@ -322,7 +322,7 @@ impl AppStore {
         // 上跳,两张表也会随开关终端无界增长(旧版 setProjectLayout 的同一段)。
         self.done.retain_panes(&self.live_pane_ids());
         self.save_project_layout_soon(project_id, cx);
-        cx.notify();
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 全部项目里活着的 pane id。
