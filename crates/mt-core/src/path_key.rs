@@ -85,7 +85,11 @@ pub fn trim_trailing_separators(path: &str) -> &str {
 /// 整串全是 `/`(含空串)时返回根 `/`。
 pub fn posix_trim_trailing(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
 }
 
 /// 剥掉 Windows verbatim 前缀(`Path::canonicalize` 在 Windows 上会加):

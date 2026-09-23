@@ -2343,12 +2343,10 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         let mut client = test_client(path.clone());
 
-        assert!(
-            !client
-                .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
-                .await
-                .unwrap()
-        );
+        assert!(!client
+            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+            .await
+            .unwrap());
         let reason = rejection_of(&client);
         assert!(reason.contains("ssh-rsa"), "{reason}");
         assert!(reason.contains("第 1 行"), "{reason}");
