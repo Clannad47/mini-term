@@ -101,7 +101,6 @@ mod pty_slot;
 mod redraw;
 mod remote_directory_picker;
 mod remote_project;
-mod remote_ssh;
 mod search_modal;
 mod secrets;
 mod session_branch;
@@ -111,7 +110,6 @@ mod shell_ops;
 mod ssh_assoc;
 mod ssh_conn;
 mod ssh_panel;
-mod ssh_registry;
 mod startup_trace;
 mod store;
 mod syntax_languages;
@@ -2291,7 +2289,7 @@ fn main() {
             ai_for_quit.shutdown();
             // SSH 会话池优雅断开(对齐装机版 `RunEvent::Exit` 里的那一调)。
             // 池没建过时是 no-op,不会为此现起 tokio 运行时。
-            remote_ssh::shutdown_on_exit();
+            mt_remote::shutdown_on_exit();
             async {}
         })
         .detach();

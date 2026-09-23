@@ -53,7 +53,7 @@ impl DocumentKey {
             } => (
                 DocumentBackendKey::Remote {
                     connection_id: connection.id.clone(),
-                    connection_fingerprint: crate::remote_ssh::connection_fingerprint(connection),
+                    connection_fingerprint: mt_remote::connection_fingerprint(connection),
                 },
                 normalize_remote_document_path(path),
             ),

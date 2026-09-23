@@ -135,6 +135,8 @@ mt-ssh = { path = "crates/mt-ssh" }
 mt-terminal = { path = "crates/mt-terminal" }
 mt-ui = { path = "crates/mt-ui" }
 mt-usage = { path = "crates/mt-usage" }
+# SSH 远程项目的服务层(自 mt-app 的 `remote_ssh/` 下沉,不依赖 gpui)。
+mt-remote = { path = "crates/mt-remote" }
 
 # 迁移期把编译时间压下来:GPUI + wgpu/blade 的依赖树很大，
 # dev 下依赖走 opt-level 1，自己的 crate 保持 0 以留调试信息。

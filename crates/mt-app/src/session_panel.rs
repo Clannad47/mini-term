@@ -22,7 +22,7 @@
 //! [`crate::ssh_conn::session_source`] 是**唯一**判据(BB-b 接上):
 //!
 //! ```text
-//! Remote(conn)  → 只走 remote_ssh::ai_sessions([后台]);宿主 / lineage / WSL
+//! Remote(conn)  → 只走 mt_remote::ai_sessions([后台]);宿主 / lineage / WSL
 //!                 三路一条都不发 —— 本地 `get_ai_sessions` 对远程 POSIX 路径
 //!                 会去本机 `~/.claude/projects` 找同名编码目录,命中的是
 //!                 **另一台机器**上同路径的会话
@@ -543,9 +543,7 @@ impl SessionPanel {
                     // (失败静默降级为空表,与原版同)
                     let result = cx
                         .background_executor()
-                        .spawn(async move {
-                            crate::remote_ssh::ai_sessions(&conn, &remote_path, force)
-                        })
+                        .spawn(async move { mt_remote::ai_sessions(&conn, &remote_path, force) })
                         .await;
                     let _ = this.update(cx, |this: &mut Self, cx| {
                         if this.request_id != req {
@@ -769,7 +767,7 @@ impl SessionPanel {
         let session_id = session.id.clone();
         let distro = session.wsl_distro.clone();
         // 远程会话的正文在**另一台机器**上,只能走 SFTP 读(`ai_session_content`);
-        // 连接从主线程取好再传进后台(`remote_ssh` 的线程口径)
+        // 连接从主线程取好再传进后台(`mt_remote` 的线程口径)
         let remote = {
             let store = self.store.read(cx);
             store
@@ -785,7 +783,7 @@ impl SessionPanel {
                     let result = match remote {
                         // 循环续读到文件末尾:单次 SFTP 读封顶 8 MB,只读一段的话
                         // 大会话后半截会被静默丢掉(前进保证与总量护栏在 all 里)
-                        Some(conn) => crate::remote_ssh::ai_session_content_all(
+                        Some(conn) => mt_remote::ai_session_content_all(
                             &conn,
                             &session_type,
                             &session_id,

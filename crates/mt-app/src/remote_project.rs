@@ -1,7 +1,7 @@
 //! 「添加远程项目」弹窗(对照 `src/components/AddRemoteProjectModal.tsx` 297 行)。
 //!
 //! 选一条已存的 SSH 连接 + 手输远程路径(默认 `~`),保存前先
-//! [`crate::remote_ssh::validate_dir`] 验证目录存在(`~` 由 SFTP canonicalize
+//! [`mt_remote::validate_dir`] 验证目录存在(`~` 由 SFTP canonicalize
 //! 展开),拿返回的**展开绝对路径**落 config;项目名默认取路径末段,可编辑。
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! ⚠️ `validate_dir` 是**阻塞**函数(TCP + KEX + SFTP 往返),雷打不动丢
-//! `background_executor` —— 主线程直调就是整个窗口卡住,见 `remote_ssh` 的线程口径。
+//! `background_executor` —— 主线程直调就是整个窗口卡住,见 `mt_remote` 的线程口径。
 //!
 //! 连接选择区(左栏分组 + 右栏单选列表)与 [`crate::ssh_panel`] 同构且共用
 //! 同一份视图件。
@@ -211,7 +211,7 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
         // [后台] `~` 展开 + canonicalize + stat 目录;不存在 / 非目录 / 连不上 → Err
         let result = cx
             .background_executor()
-            .spawn(async move { crate::remote_ssh::validate_dir(&conn, &path) })
+            .spawn(async move { mt_remote::validate_dir(&conn, &path) })
             .await;
         let _ = cx.update(|window, cx| {
             let (busy, current_conn, current_path, current_name, current_group) = {

@@ -25,6 +25,7 @@
 //!    事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递。
 
 use crate::agent::AgentKind;
+use crate::claude_settings;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -141,11 +142,6 @@ pub fn hook_binary_path() -> Result<String, String> {
     Ok(hook_path.to_string_lossy().to_string())
 }
 
-/// 获取 Claude Code 配置文件路径: ~/.claude/settings.json
-fn claude_settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
-}
-
 /// 获取 Codex hook 配置文件路径: ~/.codex/hooks.json
 fn codex_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
@@ -210,62 +206,48 @@ fn build_claude_hook_entry(hook_path: &str, event: &str) -> Value {
 
 /// 注册 Claude Code hooks 到 ~/.claude/settings.json
 fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
-    let settings_path = claude_settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let settings_path =
+        claude_settings::settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
-    // 确保 .claude 目录存在
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
-    }
-
-    // 读取现有配置
-    let mut settings: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?
-    } else {
-        serde_json::json!({})
-    };
-
-    // 确保 hooks 对象存在
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = serde_json::json!({});
-    }
-
-    let hooks = settings["hooks"]
-        .as_object_mut()
-        .ok_or_else(|| "hooks 字段不是对象".to_string())?;
-
-    let mut updated = 0;
-    let mut added = 0;
-
-    for event in CLAUDE_HOOK_EVENTS {
-        let new_entry = build_claude_hook_entry(hook_path, event);
-
-        if let Some(event_hooks) = hooks.get_mut(*event) {
-            if let Some(arr) = event_hooks.as_array_mut() {
-                // 查找已有的 miniterm-hook 条目
-                // Claude Code 格式: [{ "matcher": "", "hooks": [{ "command": "..." }] }]
-                let existing_idx = arr.iter().position(entry_is_miniterm);
-
-                if let Some(idx) = existing_idx {
-                    arr[idx] = new_entry;
-                    updated += 1;
-                } else {
-                    arr.push(new_entry);
-                    added += 1;
-                }
-            }
-        } else {
-            hooks.insert(event.to_string(), serde_json::json!([new_entry]));
-            added += 1;
+    // 读改写走共用助手:建 .claude 目录 / 读现有配置 / 原子写回 / 与 ssh_registry
+    // 进程内串行,口径见 `claude_settings` 模块注释
+    let (added, updated) = claude_settings::update(&settings_path, |settings| {
+        // 确保 hooks 对象存在
+        if settings.get("hooks").is_none() {
+            settings["hooks"] = serde_json::json!({});
         }
-    }
 
-    // 写回配置文件
-    let json_str = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    crate::util::atomic_write(&settings_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
+        let hooks = settings["hooks"]
+            .as_object_mut()
+            .ok_or_else(|| "hooks 字段不是对象".to_string())?;
+
+        let mut updated = 0;
+        let mut added = 0;
+
+        for event in CLAUDE_HOOK_EVENTS {
+            let new_entry = build_claude_hook_entry(hook_path, event);
+
+            if let Some(event_hooks) = hooks.get_mut(*event) {
+                if let Some(arr) = event_hooks.as_array_mut() {
+                    // 查找已有的 miniterm-hook 条目
+                    // Claude Code 格式: [{ "matcher": "", "hooks": [{ "command": "..." }] }]
+                    let existing_idx = arr.iter().position(entry_is_miniterm);
+
+                    if let Some(idx) = existing_idx {
+                        arr[idx] = new_entry;
+                        updated += 1;
+                    } else {
+                        arr.push(new_entry);
+                        added += 1;
+                    }
+                }
+            } else {
+                hooks.insert(event.to_string(), serde_json::json!([new_entry]));
+                added += 1;
+            }
+        }
+        Ok((added, updated))
+    })?;
 
     Ok(format!(
         "Claude Code: {} 个 hook 已添加, {} 个已更新 (共 {} 个事件)",
@@ -277,44 +259,37 @@ fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
 
 /// 从 ~/.claude/settings.json 中卸载 miniterm hooks
 fn unregister_claude_hooks() -> Result<String, String> {
-    let settings_path = match claude_settings_path() {
+    let settings_path = match claude_settings::settings_path() {
         Some(p) if p.exists() => p,
         _ => return Ok("Claude Code: settings.json 不存在，无需卸载".to_string()),
     };
 
-    let content = std::fs::read_to_string(&settings_path)
-        .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-    let mut settings: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?;
+    let removed = claude_settings::update(&settings_path, |settings| {
+        let mut removed = 0;
 
-    let mut removed = 0;
-
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in CLAUDE_HOOK_EVENTS {
-            if let Some(event_hooks) = hooks.get_mut(*event) {
-                if let Some(arr) = event_hooks.as_array_mut() {
+        if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+            for event in CLAUDE_HOOK_EVENTS {
+                if let Some(event_hooks) = hooks.get_mut(*event)
+                    && let Some(arr) = event_hooks.as_array_mut()
+                {
                     let before = arr.len();
                     arr.retain(|entry| !entry_is_miniterm(entry));
                     removed += before - arr.len();
                 }
             }
-        }
 
-        // 清理空的事件数组
-        let empty_keys: Vec<String> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in empty_keys {
-            hooks.remove(&key);
+            // 清理空的事件数组
+            let empty_keys: Vec<String> = hooks
+                .iter()
+                .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in empty_keys {
+                hooks.remove(&key);
+            }
         }
-    }
-
-    let json_str = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    crate::util::atomic_write(&settings_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
+        Ok(removed)
+    })?;
 
     Ok(format!("Claude Code: 已移除 {} 个 hook 条目", removed))
 }
@@ -350,7 +325,7 @@ fn registered_events_in(path: Option<PathBuf>) -> std::collections::HashSet<Stri
 }
 
 fn registered_claude_events() -> std::collections::HashSet<String> {
-    registered_events_in(claude_settings_path())
+    registered_events_in(claude_settings::settings_path())
 }
 
 fn registered_codex_events() -> std::collections::HashSet<String> {
@@ -1093,7 +1068,7 @@ impl HookAgent {
     /// 配置文件路径的展示形式（`~` 缩写，面板里直接给用户看到写去了哪）
     fn display_path(self) -> String {
         let raw = match self {
-            HookAgent::Claude => claude_settings_path(),
+            HookAgent::Claude => claude_settings::settings_path(),
             HookAgent::Codex => codex_hooks_path(),
             HookAgent::Grok => grok_hooks_path(),
             HookAgent::Omp => omp_extension_path(),

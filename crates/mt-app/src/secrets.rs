@@ -4,7 +4,8 @@
 //! 需要明文:
 //!
 //! 1. 编辑表单回填(`ssh_panel::new_form`);
-//! 2. 终端自动填充(`pane::connect_ssh` / `remote_ssh::prepare_remote_launch`);
+//! 2. 终端自动填充(`pane::connect_ssh` / `mt_remote::prepare_remote_launch`;
+//!    后者在独立 crate 里,直连 `mt_secret::reveal_global`,与 [`reveal_password`] 同一把钥匙);
 //! 3. `mt-ssh` 会话池认证 —— 那处在 mt-ssh 内部解,三个 sidecar 同一条路。
 //!
 //! 封存只发生在一处:[`crate::store::AppStore::upsert_ssh_connection`]。

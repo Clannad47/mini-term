@@ -812,9 +812,10 @@ impl AppStore {
         // 里找 ssh 客户端、复制私钥并**起 `icacls` 子进程**收紧权限、解开已存密码;
         // 续接要翻 `~/.claude/projects` —— 都是同步 IO,不许上主线程。主线程上只做
         // 查配置这类纯内存的事(连接在不在)。
-        let remote = project.ssh_connection_id.as_deref().map(|conn_id| {
-            crate::remote_ssh::find_connection(&self.config.ssh_connections, conn_id)
-        });
+        let remote = project
+            .ssh_connection_id
+            .as_deref()
+            .map(|conn_id| mt_remote::find_connection(&self.config.ssh_connections, conn_id));
         let (program, args) = (
             shell.command.clone(),
             shell.args.clone().unwrap_or_default(),
@@ -857,7 +858,7 @@ impl AppStore {
             Some(Ok(conn)) => Box::new(move || {
                 // 预检失败(本机缺 ssh 客户端 / 私钥不在):`?` 交回 Err,不 spawn,
                 // pane 里直接显示这条错误
-                let launch = crate::remote_ssh::prepare_remote_launch(&conn, &cwd)?;
+                let launch = mt_remote::prepare_remote_launch(&conn, &cwd)?;
                 Ok(PreparedLaunch {
                     spec: PtySpawn {
                         program: launch.program,

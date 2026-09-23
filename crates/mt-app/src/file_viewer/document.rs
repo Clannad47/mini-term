@@ -59,9 +59,9 @@
 use std::time::{Duration, Instant};
 
 use mt_project::fs::FileContentResult;
+use mt_remote::{RemoteFileBaseline, RemoteFileReadResult, RemoteFileSaveResult};
 
 use crate::i18n::t;
-use crate::remote_ssh::{RemoteFileBaseline, RemoteFileReadResult, RemoteFileSaveResult};
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 
 /// 文件行尾。读入时探测,写回时还原。
@@ -149,7 +149,7 @@ const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 // ─── 远程内容的接缝 ─────────────────────────────────────────────
 
 /// 远程读回来的一份内容。真类型是 [`RemoteFileReadResult`];做成 trait 只为单测
-/// 能造假基线 —— 真基线([`RemoteFileBaseline`])的字段出了 `remote_ssh` 就不可见,
+/// 能造假基线 —— 真基线([`RemoteFileBaseline`])的字段出了 `mt_remote` 就不可见,
 /// 这是它防「UI 伪造基线」的刻意设计,不为测试破例。
 pub(super) trait RemoteContent {
     type Baseline: Clone;

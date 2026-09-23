@@ -483,11 +483,7 @@ impl FileViewer {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
-                            crate::remote_ssh::read_file_content(
-                                &connection,
-                                &project_root,
-                                &remote_path,
-                            )
+                            mt_remote::read_file_content(&connection, &project_root, &remote_path)
                         })
                         .await;
                     let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
@@ -526,7 +522,7 @@ impl FileViewer {
 
     fn apply_remote_content(
         &mut self,
-        content: crate::remote_ssh::RemoteFileReadResult,
+        content: mt_remote::RemoteFileReadResult,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -558,7 +554,7 @@ impl FileViewer {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::remote_ssh::read_file_content(&connection, &project_root, &remote_path)
+                    mt_remote::read_file_content(&connection, &project_root, &remote_path)
                 })
                 .await;
             let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
@@ -704,8 +700,8 @@ impl FileViewer {
         let invalid = current_root.as_deref() != Some(project_root.as_str())
             || current.as_ref().is_none_or(|current| {
                 current.id != connection.id
-                    || crate::remote_ssh::connection_fingerprint(current)
-                        != crate::remote_ssh::connection_fingerprint(connection)
+                    || mt_remote::connection_fingerprint(current)
+                        != mt_remote::connection_fingerprint(connection)
             });
         if self.doc.set_remote_source_invalid(invalid) {
             cx.notify();
@@ -908,7 +904,7 @@ impl FileViewer {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
-                            crate::remote_ssh::save_file_content(
+                            mt_remote::save_file_content(
                                 &connection,
                                 &project_root,
                                 &remote_path,
@@ -1051,7 +1047,7 @@ impl FileViewer {
             project_id,
             project_root,
             &connection.id,
-            crate::remote_ssh::connection_fingerprint(connection),
+            mt_remote::connection_fingerprint(connection),
             self.current_path.clone(),
             window,
             cx,

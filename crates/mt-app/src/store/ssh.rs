@@ -83,7 +83,7 @@ impl AppStore {
             None => self.config.ssh_connections.push(conn),
         }
         if identity_changed {
-            crate::remote_ssh::invalidate_connection(&id);
+            mt_remote::invalidate_connection(&id);
         }
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
@@ -107,7 +107,7 @@ impl AppStore {
         if self.config.ssh_connections.len() == before {
             return;
         }
-        crate::remote_ssh::invalidate_connection(id);
+        mt_remote::invalidate_connection(id);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
@@ -231,7 +231,7 @@ impl AppStore {
     /// 远程项目引用的连接;**断链**(连接被删)时 `None`。
     ///
     /// 返回克隆而不是引用:调用方多半要把它丢进 `background_executor`
-    /// (`remote_ssh` 的入口全是阻塞函数,见那个模块的线程口径)。
+    /// (`mt_remote` 的入口全是阻塞函数,见那个 crate 的线程口径)。
     pub fn remote_connection_of(&self, project_id: &str) -> Option<SshConnection> {
         let project = self.project(project_id)?;
         crate::ssh_conn::remote_connection(project, &self.config.ssh_connections).cloned()
@@ -271,7 +271,7 @@ impl AppStore {
 
     /// 添加一个 SSH 远程项目并返回它的 id(`AddRemoteProjectModal.tsx::handleSave`
     /// 的落盘那一半 —— 远程路径的 `~` 展开与目录校验由调用方先跑
-    /// [`crate::remote_ssh::validate_dir`],这里只接**已 canonicalize 的绝对路径**)。
+    /// [`mt_remote::validate_dir`],这里只接**已 canonicalize 的绝对路径**)。
     ///
     /// - `name` 为空时取路径末段(再取不到就用整条路径),与原版一字不差;
     /// - 远程项目**不参与** [`Self::find_project_by_path`] 的去重(那条判据显式
@@ -380,9 +380,7 @@ impl AppStore {
                     let token = existing_token.clone();
                     let res = cx
                         .background_executor()
-                        .spawn(async move {
-                            crate::ssh_registry::enable(&dir, token.as_deref())
-                        })
+                        .spawn(async move { mt_ai::ssh_registry::enable(&dir, token.as_deref()) })
                         .await?;
                     SshAssocOutcome {
                         enabled: true,
@@ -398,7 +396,7 @@ impl AppStore {
                     let dir = project_dir.clone();
                     let message = cx
                         .background_executor()
-                        .spawn(async move { crate::ssh_registry::disable(&dir) })
+                        .spawn(async move { mt_ai::ssh_registry::disable(&dir) })
                         .await?;
                     SshAssocOutcome {
                         enabled: false,

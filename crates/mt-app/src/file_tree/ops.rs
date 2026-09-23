@@ -303,7 +303,7 @@ pub(super) fn spawn_tree_op_planned(
     true
 }
 
-fn operation_summary(summary: &crate::remote_ssh::FileOperationSummary) -> Option<String> {
+fn operation_summary(summary: &mt_remote::FileOperationSummary) -> Option<String> {
     let mut text = tr!(
         "fileTree",
         "operation.summary",
@@ -419,7 +419,7 @@ pub(super) fn paste_file_clipboard(
                 None,
                 t("fileTree", "operation.copying").into(),
                 move || {
-                    crate::remote_ssh::copy_entry_keep_both(&conn, &root, &source, &target)
+                    mt_remote::copy_entry_keep_both(&conn, &root, &source, &target)
                         .map(|(_, summary)| operation_summary(&summary))
                 },
                 window,
@@ -464,7 +464,7 @@ fn run_upload(
     conn: mt_config::SshConnection,
     target_dir: PathBuf,
     local_paths: Vec<PathBuf>,
-    strategy: crate::remote_ssh::FileConflictStrategy,
+    strategy: mt_remote::FileConflictStrategy,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -479,7 +479,7 @@ fn run_upload(
         Some(detach_before),
         t("fileTree", "operation.uploading").into(),
         move || {
-            crate::remote_ssh::upload_paths(&conn, &root, &target, &local_paths, strategy)
+            mt_remote::upload_paths(&conn, &root, &target, &local_paths, strategy)
                 .map(|summary| operation_summary(&summary))
         },
         window,
@@ -520,7 +520,7 @@ pub(super) fn start_upload(
     let target = target_dir.to_string_lossy().into_owned();
     let scan_paths = local_paths.clone();
     let task = cx.background_executor().spawn(async move {
-        crate::remote_ssh::upload_conflicts(&conn, &root, &target, &scan_paths)
+        mt_remote::upload_conflicts(&conn, &root, &target, &scan_paths)
             .map(|conflicts| (conn, conflicts))
     });
     window
@@ -537,7 +537,7 @@ pub(super) fn start_upload(
                         conn,
                         target_dir.clone(),
                         local_paths.clone(),
-                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                        mt_remote::FileConflictStrategy::KeepBoth,
                         window,
                         cx,
                     );
@@ -658,7 +658,7 @@ fn run_download(
     conn: mt_config::SshConnection,
     remote_paths: Vec<PathBuf>,
     download_dir: PathBuf,
-    strategy: crate::remote_ssh::FileConflictStrategy,
+    strategy: mt_remote::FileConflictStrategy,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -671,23 +671,18 @@ fn run_download(
         None,
         t("fileTree", "operation.downloading").into(),
         move || {
-            crate::remote_ssh::download_entries(
-                &conn,
-                &root,
-                &remote_paths,
-                &download_dir,
-                strategy,
+            mt_remote::download_entries(&conn, &root, &remote_paths, &download_dir, strategy).map(
+                |summary| {
+                    let mut message = operation_summary(&summary).unwrap_or_default();
+                    message.push_str("\n\n");
+                    message.push_str(&tr!(
+                        "fileTree",
+                        "operation.downloadLocation",
+                        path = download_dir.display()
+                    ));
+                    Some(message)
+                },
             )
-            .map(|summary| {
-                let mut message = operation_summary(&summary).unwrap_or_default();
-                message.push_str("\n\n");
-                message.push_str(&tr!(
-                    "fileTree",
-                    "operation.downloadLocation",
-                    path = download_dir.display()
-                ));
-                Some(message)
-            })
         },
         window,
         cx,
@@ -736,7 +731,7 @@ pub(super) fn start_download(
     let scan_paths = remote_paths.clone();
     let task = cx
         .background_executor()
-        .spawn(async move { crate::remote_ssh::download_conflicts(&scan_dir, &scan_paths) });
+        .spawn(async move { mt_remote::download_conflicts(&scan_dir, &scan_paths) });
     window
         .spawn(cx, async move |cx| {
             let result = task.await;
@@ -751,7 +746,7 @@ pub(super) fn start_download(
                         conn,
                         remote_paths,
                         download_dir,
-                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                        mt_remote::FileConflictStrategy::KeepBoth,
                         window,
                         cx,
                     );
@@ -838,7 +833,7 @@ pub(super) fn start_move(
         plan,
         t("fileTree", "operation.moving").into(),
         move || match connection {
-            Some(conn) => crate::remote_ssh::move_entry(
+            Some(conn) => mt_remote::move_entry(
                 &conn,
                 &root.to_string_lossy(),
                 &path.to_string_lossy(),
@@ -877,7 +872,7 @@ pub(super) fn confirm_move(
     let target_label = if target_dir == context.root {
         t("fileTree", "moveTo.root").to_string()
     } else if source.remote {
-        crate::remote_ssh::posix_relative(
+        mt_remote::posix_relative(
             &context.root.to_string_lossy(),
             &target_dir.to_string_lossy(),
         )
@@ -957,7 +952,7 @@ pub(super) fn new_entry_prompt(
                 None,
                 t("fileTree", "operation.creating").into(),
                 move || match connection {
-                    Some(conn) => crate::remote_ssh::create_entry(
+                    Some(conn) => mt_remote::create_entry(
                         &conn,
                         &root.to_string_lossy(),
                         &operation_dir.to_string_lossy(),

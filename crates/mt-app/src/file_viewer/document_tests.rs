@@ -109,7 +109,7 @@ fn 保存走原子写且_crlf_全程不变() {
 
 // ─── DocumentSession:模块注释那张状态转换表逐行锁住 ─────────────
 
-/// 假远程内容:基线用一个数字代表 —— 真基线出了 `remote_ssh` 造不出来(见
+/// 假远程内容:基线用一个数字代表 —— 真基线出了 `mt_remote` 造不出来(见
 /// [`RemoteContent`])。
 #[derive(Debug, Clone)]
 struct FakeRemote {
