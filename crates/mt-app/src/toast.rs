@@ -366,10 +366,11 @@ impl ToastLayer {
         };
 
         // ⚠️ **必须 defer**:切项目会 `hydrate_project` → 起 PTY,而起 PTY 有一条
-        // 支路会推 WSL 提示 toast(见 `TerminalPane::new`)。此刻我们正身处
+        // 支路会推 WSL 提示 toast(见 `TerminalPane::finish_spawn`)。此刻我们正身处
         // `ToastLayer` 自己的 update 里,那一推就是同一实体的嵌套 update ——
         // gpui 当场 panic。`window.defer` 把整段挪到本轮 effect 之后,
-        // 那时 ToastLayer 的借用早已释放。
+        // 那时 ToastLayer 的借用早已释放。(PTY 挪后台之后那一推已是回填时异步
+        // 发生的,这条路眼下撞不上;defer 照留 —— 切项目链路上别的同步推送同样适用。)
         window.defer(cx, move |window, cx| {
             let store = AppStore::global(cx);
             // 队列是异步消失的,点下去时那个项目可能已经被删了

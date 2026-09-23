@@ -402,15 +402,28 @@ impl AppStore {
         find_pane_of_pty(&self.project_states, pty_id)
     }
 
-    /// 这个 pane 的 PTY 起来了吗。
+    /// 这个 pane 的 PTY 起没起来 —— 定局后答复(`true` = 起来了)。
     ///
     /// `spawn_pane` 就算 PTY 起不来也照样返回 `PaneState`(视图里画一行红字),
-    /// 而 [`Self::write_to_pane`] 在没有 PTY 时是静默丢弃的 —— 移动端发起会话的
+    /// 而 [`Self::write_to_pane`] 在起失败后是静默丢弃的 —— 移动端发起会话的
     /// 回执要靠这一条把「终端根本没起来」与「命令已写入」分开。
-    pub fn pane_pty_alive(&self, pty_id: u32, cx: &App) -> bool {
-        self.terminals
-            .get(&pty_id)
-            .is_some_and(|entity| entity.read(cx).spawn_error().is_none())
+    ///
+    /// PTY 在后台起,建完 pane 那一刻还没有结论,所以这是个等待口(见
+    /// [`TerminalPane::spawn_settled`]);终端实体不在 → 立刻答 `false`。
+    /// 接收端拿到 `Canceled`(pane 在定局前没了)也按失败算。
+    pub fn pane_spawn_settled(
+        &self,
+        pty_id: u32,
+        cx: &mut App,
+    ) -> futures::channel::oneshot::Receiver<bool> {
+        match self.terminals.get(&pty_id) {
+            Some(entity) => entity.update(cx, |pane, _| pane.spawn_settled()),
+            None => {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                let _ = tx.send(false);
+                rx
+            }
+        }
     }
 
     /// 中转连接状态(`RelayEvents::status_changed` 的落点)。

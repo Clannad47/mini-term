@@ -97,6 +97,7 @@ mod project_list;
 mod project_switcher;
 mod project_tree;
 mod prompt;
+mod pty_slot;
 mod redraw;
 mod remote_directory_picker;
 mod remote_project;
@@ -2270,9 +2271,11 @@ fn main() {
         store.update(cx, |store, cx| store.apply_theme_from_config(None, cx));
 
         // 当前项目的终端要补起来(布局是从 layout.db 恢复的,PTY 当然没了),但
-        // **不在这里补** —— 每个 pane 的 openpty + 进程 spawn 都在主线程串行走,
-        // 恢复六七个 pane 就是几百毫秒,放在开窗之前等于让首帧陪着等。挪到首帧
-        // 呈现之后(见下方 `open_window` 之后那段),窗口先出来,终端随后贴上。
+        // **不在这里补** —— 挪到首帧呈现之后(见下方 `open_window` 之后那段),窗口
+        // 先出来,终端随后贴上。当初挪它是因为每个 pane 的 openpty + 进程 spawn 都在
+        // 主线程串行走(实测恢复 6 个 pane 约 110ms,慢机器 / 网络盘上是几百毫秒到
+        // 几秒);现在 spawn 与续接 cwd 反查已进后台(见 `pane` 模块注释「PTY 在后台
+        // 起」),主线程上只剩建视图,这个时机照旧保留。
         let active = store.read(cx).active_project_id.clone();
         startup_trace::mark("setup: config applied (layout restored)");
 
@@ -2378,6 +2381,7 @@ fn main() {
         // 常驻驱动,另外两家不一定)。
         //
         // 代价是 PTY 晚一个 vsync 起步(十几毫秒),换来的是窗口不再陪 spawn 干等。
+        // (spawn 本身已在后台跑,这里只是把「建视图 + 派发后台任务」排到首帧之后。)
         if let Some(project_id) = active {
             let store = store.clone();
             let _ = window.update(cx, |_, window, _| {
@@ -2393,7 +2397,8 @@ fn main() {
                                 store.focus_pane(&project_id, &pane_id, window, cx);
                             }
                         });
-                        startup_trace::mark("hydrate: PTYs spawned (after first frame)");
+                        // PTY 此刻只是派发给了后台,真正起好在各 pane 回填时
+                        startup_trace::mark("hydrate: PTY spawns dispatched (after first frame)");
                     });
                 });
             });
