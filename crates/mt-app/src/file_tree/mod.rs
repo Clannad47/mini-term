@@ -16,9 +16,11 @@
 //!
 //! 断链(连接被删)不去读本机同名路径:直接给
 //! `fileTree.remote.broken` 那句明确错误(项目仍可见、可删)。
-//! - 目录变化走 [`mt_project::watch::FsWatcher`](mt_project::watch::FsWatcher):
-//!   sink 里往 channel 丢,主线程上的前台任务醒来后失效缓存并重列 ——
-//!   与 AI 状态、终端重绘是同一套跨线程唤醒模式;
+//! - 目录变化走 [`mt_project::watch::FsWatcher`](mt_project::watch::FsWatcher)
+//!   (进程级监听单例的一个订阅者):sink 里往 channel 丢,主线程上的前台任务醒来后
+//!   失效缓存并重列 —— 与 AI 状态、终端重绘是同一套跨线程唤醒模式。watch 只在主线程
+//!   登记期望,校验与 notify 注册在单例的后台线程里做;列目录那一趟先等注册落定
+//!   (有预算)再读目录,见 [`FileTree::load_dir_with`];
 //! - 单击文件开[文件预览器](crate::file_viewer)(AA 批之前是双击调外部编辑器 ——
 //!   预览器缺位时的临时替身,原版文件行上只有预览这一条路)。
 //!
@@ -214,6 +216,8 @@ pub struct FileTree {
     active_operation_suppressed_path: Option<PathBuf>,
     /// 正在被删除、重命名或批量改写的子树。操作结束前禁止 watcher / 展开态补列
     /// 重新挂载它，避免大目录删除时 watcher 事件洪泛和半成品缓存回写。
+    /// 监听注册虽在后台线程做，unwatch 却是当场改期望表、摘路由：脱挂前还在排队的
+    /// 注册回来认领不到就作废，不会把子树「复活」；新的 watch 由各入口查本表挡住。
     suppressed_subtrees: HashSet<PathBuf>,
     /// 拖放当前命中的目标目录(外部文件上传 / 树内移动)。
     drop_target: Option<DropTarget>,
@@ -358,7 +362,7 @@ impl FileTree {
         // 丢过去的是**变动文件的完整路径**:重列只要它的父目录,但技术栈缓存的
         // 失效判据要看文件名本身(`Cargo.toml` / `package.json` 之类)
         let (tx, mut rx) = mpsc::unbounded::<PathBuf>();
-        let watcher = Arc::new(FsWatcher::new(move |change| {
+        let watcher = Arc::new(FsWatcher::with_label("files", move |change| {
             // notify 自己的线程:只把「什么变了」丢过去,重列在主线程排。
             let _ = tx.unbounded_send(change.path);
         }));
@@ -717,12 +721,11 @@ impl FileTree {
 
         // 远程项目**不注册 watcher**:远端文件系统本机监听不到
         let remote = self.remote_conn(cx);
-        if remote.is_none()
-            && self.watched.insert(dir.clone())
-            && let Err(err) = self.watcher.watch(&dir, root.to_string_lossy().as_ref())
-        {
-            eprintln!("[files] 监听 {} 失败: {err:#}", dir.display());
-        }
+        // 这里只登记期望:校验(canonicalize)与 notify 注册在监听单例的后台线程里做,
+        // WSL/网络盘上也不卡主线程。失败由单例打 `[files] 监听 X 失败` 日志,目录照样
+        // 留在 `watched` 里(与同步时代一致:折叠再展开才重试)
+        let watch_ready = (remote.is_none() && self.watched.insert(dir.clone()))
+            .then(|| self.watcher.watch(&dir, root.to_string_lossy().as_ref()));
 
         let task_dir = dir.clone();
         let task_root = root.clone();
@@ -738,6 +741,12 @@ impl FileTree {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // 先等这个目录的监听挂上(有预算)再读目录:次序与同步时代「先挂
+                    // 监听、再列目录」一致,列完之后的变化一定有事件,不用多列一遍。
+                    // 预算用完(注册线程被慢盘拖住)就照常往下列
+                    if let Some(ready) = watch_ready {
+                        ready.wait(mt_project::watch::WATCH_READY_BUDGET);
+                    }
                     let entries = crate::remote_ssh::list_directory_for(
                         remote.as_ref(),
                         &task_root,
@@ -792,16 +801,14 @@ impl FileTree {
                                     tree.chain_owner.insert(segment.clone(), dir.clone());
                                     // 链上**每一段**都要监听:后端 watcher 是
                                     // NonRecursive,中段新增文件否则无人上报,
-                                    // 压缩前提破了也不知道
-                                    if tree.watched.insert(segment.clone())
-                                        && let Err(err) = tree
-                                            .watcher
-                                            .watch(segment, root.to_string_lossy().as_ref())
+                                    // 压缩前提破了也不知道。正在被删/改名的子树
+                                    // 不挂(`suppressed_subtrees`);失败日志由监听
+                                    // 单例打,同上
+                                    if !tree.path_is_suppressed(segment)
+                                        && tree.watched.insert(segment.clone())
                                     {
-                                        eprintln!(
-                                            "[files] 监听 {} 失败: {err:#}",
-                                            segment.display()
-                                        );
+                                        tree.watcher
+                                            .watch(segment, root.to_string_lossy().as_ref());
                                     }
                                 }
                             }
@@ -1036,6 +1043,9 @@ impl FileTree {
 
     /// 删除前解除目标子树 watcher 并清掉缓存，避免大目录逐文件事件洪泛；远程树虽
     /// 没 watcher，也共用缓存清理。失败后父目录重列会按展开状态逐层恢复。
+    /// unwatch 当场摘掉事件路由（此后不再有事件进来），notify 句柄随即由监听单例的
+    /// 注册线程放掉——它每轮先摘后挂、一轮只解析一个待决注册，排队再长也最多等
+    /// 手上那一个。
     fn detach_subtree(&mut self, target: &Path) {
         let watched: Vec<PathBuf> = self
             .watched

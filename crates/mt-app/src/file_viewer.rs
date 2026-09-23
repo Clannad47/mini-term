@@ -76,7 +76,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 use mt_project::fs::FileContentResult;
-use mt_project::watch::FsWatcher;
+use mt_project::watch::{FsWatcher, WATCH_READY_BUDGET, WatchReady};
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -2690,7 +2690,7 @@ impl FileViewer {
     ) -> Self {
         // notify 自己的线程只把「哪个文件变了」丢过来,判定在主线程做
         let (tx, mut rx) = mpsc::unbounded::<PathBuf>();
-        let watcher = Arc::new(FsWatcher::new(move |change| {
+        let watcher = Arc::new(FsWatcher::with_label("file-viewer", move |change| {
             let _ = tx.unbounded_send(change.path);
         }));
         // `spawn_in` 而不是 `spawn`:重载要建 `InputState`,那是 `&mut Window` 的活
@@ -2818,7 +2818,7 @@ impl FileViewer {
         }
         self.remote_refreshing = false;
         self.refresh_warning = None;
-        self.rewatch();
+        let watch_ready = self.rewatch();
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         self.remote_conflict = None;
@@ -2846,7 +2846,14 @@ impl FileViewer {
                     let probe = (project_root, path.clone());
                     let outcome = cx
                         .background_executor()
-                        .spawn(async move { mt_project::fs::read_file_content(&probe.0, &probe.1) })
+                        .spawn(async move {
+                            // 刚换了监听目录就先等它挂上(有预算)再读:读完之后的外部
+                            // 改动一定有事件,与同步时代「先挂监听、再读盘」同一次序
+                            if let Some(ready) = watch_ready {
+                                ready.wait(WATCH_READY_BUDGET);
+                            }
+                            mt_project::fs::read_file_content(&probe.0, &probe.1)
+                        })
                         .await;
                     let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
                         if view.current_path != path || view.load_generation != generation {
@@ -3195,27 +3202,35 @@ impl FileViewer {
     // ── 监听外部修改 ──────────────────────────────────────
 
     /// 换文件时把监听挪到新文件的**父目录**上(notify 是目录级监听)。
-    /// `FsWatcher` 内部有引用计数,与文件树同时监听同一目录是安全的。
-    fn rewatch(&mut self) {
+    ///
+    /// 每个页签是进程级监听单例的一个订阅者:与文件树同时监听同一目录时后端只注册
+    /// 一次,各自按自己的项目根收事件(见 `mt_project::watch` 模块注释)。这里只登记
+    /// 期望,校验与注册在单例的后台线程里做;新挂的目录返回回执,调用方读盘前先等它。
+    /// 上次注册失败的(目录当时不可访问等),每次重载都重试一次 —— 与同步时代
+    /// 「失败不记账、下次再试」同一口径。
+    fn rewatch(&mut self) -> Option<WatchReady> {
         if self.source.is_remote() {
             if let Some(old) = self.watched.take() {
                 self.watcher.unwatch(&old);
             }
-            return;
+            return None;
         }
         let dir = self.current_path.parent().map(|p| p.to_path_buf());
-        if self.watched == dir {
-            return;
+        if self.watched == dir
+            && !dir
+                .as_deref()
+                .is_some_and(|dir| self.watcher.is_failed(dir))
+        {
+            return None;
         }
         if let Some(old) = self.watched.take() {
             self.watcher.unwatch(&old);
         }
-        if let Some(dir) = dir {
-            let project = self.project_root.to_string_lossy().to_string();
-            if self.watcher.watch(&dir, &project).is_ok() {
-                self.watched = Some(dir);
-            }
-        }
+        let dir = dir?;
+        let project = self.project_root.to_string_lossy().to_string();
+        let ready = self.watcher.watch(&dir, &project);
+        self.watched = Some(dir);
+        Some(ready)
     }
 
     /// 逐条对照 `FileViewerModal.tsx:275-283`。看图页签另走换代
