@@ -400,6 +400,15 @@ pub fn resolve_auto_resume_command(
 // 拆分前是模块私有;现在调用点(`store::panes::hydrate_project`)是兄弟模块,
 // 升到 `pub(super)`。
 pub(super) fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
+    resolve_resume_cwd_with(session, mt_ai::sessions::lookup_ai_session_cwd)
+}
+
+/// [`resolve_resume_cwd`] 的可注入版本:`lookup` 是「按会话 id 翻 jsonl」那一步。
+/// 单测换成计数桩,证明 codex / omp 根本不去翻盘。
+fn resolve_resume_cwd_with(
+    session: &AiSessionRef,
+    lookup: impl FnOnce(String) -> Option<String>,
+) -> Option<String> {
     if let Some(cwd) = session.cwd.as_deref() {
         return Path::new(cwd).is_dir().then(|| cwd.to_string());
     }
@@ -408,7 +417,44 @@ pub(super) fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
     if matches!(session.agent.as_deref(), Some("codex") | Some("omp")) {
         return None;
     }
-    mt_ai::sessions::lookup_ai_session_cwd(session.session_id.clone())
+    lookup(session.session_id.clone())
+}
+
+/// 启动恢复时,续接 pane 的 PTY 该在哪个目录起 + 反查到的会话 cwd。
+///
+/// 返回 `(启动目录, 会话 cwd)`。取值链与挪后台之前一字不差(`hydrate_project`
+/// 原地那两行):**pane 自己的 cwd 优先**(用户显式给这个 pane 定的目录,worktree
+/// 终端靠它),会话 cwd 只在 pane 没指定时兜底;两个都没有 → `None`,调用方落项目根。
+/// 会话 cwd 即便没被用来起 PTY 也照样返回 —— 它要随身份写回,下次重启免查。
+///
+/// `resolve` 即 [`resolve_resume_cwd`](带 `is_dir` 预检、codex / omp 不反查),
+/// 可注入只为单测。**同步磁盘 IO**:只许在后台线程上调(见 `start_pty_with`
+/// 交给 pane 的启动预案)。
+pub(super) fn decide_resume_cwd(
+    pane_cwd: Option<String>,
+    session: &AiSessionRef,
+    resolve: impl FnOnce(&AiSessionRef) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let session_cwd = resolve(session);
+    let start = pane_cwd.or_else(|| session_cwd.clone());
+    (start, session_cwd)
+}
+
+/// 把后台反查所得的会话 cwd 写回 pane 的会话身份。返回「真改了」(调用方据此落盘)。
+///
+/// 只认**同一个会话**:从反查到回填之间 hook 可能已经报上来一个新身份(用户手快
+/// 起了别的会话),那时写回会把别人的目录安到新会话头上。值没变就不动(与原先
+/// `sess.cwd != Some(cwd)` 才写的口径相同)。
+pub(super) fn apply_resolved_session_cwd(
+    session: &mut AiSessionRef,
+    session_id: &str,
+    cwd: &str,
+) -> bool {
+    if session.session_id != session_id || session.cwd.as_deref() == Some(cwd) {
+        return false;
+    }
+    session.cwd = Some(cwd.to_string());
+    true
 }
 
 /// fork 出的新 PTY 该以哪个目录启动。
@@ -1142,6 +1188,88 @@ mod tests {
     fn codex_会话不反查目录() {
         let s = session(Some("codex"), "rollout_9");
         assert_eq!(resolve_resume_cwd(&s), None);
+    }
+
+    /// 续接启动目录的取值链(挪后台前后一字不差):pane cwd 优先、会话 cwd 兜底、
+    /// 都没有落 `None`(调用方用项目根);会话 cwd 即便没被用上也要交回去写回。
+    #[test]
+    fn 续接启动目录_pane_优先会话兜底() {
+        let s = session(Some("claude"), "abc-123");
+        let found = || Some("D:/proj/sub".to_string());
+
+        // pane 自己有目录:用它起,反查结果照样交回(写回用)
+        assert_eq!(
+            decide_resume_cwd(Some("D:/wt".into()), &s, |_| found()),
+            (Some("D:/wt".into()), Some("D:/proj/sub".into()))
+        );
+        // pane 没指定:会话 cwd 兜底
+        assert_eq!(
+            decide_resume_cwd(None, &s, |_| found()),
+            (Some("D:/proj/sub".into()), Some("D:/proj/sub".into()))
+        );
+        // 都没有:None(调用方落项目根)
+        assert_eq!(decide_resume_cwd(None, &s, |_| None), (None, None));
+        assert_eq!(
+            decide_resume_cwd(Some("D:/wt".into()), &s, |_| None),
+            (Some("D:/wt".into()), None)
+        );
+    }
+
+    /// 反查只在 claude 系且会话记录里没有 cwd 时才发生:codex / omp 根本不碰盘,
+    /// 记录里带着(且在盘上)的 cwd 直接用。
+    #[test]
+    fn 续接启动目录_codex_omp_不反查() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let lookup = |_: String| {
+            calls.set(calls.get() + 1);
+            Some("D:/from-jsonl".to_string())
+        };
+        for agent in ["codex", "omp"] {
+            let s = session(Some(agent), "rollout_9");
+            assert_eq!(
+                decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),
+                (None, None),
+                "{agent} 不该反查"
+            );
+        }
+        assert_eq!(calls.get(), 0, "codex / omp 一次都不许翻盘");
+
+        // claude(含缺省 agent)没有 cwd → 反查一次
+        for agent in [Some("claude"), None] {
+            let s = session(agent, "abc-123");
+            assert_eq!(
+                decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)).0,
+                Some("D:/from-jsonl".into())
+            );
+        }
+        assert_eq!(calls.get(), 2);
+
+        // 记录里带着在盘上的 cwd:直接用,不反查
+        let tmp = std::env::temp_dir().to_string_lossy().to_string();
+        let mut s = session(Some("claude"), "abc-123");
+        s.cwd = Some(tmp.clone());
+        assert_eq!(
+            decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),
+            (Some(tmp.clone()), Some(tmp))
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// 写回只认同一个会话,值没变不算改动。
+    #[test]
+    fn 反查所得目录只写回同一个会话() {
+        let mut s = session(Some("claude"), "abc-123");
+        assert!(apply_resolved_session_cwd(&mut s, "abc-123", "D:/p"));
+        assert_eq!(s.cwd.as_deref(), Some("D:/p"));
+        assert!(
+            !apply_resolved_session_cwd(&mut s, "abc-123", "D:/p"),
+            "没变不落盘"
+        );
+        // hook 已经报上来别的身份:不许把旧会话的目录安到新会话头上
+        let mut other = session(Some("claude"), "new-456");
+        assert!(!apply_resolved_session_cwd(&mut other, "abc-123", "D:/p"));
+        assert_eq!(other.cwd, None);
     }
 
     /// 回滚行数的四条钳制分支(`resolveScrollback` 逐条对照)。

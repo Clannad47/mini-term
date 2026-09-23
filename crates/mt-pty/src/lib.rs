@@ -803,6 +803,32 @@ mod tests {
         );
     }
 
+    /// 上层(mt-app 的 pane)在后台线程上 spawn、再把会话交回主线程,
+    /// 会话必须能跨线程移动。编译期断言,改字段时别把它弄丢。
+    #[test]
+    fn session_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PtySession>();
+    }
+
+    #[test]
+    fn dropping_session_kills_the_child() {
+        // 上层在回填前丢掉会话(pane 已关闭 / 实体已释放)不再单独 kill,
+        // 靠的就是这一条:`Drop` 必须当场杀子进程,不留孤儿。
+        let session = PtySession::spawn(interactive_spec(), |_| {}).expect("spawn 失败");
+        let child = Arc::clone(&session.child);
+        assert!(
+            child.lock().try_wait().expect("try_wait 失败").is_none(),
+            "交互式 shell 此刻应当还活着"
+        );
+        drop(session);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.lock().try_wait().expect("try_wait 失败").is_none() {
+            assert!(Instant::now() < deadline, "丢弃会话 10s 后子进程仍然活着");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn write_notifies_input_observer_with_raw_bytes() {
         let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
