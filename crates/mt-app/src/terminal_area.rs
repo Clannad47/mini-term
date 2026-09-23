@@ -3220,6 +3220,39 @@ impl TerminalArea {
         cx.notify();
     }
 }
+/// 稳态下的终端 pane 套 gpui 的 **view 级缓存**:别的 pane 刷屏那一拍,闲着的
+/// pane 整块跳过 render / prepaint / paint,直接重放上一帧(判据与三条前提见
+/// `main.rs::cached_panel`)。此前每个可见 pane 每帧都要把整屏格子重新过一遍
+/// 签名、重新出一遍图元 —— 分屏里一个 AI 在刷、另外三个闲着,就是四份的活。
+///
+/// # 逐条核过的「不 notify 就不会动」清单
+///
+/// 缓存只在四种情况下失效:本视图(或它的子视图)被 notify、bounds 变、
+/// content_mask 变、`window.refresh()`。终端画面的每一种变化都落在其中之一:
+///
+/// - **输出**:reader 线程 → `redraw::request` → 节拍器 notify 的就是 `TerminalPane`;
+/// - **键入 / IME 预编辑 / 粘贴 / 滚轮 / 拖选 / 停留复制 / 滚动条拖动与悬停**:
+///   `TerminalView` 与终端元素的监听器里全是 `cx.notify(自己)`,沿视图路径标脏到本 pane;
+/// - **滚动条淡出**:paint 里 `request_animation_frame`,下一帧 notify 当前视图;
+/// - **查找**:查找条是本 pane 的子视图(改关键词 / 翻页即标脏);输出引起的重扫被
+///   去抖挡下时,渲染层排一发延后 notify 兜底(`TerminalSearch::take_trailing_rescan`);
+/// - **焦点切换 / 窗口激活 / 缩放与 DPI**:gpui 走 `window.refresh()`,全窗缓存作废;
+/// - **主题 / 字号 / 语言 / 减弱动效**:`set_theme` / `set_style` 自己 notify,
+///   界面字号与语言走 `refresh_windows`,亮暗切换经 `Theme::change(window)` 刷新;
+/// - **回滚行数 / 跳标记**:`set_scrollback` 与 `scroll_to_marker` 改了回看却可能
+///   不触发任何 notify,两处已补上显式 notify;
+/// - **pane 尺寸变化 / tab 推入推出动画**:bounds 变,缓存自然未命中。
+///
+/// 祖先不在动画里改 opacity(push 动画只动 `left`),`window_control_area` 也不在
+/// pane 里,`main.rs::cached_panel` 的第二、三条前提同样满足。
+///
+/// 占位样式与 `TerminalPane::render` 根节点(两个分支都是 `size_full`)等价。
+fn cached_terminal(entity: Entity<crate::pane::TerminalPane>) -> AnyElement {
+    entity
+        .cached(gpui::StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
 /// 叶内切 tab 的方向性 push 两层(见文件头注释):新 pane 按方向推入、旧 pane
 /// 同向推出;两层都是全尺寸 absolute,只动 `left`,PTY 不收 resize。没有在场
 /// 记录时零包装 —— 只包终端主体,tab 栏不参与(它没换内容,动了反而怪)。
@@ -3291,7 +3324,7 @@ fn leaf_terminal_layer(
                     )
                     .into_any_element()
             }
-            None => entity.into_any_element(),
+            None => cached_terminal(entity),
         },
         // 空洞态(RevealBack 在飞)只画底色,不出「正在启动」——
         // 那行字会在飞行层落位前闪一下

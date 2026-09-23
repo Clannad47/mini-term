@@ -5,11 +5,11 @@
 //! 版本不匹配时停止重连(重试无意义),等待用户升级。
 
 use parking_lot::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::host::{AiLauncher, RelayEvents, RelayHost};
-use crate::mirror::{self, history_slice, MirrorParser, MIRROR_PAGE_SIZE};
+use crate::mirror::{self, MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, history_slice};
 use crate::util::is_wsl_unc_path;
 
 /// 握手 ack 等待超时。
@@ -30,6 +30,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 镜像会话文件轮询间隔。
 const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 启发式绑定(无 hook 会话身份)**已绑上**时多久重新定位一次。
+///
+/// 启发式定位要把四家的会话目录各扫一遍 —— Codex 那条递归整个
+/// `~/.codex/sessions`、逐个 stat 再打开最新 30 个读头,实测一次 30ms 量级
+/// (本机 378 个 rollout);已绑上时每秒扫一遍纯属浪费。增量泵照旧每轮跑,
+/// 只把「项目里有没有更新的会话文件」这个问题降到 10s 问一次。代价如实记:
+/// 无 hook 时切会话(`/clear` 等)的换绑最多晚 10s。
+const HEURISTIC_RELOCATE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 启发式绑定**还没绑上**(本轮会话的文件尚未落盘)时多久重新定位一次。
+/// 比已绑上时勤一些:这段时间移动端看到的是空镜像,等的就是第一个文件出现。
+const HEURISTIC_PENDING_INTERVAL: Duration = Duration::from_secs(3);
 
 /// 桌面侧 store 喂入的同步载荷:比 wire 类型多项目路径(镜像绑定用,不发给移动端)。
 ///
@@ -71,6 +84,92 @@ struct MirrorRuntime {
     parser: MirrorParser,
     path: PathBuf,
     offset: u64,
+}
+
+/// 决定「这个 pane 该镜像哪个文件」的全部输入。与上一次定位时不同 = 当轮必须
+/// 重新定位(hook 上报了新身份、AI 换了一轮、PTY 换了),时机与原来每轮都定位一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocateKey {
+    /// hook 上报过会话身份:按身份精确定位
+    Hook {
+        pty_id: u32,
+        agent: Option<String>,
+        session_id: String,
+    },
+    /// 输入检测认出的 agent 没有可解析的记录(pi / opencode):恒为空镜像,不做 IO
+    NoLog { pty_id: Option<u32>, agent: String },
+    /// 无会话身份:项目最新文件 + AI 启动时刻下限的启发式
+    Heuristic {
+        pty_id: Option<u32>,
+        agent: Option<String>,
+        started: Option<SystemTime>,
+    },
+}
+
+/// 一个镜像订阅的定位状态:上一次用什么输入、在什么时刻、定位到了哪个文件。
+///
+/// 只在轮询任务里流转(每轮随阻塞任务带进带出),不与点选作答的泵共享 ——
+/// 那条只碰 [`MirrorRuntime`]。
+#[derive(Default)]
+struct MirrorLocator {
+    key: Option<LocateKey>,
+    /// 上一次定位的结果。`None` = 本轮会话的文件尚未落盘 / 该 agent 没有记录:
+    /// 此时**不泵**旧绑定(与原来「定位落空的那一轮不泵」同口径)
+    resolved: Option<(PathBuf, MirrorAgent)>,
+    at: Option<Instant>,
+    /// 已给过首个(可能为空的)快照
+    sent_initial: bool,
+}
+
+impl MirrorLocator {
+    /// 这一轮要不要重新定位。`bound` = 运行态当前绑着的文件(`None` = 从没绑过,
+    /// 或增量泵发现文件被截断/删掉而清了运行态)。
+    fn needs_locate(&self, key: &LocateKey, bound: Option<&Path>, now: Instant) -> bool {
+        if self.key.as_ref() != Some(key) {
+            return true;
+        }
+        let resolved = self.resolved.as_ref().map(|(path, _)| path.as_path());
+        match key {
+            // 精确绑定:身份没变且已绑在定位结果上 → 只做增量泵。文件还没落盘、
+            // 或被截断清掉了运行态,才每轮再找(与原来同一节奏)
+            LocateKey::Hook { .. } => resolved.is_none() || resolved != bound,
+            // 结果恒为 None,输入没变就不必再算
+            LocateKey::NoLog { .. } => false,
+            LocateKey::Heuristic { .. } => {
+                let elapsed = self
+                    .at
+                    .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+                match bound {
+                    // 绑过但运行态被泵清掉了(文件截断/重写):立刻重绑,
+                    // 与原来「下一轮重新绑定」同时机
+                    None if resolved.is_some() => true,
+                    None => elapsed >= HEURISTIC_PENDING_INTERVAL,
+                    Some(_) => elapsed >= HEURISTIC_RELOCATE_INTERVAL,
+                }
+            }
+        }
+    }
+}
+
+/// 一条镜像订阅在轮询任务手上的那几样。每轮连同 `Arc` 一起带进阻塞线程池。
+struct MirrorJob {
+    pane_id: String,
+    project_path: String,
+    messages: Arc<Mutex<Vec<MirrorMessage>>>,
+    runtime: Arc<Mutex<Option<MirrorRuntime>>>,
+}
+
+/// 按定位输入找会话文件(阻塞 IO,只在阻塞线程池上调)。
+fn locate_session_file(project_path: &str, key: &LocateKey) -> Option<(PathBuf, MirrorAgent)> {
+    match key {
+        LocateKey::Hook {
+            agent, session_id, ..
+        } => mirror::resolve_session_file_by_id(project_path, agent.as_deref(), session_id),
+        LocateKey::NoLog { .. } => None,
+        LocateKey::Heuristic { started, .. } => {
+            mirror::resolve_session_file(project_path, *started)
+        }
+    }
 }
 
 /// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)
@@ -472,6 +571,113 @@ impl MobileRelayManager {
         }
     }
 
+    /// 这一轮的定位输入。绑定分两层,每轮重取(PTY 映射、hook 上报都可能后到):
+    /// 1. hook 上报过会话身份 → 只认该会话的文件,未落盘就等(空镜像),
+    ///    不退启发式——退了就会串到同项目其他 pane 的会话;
+    /// 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式。
+    ///
+    /// 这几问都是查内存表,每轮问一遍没有代价;贵的是拿着答案去扫磁盘,
+    /// 那一步由 [`MirrorLocator::needs_locate`] 把关。
+    fn mirror_locate_key(&self, pane_id: &str) -> LocateKey {
+        let pty_id = self.pane_ptys.lock().get(pane_id).copied();
+        if let Some(pty) = pty_id
+            && let Some(s) = self.host.hook_session(pty)
+        {
+            return LocateKey::Hook {
+                pty_id: pty,
+                agent: s.agent,
+                session_id: s.session_id,
+            };
+        }
+        // 启发式的前提是"这个 agent 会往磁盘写我们认识的会话记录"。pi /
+        // opencode 不写(或格式不认),此时退启发式就会绑到同项目里 Claude/
+        // Codex 的最新文件,把别人的对话贴到这个 pane 上——比空镜像更糟。
+        let agent = pty_id.and_then(|id| self.host.ai_session_agent(id));
+        if let Some(agent) = agent.as_deref()
+            && !mirror::agent_has_session_log(agent)
+        {
+            return LocateKey::NoLog {
+                pty_id,
+                agent: agent.to_string(),
+            };
+        }
+        LocateKey::Heuristic {
+            pty_id,
+            agent,
+            started: pty_id.and_then(|id| self.host.ai_session_started_at(id)),
+        }
+    }
+
+    /// 镜像轮询的一轮:必要时重新定位,换绑或增量泵。**全是阻塞文件 IO**,
+    /// 只在阻塞线程池上跑(见 [`mirror_task`])。
+    ///
+    /// `locate` 是定位函数本身(生产传 [`locate_session_file`]),单测注入计数替身。
+    fn mirror_round(
+        &self,
+        job: &MirrorJob,
+        locator: &mut MirrorLocator,
+        now: Instant,
+        locate: impl Fn(&str, &LocateKey) -> Option<(PathBuf, MirrorAgent)>,
+    ) {
+        let key = self.mirror_locate_key(&job.pane_id);
+        let bound = job.runtime.lock().as_ref().map(|rt| rt.path.clone());
+        if locator.needs_locate(&key, bound.as_deref(), now) {
+            locator.resolved = locate(&job.project_path, &key);
+            locator.key = Some(key);
+            locator.at = Some(now);
+        }
+        match locator.resolved.clone() {
+            None => {
+                // 属于本轮会话的文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
+                if !locator.sent_initial {
+                    locator.sent_initial = true;
+                    let _ = self.send(DesktopToRelay::MirrorSnapshot {
+                        pane_id: job.pane_id.clone(),
+                        messages: vec![],
+                        has_more: false,
+                    });
+                }
+            }
+            Some((path, agent)) if bound.as_deref() != Some(path.as_path()) => {
+                // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照
+                if self.rebind_mirror(job, path, agent) {
+                    locator.sent_initial = true;
+                }
+            }
+            // 增量与「文件被截断→清运行态待重绑」都在泵里
+            Some(_) => self.pump_mirror(&job.pane_id, &job.messages, &job.runtime),
+        }
+    }
+
+    /// 换绑:整份解析新文件并重发快照。返回是否绑上(文件读不了 = 没绑上,下一轮再试)。
+    ///
+    /// 解析用一只新解析器、在锁外做完(文件可能不小,解析可能几百毫秒,不该让点选
+    /// 作答的泵干等);换入运行态与替换消息缓存在同一次持锁内完成,防点选作答的泵
+    /// 在中间插进来喂错解析器。
+    fn rebind_mirror(&self, job: &MirrorJob, path: PathBuf, agent: MirrorAgent) -> bool {
+        let mut parser = MirrorParser::new(agent);
+        let Some((msgs, offset)) = mirror::parse_whole_file(&path, &mut parser) else {
+            return false;
+        };
+        let (page, has_more) = {
+            let mut slot = job.runtime.lock();
+            *slot = Some(MirrorRuntime {
+                parser,
+                path,
+                offset,
+            });
+            let mut m = job.messages.lock();
+            *m = msgs;
+            history_slice(&m, None, MIRROR_PAGE_SIZE)
+        };
+        let _ = self.send(DesktopToRelay::MirrorSnapshot {
+            pane_id: job.pane_id.clone(),
+            messages: page,
+            has_more,
+        });
+        true
+    }
+
     /// 分页取数:从订阅的消息缓存里取 seq < before_seq 的最近一页并回发。
     fn send_mirror_history(&self, pane_id: &str, before_seq: u64) {
         let slice = {
@@ -558,8 +764,14 @@ impl MobileRelayManager {
             },
         );
         let manager = Arc::clone(self);
+        let job = Arc::new(MirrorJob {
+            pane_id,
+            project_path,
+            messages,
+            runtime,
+        });
         self.spawn(async move {
-            mirror_task(manager, pane_id, project_path, messages, runtime, cancel_rx).await;
+            mirror_task(manager, job, cancel_rx).await;
         });
     }
 }
@@ -992,84 +1204,33 @@ fn try_answer_question(
 
 /// 镜像轮询任务:解析 pane 应镜像的最新会话文件,增量读取新行推送;
 /// 出现更新的会话文件时重新绑定并重发快照。
+///
+/// 每一轮([`MobileRelayManager::mirror_round`])整个丢进 tokio 的**阻塞线程池**:
+/// 定位要扫会话目录、换绑要把整份记录解析一遍、增量泵也是文件读,而中转运行时
+/// 只有两个工作线程,WebSocket 收发也在上面 —— 让它们去等磁盘,移动端的指令
+/// 回执与镜像推送就一起卡住。
 async fn mirror_task(
     manager: Arc<MobileRelayManager>,
-    pane_id: String,
-    project_path: String,
-    messages: Arc<Mutex<Vec<MirrorMessage>>>,
-    runtime: Arc<Mutex<Option<MirrorRuntime>>>,
+    job: Arc<MirrorJob>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut sent_initial = false;
+    let mut locator = MirrorLocator::default();
 
     loop {
-        // 绑定分两层,每轮重取(PTY 映射、hook 上报都可能后到):
-        // 1. hook 上报过会话身份 → 只认该会话的文件,未落盘就等(空镜像),
-        //    不退启发式——退了就会串到同项目其他 pane 的会话;
-        // 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式。
-        let pty_id = manager.pane_ptys.lock().get(&pane_id).copied();
-        let resolved = match pty_id.and_then(|id| manager.host.hook_session(id)) {
-            Some(s) => {
-                mirror::resolve_session_file_by_id(&project_path, s.agent.as_deref(), &s.session_id)
-            }
-            None => {
-                // 启发式的前提是"这个 agent 会往磁盘写我们认识的会话记录"。pi /
-                // opencode 不写(或格式不认),此时退启发式就会绑到同项目里 Claude/
-                // Codex 的最新文件,把别人的对话贴到这个 pane 上——比空镜像更糟。
-                let agent = pty_id.and_then(|id| manager.host.ai_session_agent(id));
-                if agent.is_some_and(|a| !mirror::agent_has_session_log(&a)) {
-                    None
-                } else {
-                    let ai_started =
-                        pty_id.and_then(|id| manager.host.ai_session_started_at(id));
-                    mirror::resolve_session_file(&project_path, ai_started)
-                }
-            }
+        let round = {
+            let manager = manager.clone();
+            let job = job.clone();
+            let mut locator = std::mem::take(&mut locator);
+            tokio::task::spawn_blocking(move || {
+                manager.mirror_round(&job, &mut locator, Instant::now(), locate_session_file);
+                locator
+            })
         };
-        match resolved {
-            None => {
-                // 属于本轮会话的文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
-                if !sent_initial {
-                    sent_initial = true;
-                    let _ = manager.send(DesktopToRelay::MirrorSnapshot {
-                        pane_id: pane_id.clone(),
-                        messages: vec![],
-                        has_more: false,
-                    });
-                }
-            }
-            Some((path, agent)) => {
-                let rebind = runtime.lock().as_ref().is_none_or(|rt| rt.path != path);
-                if rebind {
-                    // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照。
-                    // 全量读在锁外(文件可能不小);换入运行态与替换消息缓存在
-                    // 同一次持锁内完成,防点选作答的泵在中间插进来喂错解析器
-                    if let Some((bytes, offset)) = mirror::read_from_offset(&path, 0) {
-                        let (page, has_more) = {
-                            let mut slot = runtime.lock();
-                            let rt = slot.insert(MirrorRuntime {
-                                parser: MirrorParser::new(agent),
-                                path,
-                                offset,
-                            });
-                            let msgs = rt.parser.feed(&bytes);
-                            let mut m = messages.lock();
-                            *m = msgs;
-                            history_slice(&m, None, MIRROR_PAGE_SIZE)
-                        };
-                        sent_initial = true;
-                        let _ = manager.send(DesktopToRelay::MirrorSnapshot {
-                            pane_id: pane_id.clone(),
-                            messages: page,
-                            has_more,
-                        });
-                    }
-                } else {
-                    // 增量与「文件被截断→清运行态待重绑」都在泵里
-                    manager.pump_mirror(&pane_id, &messages, &runtime);
-                }
-            }
-        }
+        // 阻塞任务 panic / 运行时收摊:这条订阅就此结束(与原来任务体 panic 同结局)
+        locator = match round.await {
+            Ok(locator) => locator,
+            Err(_) => return,
+        };
 
         tokio::select! {
             _ = tokio::time::sleep(MIRROR_POLL_INTERVAL) => {}
@@ -1655,5 +1816,292 @@ mod tests {
         // 简单状态不携带版本字段
         let simple = serde_json::to_string(&MobileRelayStatusPayload::simple("connected")).unwrap();
         assert_eq!(simple, r#"{"status":"connected"}"#);
+    }
+
+    // ── 镜像轮询:定位节流 ──
+
+    use crate::host::{HookSessionId, RelayProject};
+    use std::cell::{Cell, RefCell};
+
+    /// 可控的宿主:hook 身份 / 输入检测的 agent / AI 启动时刻都由测试随手改。
+    #[derive(Default)]
+    struct FakeHost {
+        hook: Mutex<Option<HookSessionId>>,
+        agent: Mutex<Option<String>>,
+        started: Mutex<Option<SystemTime>>,
+    }
+
+    impl RelayHost for FakeHost {
+        fn launchers(&self) -> Vec<AiLauncher> {
+            Vec::new()
+        }
+        fn project(&self, _project_id: &str) -> Option<RelayProject> {
+            None
+        }
+        fn write_pty(&self, _pty_id: u32, _data: String) -> Result<(), String> {
+            Ok(())
+        }
+        fn hook_session(&self, _pty_id: u32) -> Option<HookSessionId> {
+            self.hook.lock().clone()
+        }
+        fn ai_session_agent(&self, _pty_id: u32) -> Option<String> {
+            self.agent.lock().clone()
+        }
+        fn ai_session_started_at(&self, _pty_id: u32) -> Option<SystemTime> {
+            *self.started.lock()
+        }
+    }
+
+    struct MirrorFixture {
+        manager: MobileRelayManager,
+        host: Arc<FakeHost>,
+        job: MirrorJob,
+        dir: PathBuf,
+    }
+
+    impl MirrorFixture {
+        fn new(tag: &str) -> Self {
+            let host = Arc::new(FakeHost::default());
+            let manager = MobileRelayManager::new(host.clone(), Arc::new(NoopRelayHost));
+            manager.pane_ptys.lock().insert("pane-1".into(), 7);
+            let dir = std::env::temp_dir().join(format!(
+                "mt-relay-locate-{tag}-{}",
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let job = MirrorJob {
+                pane_id: "pane-1".into(),
+                project_path: r"D:\proj".into(),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                runtime: Arc::new(Mutex::new(None)),
+            };
+            Self {
+                manager,
+                host,
+                job,
+                dir,
+            }
+        }
+
+        fn round(
+            &self,
+            locator: &mut MirrorLocator,
+            now: Instant,
+            locate: impl Fn(&str, &LocateKey) -> Option<(PathBuf, MirrorAgent)>,
+        ) {
+            self.manager.mirror_round(&self.job, locator, now, locate);
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.job
+                .messages
+                .lock()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect()
+        }
+
+        fn bound(&self) -> Option<PathBuf> {
+            self.job.runtime.lock().as_ref().map(|rt| rt.path.clone())
+        }
+    }
+
+    impl Drop for MirrorFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn user_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}},"timestamp":"2026-01-01T00:00:00Z"}}"#
+        ) + "\n"
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(user_line(text).as_bytes()).unwrap();
+    }
+
+    fn hook(session_id: &str) -> Option<HookSessionId> {
+        Some(HookSessionId {
+            agent: Some("claude-code".into()),
+            session_id: session_id.into(),
+        })
+    }
+
+    /// hook 身份没变且已绑上:此后只做增量泵,不再扫目录(时间过多久都一样);
+    /// 身份一变,**当轮**就重新定位并换绑 —— 与原来每轮都定位的换绑时机一致。
+    #[test]
+    fn hook_bound_pumps_only_until_identity_changes() {
+        let fx = MirrorFixture::new("hook");
+        let a = fx.dir.join("a.jsonl");
+        let b = fx.dir.join("b.jsonl");
+        std::fs::write(&a, user_line("a1")).unwrap();
+        std::fs::write(&b, user_line("b1") + &user_line("b2")).unwrap();
+        let calls = Cell::new(0);
+        let locate = |_: &str, key: &LocateKey| {
+            calls.set(calls.get() + 1);
+            match key {
+                LocateKey::Hook { session_id, .. } if session_id == "sid-a" => {
+                    Some((a.clone(), MirrorAgent::Claude))
+                }
+                LocateKey::Hook { session_id, .. } if session_id == "sid-b" => {
+                    Some((b.clone(), MirrorAgent::Claude))
+                }
+                _ => None,
+            }
+        };
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        *fx.host.hook.lock() = hook("sid-a");
+
+        fx.round(&mut loc, t0, locate);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fx.texts(), ["a1"]);
+
+        append(&a, "a2");
+        fx.round(&mut loc, t0 + Duration::from_secs(1), locate);
+        fx.round(&mut loc, t0 + Duration::from_secs(600), locate);
+        assert_eq!(calls.get(), 1, "身份没变:只泵不定位");
+        assert_eq!(fx.texts(), ["a1", "a2"], "增量照常进来");
+
+        *fx.host.hook.lock() = hook("sid-b");
+        fx.round(&mut loc, t0 + Duration::from_secs(601), locate);
+        assert_eq!(calls.get(), 2, "身份一变当轮重新定位");
+        assert_eq!(fx.bound(), Some(b.clone()));
+        assert_eq!(fx.texts(), ["b1", "b2"], "换绑后是新会话的全量");
+
+        // 文件被截断重写:泵清掉运行态,下一轮立刻重绑(与原来同节奏)
+        std::fs::write(&b, user_line("x")).unwrap();
+        fx.round(&mut loc, t0 + Duration::from_secs(602), locate);
+        assert_eq!(fx.bound(), None, "截断由泵发现并清运行态");
+        fx.round(&mut loc, t0 + Duration::from_secs(603), locate);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(fx.texts(), ["x"]);
+    }
+
+    /// hook 已上报身份、会话文件还没落盘:每轮都再找(移动端在等第一条消息),
+    /// 文件一出现当轮绑上。
+    #[test]
+    fn hook_identity_without_file_keeps_locating_every_round() {
+        let fx = MirrorFixture::new("pending");
+        let a = fx.dir.join("a.jsonl");
+        let calls = Cell::new(0);
+        let locate = |_: &str, _: &LocateKey| {
+            calls.set(calls.get() + 1);
+            a.exists().then(|| (a.clone(), MirrorAgent::Claude))
+        };
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        *fx.host.hook.lock() = hook("sid-a");
+
+        fx.round(&mut loc, t0, locate);
+        fx.round(&mut loc, t0 + Duration::from_secs(1), locate);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fx.bound(), None);
+
+        std::fs::write(&a, user_line("hi")).unwrap();
+        fx.round(&mut loc, t0 + Duration::from_secs(2), locate);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(fx.texts(), ["hi"]);
+        fx.round(&mut loc, t0 + Duration::from_secs(3), locate);
+        assert_eq!(calls.get(), 3, "绑上之后只泵");
+    }
+
+    /// 无 hook 的启发式:已绑上时 10s 才重新定位一次,期间照常泵;AI 换了一轮
+    /// (启动时刻变了)不等节流,当轮重新定位。
+    #[test]
+    fn heuristic_relocates_on_interval_or_when_inputs_change() {
+        let fx = MirrorFixture::new("heuristic");
+        let a = fx.dir.join("a.jsonl");
+        let b = fx.dir.join("b.jsonl");
+        std::fs::write(&a, user_line("a1")).unwrap();
+        std::fs::write(&b, user_line("b1")).unwrap();
+        let newest = RefCell::new(a.clone());
+        let calls = Cell::new(0);
+        let locate = |_: &str, key: &LocateKey| {
+            calls.set(calls.get() + 1);
+            assert!(matches!(key, LocateKey::Heuristic { .. }));
+            Some((newest.borrow().clone(), MirrorAgent::Claude))
+        };
+        *fx.host.agent.lock() = Some("claude".into());
+        *fx.host.started.lock() = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+
+        fx.round(&mut loc, t0, locate);
+        assert_eq!((calls.get(), fx.bound()), (1, Some(a.clone())));
+
+        // 出现了更新的会话文件:节流期内先不换,旧绑定照泵
+        *newest.borrow_mut() = b.clone();
+        append(&a, "a2");
+        fx.round(&mut loc, t0 + Duration::from_secs(5), locate);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fx.texts(), ["a1", "a2"]);
+
+        fx.round(&mut loc, t0 + HEURISTIC_RELOCATE_INTERVAL, locate);
+        assert_eq!(calls.get(), 2, "到点重新定位");
+        assert_eq!(fx.bound(), Some(b.clone()));
+
+        // 同 pane 起了新一轮 AI:输入变了,不等节流
+        *fx.host.started.lock() = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(200));
+        fx.round(
+            &mut loc,
+            t0 + HEURISTIC_RELOCATE_INTERVAL + Duration::from_secs(1),
+            locate,
+        );
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// 启发式还没绑上(本轮会话的文件没落盘):按较短的间隔再找。
+    #[test]
+    fn heuristic_unbound_retries_on_pending_interval() {
+        let fx = MirrorFixture::new("heuristic-pending");
+        let calls = Cell::new(0);
+        let locate = |_: &str, _: &LocateKey| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        fx.round(&mut loc, t0, locate);
+        fx.round(&mut loc, t0 + Duration::from_secs(1), locate);
+        assert_eq!(calls.get(), 1);
+        fx.round(&mut loc, t0 + HEURISTIC_PENDING_INTERVAL, locate);
+        assert_eq!(calls.get(), 2);
+        assert!(loc.sent_initial, "定位落空时给过空快照");
+    }
+
+    /// 没有会话记录的 agent(pi / opencode):定位输入是 NoLog,生产定位函数
+    /// 对它不做任何 IO;输入不变就连这一问都省掉,运行态始终是空的。
+    #[test]
+    fn nolog_agent_never_binds() {
+        let fx = MirrorFixture::new("nolog");
+        *fx.host.agent.lock() = Some("pi".into());
+        assert!(matches!(
+            fx.manager.mirror_locate_key("pane-1"),
+            LocateKey::NoLog { .. }
+        ));
+        assert_eq!(
+            locate_session_file(r"D:\proj", &fx.manager.mirror_locate_key("pane-1")),
+            None
+        );
+        let calls = Cell::new(0);
+        let locate = |_: &str, key: &LocateKey| {
+            calls.set(calls.get() + 1);
+            locate_session_file(r"D:\proj", key)
+        };
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        for s in 0..20 {
+            fx.round(&mut loc, t0 + Duration::from_secs(s), locate);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fx.bound(), None);
     }
 }

@@ -5,6 +5,8 @@
 //! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
 //! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
 //! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
+//! (每秒一次的是增量泵;扫目录的「重新定位」只在定位输入变了时做,无 hook 的
+//! 启发式另按间隔节流,见 `relay::MirrorLocator`。)
 //!
 //! 绑定策略分两层:hook 上报过会话身份(pty→session_id)时精确绑定该会话的
 //! 文件,同项目多个 AI pane 各绑各的会话;未启用 hook 时退回"项目最新文件 +
@@ -69,6 +71,9 @@ pub struct MirrorParser {
     agent: MirrorAgent,
     next_seq: u64,
     partial: Vec<u8>,
+    /// `partial` 里已确认不含 `\n` 的前缀长度。超长行(工具输出动辄几 MB)跨好几块
+    /// 才到齐时,下一块只从这里往后找换行,不必把攒着的半行从头再扫一遍。
+    scanned: usize,
     /// grok 专用:消息被拆成任意多个 chunk 行,要攒到边界才成一条。
     /// 其余两家一行即一条,该状态机不参与。
     grok: Option<ai_sessions::GrokUpdateParser>,
@@ -82,6 +87,7 @@ impl MirrorParser {
             agent,
             next_seq: 0,
             partial: Vec::new(),
+            scanned: 0,
             grok: (agent == MirrorAgent::Grok).then(ai_sessions::GrokUpdateParser::new),
             pending: Vec::new(),
         }
@@ -95,15 +101,27 @@ impl MirrorParser {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<MirrorMessage> {
         self.partial.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.partial.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.partial.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
+        // 按下标逐行切片,整块切完再一次性丢掉已消费的前缀。此前是逐行
+        // `drain(..=pos)`:每切一行都把剩下的字节整体前移一遍,整份会话记录一次
+        // 喂进来(换绑)时是 O(字节数 × 行数)的搬运 —— 实测 19 MB 的记录光这一步
+        // 就是几百毫秒。
+        let buf = std::mem::take(&mut self.partial);
+        let mut start = 0;
+        let mut from = self.scanned;
+        while let Some(pos) = buf[from..].iter().position(|&b| b == b'\n') {
+            let end = from + pos;
+            let line = String::from_utf8_lossy(&buf[start..end]);
+            start = end + 1;
+            from = start;
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 continue;
             }
             self.parse_line(line, &mut out);
         }
+        self.scanned = buf.len() - start;
+        self.partial = buf;
+        self.partial.drain(..start);
         out
     }
 
@@ -682,6 +700,49 @@ pub fn resolve_session_file_by_id(
         }
         AgentKind::OpenCode | AgentKind::Pi => None,
     }
+}
+
+/// 换绑时整份解析每次读多少字节。
+const REBIND_CHUNK: usize = 256 * 1024;
+
+/// 换绑:从头把整份会话记录解析一遍。**分块读、边读边喂**,原始字节同一时刻只有
+/// 一块在内存里 —— 此前是 `read_to_end` 整份读进来再喂,Claude 的长会话记录实测
+/// 能到 19 MB,每次换绑就是一份等大的临时分配。
+///
+/// **为什么不只读尾部**:镜像要的是整段对话 —— seq 在一次绑定内从 0 连续编号,
+/// 移动端上拉分页一直翻得到第一条([`history_slice`] 的下标就是 seq);挂起提问的
+/// 作答对账、grok 的分片状态机也都要从头走一遍才对得上。只读尾部这三样全会走样,
+/// 所以省的是「整份字节同时在内存」,不是「整份都要解析」。
+///
+/// 返回 (解析出的全部消息, 读到的字节数 = 之后增量泵的起点);打不开 / 读失败
+/// 返回 None(调用方下一轮重试,与原来 `read_from_offset(path, 0)` 失败同处置)。
+pub fn parse_whole_file(
+    path: &Path,
+    parser: &mut MirrorParser,
+) -> Option<(Vec<MirrorMessage>, u64)> {
+    parse_whole_file_chunked(path, parser, REBIND_CHUNK)
+}
+
+fn parse_whole_file_chunked(
+    path: &Path,
+    parser: &mut MirrorParser,
+    chunk: usize,
+) -> Option<(Vec<MirrorMessage>, u64)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; chunk.max(1)];
+    let mut offset = 0u64;
+    let mut out = Vec::new();
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        offset += n as u64;
+        out.extend(parser.feed(&buf[..n]));
+    }
+    Some((out, offset))
 }
 
 /// 从 `offset` 读到文件尾。返回 (新字节, 新 offset);文件比 offset 短(被截断/重写)
@@ -1425,6 +1486,79 @@ mod tests {
         fs::write(&file, b"x\n").unwrap();
         assert!(read_from_offset(&file, offset).is_none());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一段带中文(多字节)、CRLF、空行与提问/作答的 Claude 记录。
+    fn claude_transcript() -> String {
+        format!(
+            "{}\r\n\n{}\n{}\n{}\n{}\n",
+            claude_line("user", "你好,帮我改个 bug", "2026-01-01T00:00:00Z"),
+            claude_line("assistant", "好的 ✅ 马上看", "2026-01-01T00:00:01Z"),
+            question_line(),
+            answer_line(),
+            claude_line("assistant", "改完了", "2026-01-01T00:00:04Z"),
+        )
+    }
+
+    /// 切块位置落在任何地方(含多字节字符中间、CRLF 中间)都与整块喂入逐条一致 ——
+    /// 换绑改成分块读之后,这是「行为不变」的全部前提。
+    #[test]
+    fn feed_is_chunking_invariant() {
+        let data = claude_transcript();
+        let bytes = data.as_bytes();
+        let whole = MirrorParser::new(MirrorAgent::Claude).feed(bytes);
+        assert!(whole.len() >= 4, "样本至少要产出几条消息: {whole:?}");
+        for size in 1..=bytes.len() {
+            let mut parser = MirrorParser::new(MirrorAgent::Claude);
+            let mut got = Vec::new();
+            for chunk in bytes.chunks(size) {
+                got.extend(parser.feed(chunk));
+            }
+            assert_eq!(got, whole, "块大小 {size} 时结果与整块喂入不一致");
+        }
+    }
+
+    /// 分块整份解析 = 原来的「整读 + 一次喂」;尾部没写完的半行留在解析器里,
+    /// 偏移照样推到文件尾,之后的增量泵从那里接着读就能把它补全。
+    #[test]
+    fn parse_whole_file_matches_single_read_and_keeps_partial_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-mirror-parse-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        let tail = claude_line("user", "还没写完的一行", "2026-01-01T00:00:05Z");
+        let (head, rest) = tail.split_at(tail.len() / 2);
+        let data = format!("{}{head}", claude_transcript());
+        fs::write(&file, &data).unwrap();
+
+        let (bytes, read_offset) = read_from_offset(&file, 0).unwrap();
+        let expected = MirrorParser::new(MirrorAgent::Claude).feed(&bytes);
+        for chunk in [1, 7, 64, REBIND_CHUNK] {
+            let mut parser = MirrorParser::new(MirrorAgent::Claude);
+            let (msgs, offset) = parse_whole_file_chunked(&file, &mut parser, chunk).unwrap();
+            assert_eq!(msgs, expected, "块大小 {chunk}");
+            assert_eq!(offset, read_offset, "偏移必须推到文件尾(含半行)");
+
+            // 半行由之后的增量读补全
+            let more = parser.feed(format!("{rest}\n").as_bytes());
+            assert_eq!(more.len(), 1);
+            assert_eq!(more[0].content, "还没写完的一行");
+            assert_eq!(more[0].seq, expected.len() as u64, "seq 接着换绑时的编号走");
+        }
+        assert!(
+            parse_whole_file(
+                &dir.join("missing.jsonl"),
+                &mut MirrorParser::new(MirrorAgent::Claude)
+            )
+            .is_none(),
+            "打不开返回 None,调用方下一轮重试"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
