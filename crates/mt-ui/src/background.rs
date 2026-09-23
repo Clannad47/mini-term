@@ -111,6 +111,16 @@ pub struct BackgroundArtElement {
     fit: Fit,
     /// 额外的整体透明度(0..1)。设置页做小预览时可以调低。
     opacity: f32,
+    source: ArtSource,
+}
+
+/// 位图从哪来。
+#[derive(Clone)]
+enum ArtSource {
+    /// 按 `art.image` 走资源系统取原图(窗口级背景)
+    Original,
+    /// 调用方备好的位图(见 [`BackgroundArtElement::prepared_image`]);`None` = 还没好
+    Prepared(Option<Arc<RenderImage>>),
 }
 
 impl BackgroundArtElement {
@@ -119,7 +129,20 @@ impl BackgroundArtElement {
             art,
             fit: Fit::Cover,
             opacity: 1.0,
+            source: ArtSource::Original,
         }
+    }
+
+    /// 画调用方给的位图,不按 `art.image` 取原图。`None` = 还没备好,那一帧
+    /// 什么都不画(口径同上)。
+    ///
+    /// 给设置页的皮肤卡片用:卡片只有两三百像素宽,原图动辄 2560×1440
+    /// (解出来 15 MB 内存 + 同样大的显存),卡片换成按显示尺寸缩的缩略图
+    /// (缩略图的生成与释放在 mt-app 那边)。铺法(cover + focus + 纱罩)不变 ——
+    /// 缩略图与原图同宽高比,[`fit_bounds`] 算出来的落位一样。
+    pub fn prepared_image(mut self, image: Option<Arc<RenderImage>>) -> Self {
+        self.source = ArtSource::Prepared(image);
+        self
     }
 
     pub fn fit(mut self, fit: Fit) -> Self {
@@ -134,6 +157,9 @@ impl BackgroundArtElement {
 
     /// 解码好的位图。没好返回 `None`(见结构体注释)。
     fn image(&self, window: &mut Window, cx: &mut App) -> Option<Arc<RenderImage>> {
+        if let ArtSource::Prepared(image) = &self.source {
+            return image.clone();
+        }
         let resource = Resource::Path(self.art.image.clone().into());
         window
             .use_asset::<ImageAssetLoader>(&resource, cx)
