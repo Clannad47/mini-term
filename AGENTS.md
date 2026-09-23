@@ -8,7 +8,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 - **UI/渲染**: [gpui-pre](https://crates.io/crates/gpui-pre) 0.3.5（Zed 快照，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-pre-platform`）+ gpui-component 0.6.2（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
-- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」）+ macOS dmg + Linux deb/tar.gz
+- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉四家 AI 工具里的 hook 注册，升级不摘）+ macOS dmg + Linux deb/tar.gz
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
 
 ## 开发命令
@@ -20,7 +20,7 @@ node scripts/stage-sidecars.mjs
 # 启动开发实例（⚠️ 与装机版并跑时必须隔离数据目录）
 MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 
-# 全工作区测试（2026-09 实数：33 个目标 / 2069 例 —— 目标数 = Running + Doc-tests 行数，
+# 全工作区测试（2026-09 实数：33 个目标 / 2076 例 —— 目标数 = Running + Doc-tests 行数，
 # 例数 = 各 `test result:` 行 passed 之和；数字只是快照，随代码增长）
 cargo test --workspace
 
@@ -43,6 +43,7 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 bun run tools/omp-ext-check.ts
 ```
 
+- **便携 ConPTY**（Windows）：`main()` 在建 gpui 平台层之前调 `mt_pty::conpty::initialize_default()`，从 exe 同目录的 `portable-conpty\` 预载 Windows Terminal 1.24 的 conpty.dll，PTY 宿主于是是 `portable-conpty\x64\OpenConsole.exe` 而不是系统 `conhost.exe`。dev 实例的这个目录由上面的 `stage-sidecars.mjs` 就位到 `target/debug/`；没就位就回落系统 ConPTY——看日志里的 `[conpty-bootstrap] backend=portable|system` 一行。⚠️ 该脚本不认 `CARGO_TARGET_DIR`：给构建另设了 target 目录时，要把 `target/debug/portable-conpty/`（连同三个 sidecar）复制到那个目录的 `debug/` 下，否则 dev 实例跑的是系统 conhost。`MT_DISABLE_PORTABLE_CONPTY=1` 跳过预载，用于开 / 关对比与排障
 - 工具链由根目录 `rust-toolchain.toml` 钉死（channel + clippy/rustfmt），CI 按同一文件安装，本地 clippy 与 CI 同版本。新机器 / 新 checkout 先跑一次无参 `rustup toolchain install`（新版 rustup 已弃用「缺工具链时自动安装」）；升级工具链只改该文件的 `channel` 一处。
 - ⚠️ **禁跑 `cargo fmt`**：本仓 HEAD 非 rustfmt-clean，全仓 fmt 会重排几十个文件淹没 diff。
 - ⚠️ GPUI dev 实例运行中时，`cargo build -p mt-app` / `cargo run -p mt-app` 会卡在「无法替换 target/debug/mini-term.exe」——先关实例，或给这次构建另设 `CARGO_TARGET_DIR`。`cargo test`（含 `-p mt-app` 与 `--workspace`）不受影响：mt-app 没有集成测试，只编单测 harness（`target/debug/deps/mini_term-<hash>.exe`），不产出也不替换 `mini-term.exe`。
@@ -66,7 +67,7 @@ bun run tools/omp-ext-check.ts
 | `mt-app` | GPUI 应用壳：Workspace 组件树、AppStore 全局状态、SplitNode 布局树、各面板/弹窗/托盘/标题栏。组件树图见 `main.rs` 模块注释 |
 | `mt-ui` | GPUI 渲染层：终端 view/element、主题桥。不含业务逻辑。**不依赖 mt-config / mt-i18n / mt-project**（前两者改得勤，一改就连带重编这两万多行；后者带 git2）：终端查找条文案由宿主注入（`TerminalSearchBar::new` 的 labels 参数），技术栈徽标按落盘字符串查表（`TechIcon::new(kind.as_str())`） |
 | `mt-terminal` | VT 状态机 + grid 模型（alacritty_terminal 封装）。不依赖 gpui |
-| `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载） |
+| `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载；mt-app `main()` 启动时调一次，必须早于任何 spawn） |
 | `mt-ai` | AI 感知：hook server（权威）、hook 注册（`hook_registry.rs`）、输入检测降级（`detect.rs`）、状态判定（`monitor.rs`/`perception.rs`）、会话记录读取（`sessions.rs`）、SSH 工具 skill 按项目启停（`ssh_registry.rs`）。两个 registry 共动 `~/.claude/settings.json`，读改写统一走 `claude_settings.rs`（原子写 + 进程内串行） |
 | `mt-project` | 文件树、目录监听、搜索、Git（git2，vendored-openssl 必须保留）、外部编辑器、WSL 发行版枚举、技术栈探测与 `ProjectKind` 枚举（`project_kind`；枚举与 mt-ui 的徽标形状表同由 `crates/mt-ui/tools/gen_tech_icons.mjs` 生成，禁止手改） |
 | `mt-config` | 配置持久化(`config.db`,rusqlite)。主题包文件层再导出自 `mt-theme-packs`(`mt_config::ThemePacks` 原路径不变,目录口径 `themes_dir` 留在这里)。不依赖 gpui。`config.json` 已退化成给 sidecar 读的 SSH 投影(见下节);界面布局另见 `mt-layout` |
@@ -100,7 +101,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 | `layout.db` | 界面布局（见下节） | 只有主程序（`mt-layout`） |
 | `usage.db` | 用量账本（可从 JSONL 再生） | `mt-usage` |
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
-| `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件 | 主程序（`mt-app::logfile`） |
+| `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic 连同 backtrace 与模块基址、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件。backtrace 要解析成函数名 + 行号，把 release 资产里同版本的 `Mini-Term_<版本>_x64-pdb.zip` 解压到安装目录（`mini_term.pdb` 与 exe 同目录） | 主程序（`mt-app::logfile`） |
 
 ⚠️ **config.db 前向兼容**：预览版与正式版会来回装、共用同一个库，所以旧版本**只删自己认识的键**，不认识的 settings 键、项目/连接行里不认识的字段（`extra`）、读不懂的键与行都原样留着（口径见 `mt-config/src/db.rs` 模块注释）。由此两条硬规矩：**删 `AppConfig` 字段时把键名加进 `db.rs` 的 `RETIRED_KEYS`**（否则库里旧值永远留着）；**下线的键名永不复用**。
 

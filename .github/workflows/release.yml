@@ -6,14 +6,16 @@ name: Build & Release
 #   身份对齐旧 Tauri NSIS —— HKCU Uninstall\Mini-Term 键 + 读旧 InstallLocation,
 #   老用户原地升级:装过就先弹框告知、再跑旧版卸载器,不是文件覆盖写;
 #   包内平铺 exe + 三个 sidecar + portable-conpty/,
-#   运行时全部按「与 exe 同目录」定位)
+#   运行时全部按「与 exe 同目录」定位)+ 调试符号 zip(mini_term.pdb,单独资产,
+#   不进安装包,见「Package debug symbols」步骤)
 # - macOS arm64 + x64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
 #   bundle id 沿用旧 Tauri 版的 com.mini-term.app)。Intel 包(issue #77)在
 #   GitHub 免费的 `macos-15-intel` runner 上原生编译,不交叉编译;该镜像是 Actions
 #   最后一代 x86_64 macOS,官方承诺可用到 2027-08,之后要么在 arm64 runner 上带
 #   `--target x86_64-apple-darwin` 交叉编,要么 lipo 合成 universal 包
 # - Linux x64:deb + tar.gz(deb 版本号把 `-` 换成 `~`,预发布序才正确 ——
-#   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号)
+#   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号;
+#   deb 的 Depends 由 dpkg-shlibdeps 在构建时按二进制实际链接的库算出)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
 #   该目录收集 —— 目录布局即最终包布局
 # - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
@@ -284,6 +286,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "makensis 退出码 $LASTEXITCODE" }
           Get-ChildItem dist
 
+      # 调试符号单独成一个 release 资产,**不进安装包**(根 Cargo.toml 的 release profile
+      # 开了行号表,MSVC 把它写进 exe 旁的 mini_term.pdb,exe 本身不变)。压成 zip:PDB 压缩比
+      # 高;包内保持链接器写进 exe 的原名 mini_term.pdb —— 解压到安装目录(与 mini-term.exe
+      # 同目录),panic 日志里的 backtrace 就直接解析成函数名 + 行号;不放进去也能对着日志里
+      # 的模块基址换算 RVA 离线解析。PDB 与 exe 靠 GUID 配对,只对同一次构建的 exe 有效。
+      # 资产名带版本号;publish 作业的 SHA256SUMS.txt 按 release 的全部资产算,自动包含它
+      - name: Package debug symbols (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $pdb = 'target/release/mini_term.pdb'
+          if (-not (Test-Path $pdb)) { throw "没找到 ${pdb}(release profile 的 debug 设置被改掉了?)" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path $pdb -DestinationPath "dist/Mini-Term_${version}_x64-pdb.zip" -CompressionLevel Optimal -Force
+          Get-ChildItem dist
+
       - name: Assemble .app bundle + dmg (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -368,6 +387,42 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$PKG/usr/lib/mini-term/"
           done
+          # ── 运行时依赖(Depends)──
+          # 由 dpkg-shlibdeps(build-essential 带的 dpkg-dev)按四个二进制实际链接的 .so
+          # (ELF NEEDED)反查所属包与最低版本算出,不手写死一份会过期的列表:哪天多链 / 少链
+          # 一个库,这里自动跟着变。它只认「源码包」目录布局,临时造一个最小的 debian/control。
+          # 算不出来时退回此前的「不声明依赖」并打 warning —— 不为打包细节挡住整次发版
+          # (publish 要全部平台成功)。
+          SHLIBS_DIR="$(mktemp -d)"
+          mkdir -p "$SHLIBS_DIR/debian"
+          printf 'Source: mini-term\n\nPackage: mini-term\nArchitecture: amd64\n' > "$SHLIBS_DIR/debian/control"
+          BIN_ARGS=()
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            BIN_ARGS+=("-e$PWD/$PKG/usr/lib/mini-term/$name")
+          done
+          DEPENDS=""
+          if SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "${BIN_ARGS[@]}") \
+             && [ "${SHLIBS#shlibs:Depends=}" != "$SHLIBS" ]; then
+            DEPENDS="${SHLIBS#shlibs:Depends=}"
+          else
+            echo "::warning::dpkg-shlibdeps 没算出依赖,deb 不带 Depends: ${SHLIBS:-<no output>}"
+          fi
+          # Ubuntu 24.04 的 64 位 time_t 过渡给一批库改了名(libasound2 → libasound2t64 …),
+          # 22.04 runner 上算出的旧名在 24.04 上只剩虚包。对过渡改名名单里的包补一个
+          # `| <名>t64` 备选,两代发行版都装得上。名单是那次一次性改名的历史事实,与
+          # 「依赖列表」不同,不会随代码变化而过期;不在名单里的依赖原样保留。
+          T64_RENAMED=" libasound2 libglib2.0-0 libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 libssl3 libcurl4 libpng16-16 "
+          if [ -n "$DEPENDS" ]; then
+            DEPENDS=$(printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
+              | while IFS= read -r dep; do
+                  name="${dep%% *}"
+                  case "$T64_RENAMED" in
+                    *" $name "*) printf '%s | %st64\n' "$dep" "$name" ;;
+                    *) printf '%s\n' "$dep" ;;
+                  esac
+                done | paste -sd, - | sed 's/,/, /g')
+          fi
+          echo "Depends: ${DEPENDS:-<none>}"
           ln -s ../lib/mini-term/mini-term "$PKG/usr/bin/mini-term"
           cp docs/icon.png "$PKG/usr/share/icons/hicolor/512x512/apps/mini-term.png"
           cat > "$PKG/usr/share/applications/mini-term.desktop" <<'DESKTOP'
@@ -388,16 +443,23 @@ jobs:
           Description: Desktop terminal manager for the AI era
            Multi-project tabs, recursive split panes, AI process awareness.
           CONTROL
+          # Depends 插在 Architecture 之后;为空时整行不写(空字段值不合法)
+          if [ -n "$DEPENDS" ]; then
+            sed -i "/^Architecture:/a Depends: ${DEPENDS}" "$PKG/DEBIAN/control"
+          fi
+          cat "$PKG/DEBIAN/control"
           # deb 的文件名用 DEB_VERSION(`-` 已换成 `~`),与包内 Version 字段一致；
           # 正式版两者本来就相同(1.1.0),预发布才看得出差别(1.1.0~beta)
           dpkg-deb --build --root-owner-group "$PKG" \
             "dist/Mini-Term_${DEB_VERSION}_amd64.deb"
+          dpkg-deb --field "dist/Mini-Term_${DEB_VERSION}_amd64.deb" Depends || true
           ls -la dist
 
       # 用 gh 直传(找得到 draft),只上传文件、不碰 notes / draft / prerelease。
       # release 不存在时 gh 直接报错,不会像 action-gh-release 那样顺手新建一个。
       # --clobber:手动补建选了已有产物的平台时覆盖同名文件(与之前的覆盖语义一致)。
-      # 每个平台只产出下面四类里的一两类,nullglob 让没匹配到的模式直接消失
+      # 每个平台只产出下面五类里的一两类(Windows 是安装包 + 调试符号 zip),
+      # nullglob 让没匹配到的模式直接消失
       - name: Upload bundles to release
         shell: bash
         env:
@@ -405,7 +467,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           shopt -s nullglob
-          files=(dist/Mini-Term_*-setup.exe dist/Mini-Term_*.dmg dist/Mini-Term_*.tar.gz dist/Mini-Term_*.deb)
+          files=(dist/Mini-Term_*-setup.exe dist/Mini-Term_*-pdb.zip dist/Mini-Term_*.dmg dist/Mini-Term_*.tar.gz dist/Mini-Term_*.deb)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::dist/ 下没有可上传的产物"
             exit 1
@@ -413,7 +475,8 @@ jobs:
           printf 'upload: %s\n' "${files[@]}"
           gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
 
-  # 全部平台构建成功之后:对 release 的**全部**资产算 SHA256 → SHA256SUMS.txt 覆盖上传;
+  # 全部平台构建成功之后:对 release 的**全部**资产(含 Windows 的调试符号 zip)算 SHA256
+  # → SHA256SUMS.txt 覆盖上传;
   # push 路径再把 draft 转正。手动补建路径只重算校验和(补传的文件变了,旧的 SUMS 就过期了),
   # 不改 draft / prerelease —— 已发布的版本不能被改回 draft,还在 draft 的也不由补建来转正。
   # 校验:下载全部资产后 `sha256sum -c SHA256SUMS.txt`(或 --ignore-missing 只验下载的那个)

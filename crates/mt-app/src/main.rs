@@ -50,6 +50,7 @@
 mod activity_bar;
 mod ai;
 mod branch_family;
+mod cli;
 mod clipboard;
 mod command_library;
 mod date_picker;
@@ -2111,14 +2112,24 @@ impl Render for Workspace {
     }
 }
 
-/// 全局 panic 兜底:在默认 hook 之前补一行带**线程名**的 stderr。
+/// 全局 panic 兜底:在默认 hook 之前补一行带**线程名**的 stderr,再附一份 backtrace。
 ///
 /// 倒下的多半不是主线程 —— PTY reader、hook HTTP、500ms 轮询、mt-relay 的 tokio
 /// 任务都在各自线程里跑,默认 hook 只打消息与位置,事后从用户贴来的日志里认不出
-/// 是哪条线路。原 hook 链式调用在后,backtrace 行为(RUST_BACKTRACE)一个字不改。
+/// 是哪条线路。原 hook 链式调用在后,它自己的 backtrace 行为(RUST_BACKTRACE)不变。
+///
+/// backtrace **不看 RUST_BACKTRACE、无条件抓**(`force_capture`):装机版用户不会去设
+/// 环境变量,而 panic 往往复现不了第二次。按完整格式(`{:#}`)打,每帧带绝对地址:
+/// - 安装目录里有同版本的 `mini_term.pdb`(release 资产里单独下载)时,帧直接解析成
+///   函数名 + file:line(release 编了行号表,见根 Cargo.toml 的 `debug`);
+/// - 没有 PDB 时帧是 `<unknown>`,拿同一行里的模块基址换算成 RVA(地址 − 基址),
+///   事后对着 PDB 离线解析。基址每次启动随 ASLR 变,所以必须和帧地址记在一起。
+///
+/// 抓栈 + 符号化在 panic 线程上同步做,有 PDB 时首次要加载它(一百多 MB),慢一点
+/// 无妨:panic 本身就是稀有事件。
 ///
 /// release 的 Windows GUI 子系统下 stderr 由 [`logfile::install`] 接到
-/// `mini-term.log`(`main` 第一行,早于本钩子安装),装机版的 panic 于是也留档。
+/// `mini-term.log`(早于本钩子安装),装机版的 panic 于是也留档。
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2134,11 +2145,38 @@ fn install_panic_hook() {
             location,
             info.payload_as_str().unwrap_or("<non-string payload>")
         );
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        eprintln!(
+            "[panic] backtrace (thread={name}, module base {}):\n{backtrace:#}",
+            module_base()
+        );
         default_hook(info);
     }));
 }
 
+/// 主程序模块的加载基址(十六进制),给 backtrace 的离线符号化换算 RVA 用。
+#[cfg(windows)]
+fn module_base() -> String {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: 传 None 取的是当前进程 exe 自身的模块句柄,不增引用计数、无需释放。
+    match unsafe { GetModuleHandleW(None) } {
+        Ok(module) => format!("{:#x}", module.0 as usize),
+        Err(_) => "<unknown>".to_string(),
+    }
+}
+
+/// 非 Windows:地址解析靠符号表(release 已剥)或 core dump,不在这条链路上。
+#[cfg(not(windows))]
+fn module_base() -> String {
+    "<n/a>".to_string()
+}
+
 fn main() {
+    // 卸载器调起的无窗口模式(`--unregister-hooks`,见 `cli` 模块注释):排在一切之前,
+    // 做完即退 —— 不接管日志(那会在 AppData 下建数据目录)、不预载 ConPTY、不碰 gpui。
+    if let Some(code) = cli::run_if_requested() {
+        std::process::exit(code);
+    }
     // 装机版没有控制台,stderr 先接到 `mini-term.log`(见 `logfile` 模块注释)。
     // 必须排在埋点之前:`startup_trace::init` 自己就要打第一条 `run() enter`。
     // 有控制台时它是空操作,dev 实例的日志照旧附着当前终端。
@@ -2149,6 +2187,19 @@ fn main() {
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
+    // 便携 ConPTY 预载(exe 旁 `portable-conpty\` 里的 Windows Terminal conpty.dll +
+    // OpenConsole.exe;`MT_DISABLE_PORTABLE_CONPTY=1` 跳过,见 `mt_pty::conpty`)。
+    //
+    // ⚠️ 必须早于任何 PTY spawn:portable-pty 第一次 openpty 时按裸名解析
+    // `conpty.dll`,那一刻已加载的模块才算数,之后再预载不影响已解析的函数表。
+    // 放在这里 —— 主线程上同步做完、在 `application()` 建出平台层**之前** —— 就天然
+    // 满足:PTY 一律在 background executor 上起(`pane` 模块注释「PTY 在后台起」),
+    // 而 executor 的线程与任务都要等平台层建出来、`app.run` 的回调跑起来之后才有;
+    // 最早的一批(`hydrate_project`)还排在首帧之后。
+    // 线程创建本身是 happens-before 边,这里的 LoadLibrary 对它们一定可见。
+    // 代价:读三个文件的 PE 头 + 一次 LoadLibrary,实测不到 1ms(下面的埋点可量)。
+    mt_pty::conpty::initialize_default();
+    startup_trace::mark("conpty bootstrap done");
     // 组件库的图标资产源。gpui 的 `svg()` 一律经 `AssetSource` 取字节,没挂资产源时
     // 上游组件里每一枚 `Icon::new(IconName::..)` 都画成**空白**(只在日志里留一行,
     // 编译期与运行期界面上都毫无提示)—— 0.5.1 时代 crate 包里根本不带 svg,于是

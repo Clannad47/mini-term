@@ -4836,7 +4836,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-xml",
  "unicode-segmentation",
- "windows 0.61.3",
+ "windows 0.62.2",
  "winresource",
  "zed-reqwest",
 ]
@@ -4896,7 +4896,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "windows-registry 0.2.0",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -10301,17 +10301,6 @@ checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
  "windows-core 0.62.2",
  "windows-link 0.2.1",
-]
-
-[[package]]
-name = "windows-registry"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e400001bb720a623c1c69032f8e3e4cf09984deec740f007dd2b03ec864804b0"
-dependencies = [
- "windows-result 0.2.0",
- "windows-strings 0.1.0",
- "windows-targets 0.52.6",
 ]
 
 [[package]]

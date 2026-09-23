@@ -163,8 +163,10 @@ gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
-# 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
-windows = { version = "0.61", features = [
+# 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate
+# (gpui-pre 0.3.5 用 0.62;此前这里停在 0.61,等于多编一整套 windows 0.61 家族。
+# 依赖树里另有一份 0.58 是 gpui-component / gpui-base 带进来的,本仓对不齐)。
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     # 装机版日志落盘(logfile.rs):GetStdHandle 判「有没有 stderr」,
     # SetStdHandle 把 stderr / stdout 换成 mini-term.log 的句柄。

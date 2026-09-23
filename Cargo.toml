@@ -146,7 +146,8 @@ mt-remote = { path = "crates/mt-remote" }
 [profile.dev.package."*"]
 opt-level = 1
 
-# 发布构建。只调这三项,都是「体积/运行时换构建时间」的保守档位。
+# 发布构建。只调这四项:前三项是「体积/运行时换构建时间」的保守档位,`debug` 是给
+# Windows 崩溃排查留的行号表(不进 exe,见该项注释)。
 #
 # ⚠️ **不要加 `panic = "abort"`**:进程内多处依赖 unwind 语义 —— PTY reader 线程、
 # hook server、后台执行器上的任务 panic 后由 join handle 收敛成错误,单个 pane 挂掉
@@ -158,6 +159,16 @@ lto = "thin"
 # 单个 codegen unit:让 LLVM 看到整个 crate 再优化。代价是丢掉 codegen 并行,
 # release 构建变慢 —— 但 release 只在发版/CI 跑,不吃开发迭代的时间。
 codegen-units = 1
-# 剥符号表:装机包小一圈,且发布产物不需要本地符号(崩溃分析靠日志与复现步骤)。
-# 用 `symbols` 而非 `debuginfo` —— 后者只去调试信息,符号表还留着。
+# 调试信息只要行号表,给 Windows 的 PDB 用(panic 的 backtrace 要能落到函数名 + file:line):
+# - MSVC:调试信息从来不进 exe,链接器把它写进旁边的 `mini_term.pdb`。rustc 在 MSVC 上
+#   **不理会** `strip`(PE 里没有可剥的调试信息)—— 下面 strip = "symbols" 时 PDB 其实一直
+#   在生成,只是 debug = 0 时里面只有公共符号:用户代码的帧会被就近安到别的函数名上、
+#   没有行号(实测)。开行号表后函数名与 file:line(含内联帧)都对,exe 体积不变。
+#   PDB 由 release.yml 作为单独资产发布,不进安装包。
+# - macOS / Linux:行号表被下面的 strip 连同符号表一起剥掉,产物大小不变,只多一点编译
+#   时间。macOS 开了调试信息时 cargo 默认 split-debuginfo = "unpacked"(调试信息留在 .o 里、
+#   不跑 dsymutil);Linux 默认 "off",编进二进制后由 strip 剥掉。
+debug = "line-tables-only"
+# 剥符号表(macOS / Linux):装机包小一圈。用 `symbols` 而非 `debuginfo` —— 后者只去
+# 调试信息,符号表还留着。MSVC 上无效(见上一项)。
 strip = "symbols"
