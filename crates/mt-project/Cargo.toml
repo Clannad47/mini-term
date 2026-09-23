@@ -7,6 +7,9 @@ authors.workspace = true
 
 [dependencies]
 serde.workspace = true
+# 技术栈探测解析 `package.json` 的依赖表(`project_kind::parse_package_deps`,
+# 随探测逻辑自 mt-app 移入)。工作区里已有,零新增。
+serde_json.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
 regex.workspace = true

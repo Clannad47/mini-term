@@ -6,8 +6,9 @@
 //! ├── vector    形状 DSL + 唯一的绘制 Element(自绘,不走 asset / 不走位图)
 //! ├── svg_path  SVG `d` 的解析与离散化 —— 品牌 logo 原样搬运官方 path 靠它
 //! ├── brand     AI 厂商图标 + 厂商推断(BrandIcon.tsx / inferVendor.ts)
-//! ├── tech      技术栈徽标的 Element 与菜单分组(TechIcon.tsx / projectKind.ts)
-//! ├── tech_art  ↑ 用的 51 种 ProjectKind 与官方 logo —— **生成物**,见 tools/gen_tech_icons.mjs
+//! ├── tech      技术栈徽标的 Element(TechIcon.tsx)
+//! ├── tech_art  ↑ 用的 51 种技术栈官方 logo,按落盘字符串查 —— **生成物**,见 tools/gen_tech_icons.mjs
+//! │             (`ProjectKind` 枚举与菜单分组同出该生成器,住在 `mt_project::project_kind`)
 //! ├── file      文件树图标的查表规则与 Element(fileIcon.ts / FileTree.tsx)
 //! ├── file_art  ↑ 用的 263 枚官方图形状表 —— **生成物**,见 tools/gen_file_icons.mjs
 //! ├── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
@@ -33,7 +34,7 @@
 //! | `ui.rs::status_dot` | div 拼的三形圆点 | [`StatusDot`](status::StatusDot),见 [`status`] 模块注释的完整片段 |
 //! | `session_panel.rs:492` | `"CX" / "GK" / "CL"` 文本 | [`BrandIcon`](brand::BrandIcon) + [`AiVendor::for_session`](brand::AiVendor::for_session) |
 //! | tab 栏 / pane 标题 | 无图标 | [`BrandIcon`] + [`AiVendor::from_session_type`](brand::AiVendor::from_session_type) |
-//! | 项目列表 / 文件树根 | 无图标 | [`TechIcon`](tech::TechIcon) + [`ProjectKind::from_str`](tech_art::ProjectKind::from_str) |
+//! | 项目列表 / 文件树根 | 无图标 | [`TechIcon`](tech::TechIcon) + `mt_project::project_kind::ProjectKind::from_str`(宿主传 `kind.as_str()`) |
 //! | 文件树每一行 | 无图标 | [`FileIcon`](file::FileIcon) |
 //!
 //! 三个尺寸口径与原版对齐:品牌 13px、技术栈 14px、文件 14px、状态灯 10px(sm)
@@ -43,14 +44,15 @@
 //!
 //! ```ignore
 //! use gpui::{div, px, ParentElement as _, Styled as _};
-//! use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, ProjectKind, StatusDot, StatusKind, TechIcon};
+//! use mt_project::project_kind::ProjectKind;
+//! use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, StatusDot, StatusKind, TechIcon};
 //!
 //! div()
 //!     .flex()
 //!     .items_center()
 //!     .gap(px(6.0))
 //!     // 项目行:技术栈徽标 + 聚合状态灯
-//!     .child(TechIcon::new(ProjectKind::Rust))
+//!     .child(TechIcon::new(ProjectKind::Rust.as_str()))
 //!     .child(StatusDot::new(StatusKind::AiWorking))
 //!     // 会话行:厂商图标
 //!     .child(BrandIcon::new(AiVendor::for_session("claude", Some("glm-4.6"))))
@@ -74,8 +76,8 @@ pub use file::{FileIcon, art_of as file_art_of};
 pub use file_art::FileArt;
 pub use shell::{ALL_SHELL_KINDS, ShellIcon, ShellKind};
 pub use status::{ALL_STATUS_KINDS, SPIN_PERIOD, StatusDot, StatusKind};
-pub use tech::{ALL_TECH_CATEGORIES, TechCategory, TechIcon};
-pub use tech_art::{ALL_PROJECT_KINDS, ProjectKind};
+pub use tech::TechIcon;
+pub use tech_art::TECH_ART_KINDS;
 pub use usage_glyphs::ALL_USAGE_GLYPHS;
 pub use vector::{Geom, Ink, Pen, Shape, VectorIcon};
 

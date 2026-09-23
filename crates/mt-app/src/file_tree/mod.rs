@@ -67,10 +67,12 @@ use gpui::{
     px,
 };
 use mt_config::{AppConfig, ProjectConfig};
+use mt_core::path_key::collapse_separators;
 use mt_project::fs::FileEntry;
+use mt_project::project_kind::ProjectKind;
 use mt_project::watch::FsWatcher;
+use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
-use mt_ui::icons::{FileIcon, ProjectKind};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::DragFilePath;
@@ -912,18 +914,17 @@ impl FileTree {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return;
         };
-        if !crate::project_kind::is_marker_file(name) {
+        if !mt_project::project_kind::is_marker_file(name) {
             return;
         }
-        let parent = crate::project_kind::norm_path(&dir.to_string_lossy());
+        // 失效比对用规范化路径(分隔符统一、去尾,原版 `normPath`);缓存键仍是路径原文
+        let parent = collapse_separators(&dir.to_string_lossy());
         let target = self
             .store
             .read(cx)
             .projects()
             .iter()
-            .find(|p| {
-                p.ssh_connection_id.is_none() && crate::project_kind::norm_path(&p.path) == parent
-            })
+            .find(|p| p.ssh_connection_id.is_none() && collapse_separators(&p.path) == parent)
             .map(|p| p.path.clone());
         if let Some(target) = target {
             self.store
@@ -1164,7 +1165,7 @@ struct Row {
     /// git 状态字母 + **是不是汇总来的**(汇总的那枚画淡一档)。
     git: Option<(String, bool)>,
     /// 一级子目录的技术栈徽标(`None` = 用普通文件夹图标)。
-    kind: Option<mt_ui::icons::ProjectKind>,
+    kind: Option<ProjectKind>,
 }
 
 // ─── 单链目录压缩(`FileTree.tsx:50-86` 的 `compactDirChains`) ──
@@ -2266,7 +2267,7 @@ impl FileTree {
         let git_badge = row.git.clone();
         // 一级子工程目录优先显示技术栈徽标(原版那段 IIFE 的第一条分支)
         let icon: AnyElement = match row.kind {
-            Some(kind) => mt_ui::icons::TechIcon::new(kind)
+            Some(kind) => mt_ui::icons::TechIcon::new(kind.as_str())
                 .size(px(14.0))
                 .into_any_element(),
             None => {

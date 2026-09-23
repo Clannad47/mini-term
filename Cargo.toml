@@ -87,7 +87,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util
 # 跨线程 join_all / oneshot 等组合子(mt-app 的 PTY 唤醒信号、mt-ssh 的池 shutdown)。
 # gpui 自己就依赖 futures 0.3,提到工作区只是去重声明,不会多拉一棵依赖树。
 futures = "0.3"
-# 主题包 manifest 的 sha256 校验(mt-config)。
+# 主题包 manifest 的 sha256 校验(mt-theme-packs)。
 sha2 = "0.11.0"
 # SQLite:config.db(mt-config)/ layout.db(mt-layout)/ usage.db(mt-usage) 三家共用。
 #
@@ -133,6 +133,9 @@ mt-secret = { path = "crates/mt-secret" }
 # 移入;BB 批(SSH 全套 UI)接线用。
 mt-ssh = { path = "crates/mt-ssh" }
 mt-terminal = { path = "crates/mt-terminal" }
+# 外置主题包的文件层(自 mt-config 拆出)。mt-ui 的主题桥只要其中的 `ThemePacks`,
+# 单独成 crate 后 mt-ui 不再经 mt-config 连带依赖 rusqlite、也不随 config.rs 重编。
+mt-theme-packs = { path = "crates/mt-theme-packs" }
 mt-ui = { path = "crates/mt-ui" }
 mt-usage = { path = "crates/mt-usage" }
 

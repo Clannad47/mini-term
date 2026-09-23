@@ -47,8 +47,8 @@ use std::time::Instant;
 use futures::StreamExt as _;
 use gpui::{App, Context, Entity, Global, Subscription, Task};
 use mt_config::{AppConfig, ConfigStore, ProjectConfig};
+use mt_project::project_kind::ProjectKind;
 use mt_relay::MobileRelayStatusPayload;
-use mt_ui::icons::ProjectKind;
 use mt_ui::theme_bridge::BackgroundArt;
 use mt_ui::TerminalTheme;
 

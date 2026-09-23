@@ -5,6 +5,17 @@
 //! 本模块只负责**文件层**：列举 / 导入 / 删除 / 取原文与二进制资源。
 //! theme.json 的语义校验与"配色 → 运行时主题"的映射不在这里。
 //!
+//! # 为什么单独成 crate
+//!
+//! 原先住在 `mt-config::theme_packs`。mt-ui 的主题桥只要 [`ThemePacks`] 这一个
+//! 类型,却因此连带依赖整个 mt-config(rusqlite + 频繁改动的 config.rs),每改一次
+//! 配置就把 mt-ui 的两万多行重编一遍。拆出来之后 mt-config / mt-ui 各自依赖本
+//! crate,`mt_config::ThemePacks` 等原路径由 mt-config 再导出,调用方不用改。
+//!
+//! 本 crate **不认数据目录口径**(`MT_APP_DATA_DIR` 那一套在 `mt_config::paths`):
+//! 只有 [`ThemePacks::at`] 一个构造入口,themes 目录由宿主算好传进来
+//! (mt-app 的 `theme::theme_packs` 取 `mt_config::themes_dir`)。
+//!
 //! # 与 gpui-component 主题层的关系（后续 wave，本次不做）
 //!
 //! 主题包里「配色」那一半将来可以映射到 `gpui_component::theme` 的 JSON schema
@@ -63,16 +74,12 @@ pub struct ThemePacks {
 }
 
 impl ThemePacks {
-    /// 指向 `{active_data_dir}/themes` —— 认 `MT_APP_DATA_DIR`
-    /// (见 [`crate::paths::active_data_dir`])。
+    /// 指向给定的 themes 目录。
     ///
-    /// 此前 [`crate::paths::themes_dir`] 钉死在装机版目录上,dev 实例只能
-    /// 自己拼路径走 [`Self::at`] 绕开;现在两条路重合,宿主直接用这个入口。
-    pub fn open() -> Result<Self> {
-        Ok(Self::at(crate::paths::themes_dir()?))
-    }
-
-    /// 指向任意目录（测试用）。
+    /// 唯一的构造入口。应用里的目录口径(认 `MT_APP_DATA_DIR`)是
+    /// `mt_config::themes_dir`;原先的 `ThemePacks::open()` 就是
+    /// `at(themes_dir()?)`,随本 crate 拆出 mt-config 时收回宿主那一侧
+    /// (本 crate 不依赖 mt-config)。测试直接指向临时目录。
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -237,7 +244,11 @@ impl ThemePacks {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            pack_root.file_name().unwrap().to_string_lossy().into_owned()
+            pack_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         };
         validate_theme_id(&theme_id).map_err(&cleanup)?;
 
@@ -431,7 +442,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = install_pack(&themes, "dracula", &src).unwrap_err().to_string();
+        let err = install_pack(&themes, "dracula", &src)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("大小不符"), "实际错误: {err}");
         assert_eq!(
             fs::read_to_string(existing.join("theme.json")).unwrap(),
@@ -545,7 +558,10 @@ mod tests {
         assert!(packs.read("ember-dusk").is_err());
         // 资源读取与删除同一把尺子
         fs::write(packs.root().join("ember-new").join("background.png"), b"x").unwrap();
-        assert_eq!(packs.read_asset("ember-new", "background.png").unwrap(), b"x");
+        assert_eq!(
+            packs.read_asset("ember-new", "background.png").unwrap(),
+            b"x"
+        );
         assert!(packs.read_asset("ember-dusk", "background.png").is_err());
         assert!(packs.delete("ember-dusk").is_err());
         assert!(packs.delete("ember-new").is_ok());
@@ -584,7 +600,11 @@ mod tests {
         // 资源读取:拿到原始字节;路径分量非法一律拒绝
         let asset = packs.read_asset(EXAMPLE_THEME_ID, "README.md").unwrap();
         assert_eq!(asset, EXAMPLE_THEME_README.as_bytes());
-        assert!(packs.read_asset(EXAMPLE_THEME_ID, "../config.json").is_err());
+        assert!(
+            packs
+                .read_asset(EXAMPLE_THEME_ID, "../config.json")
+                .is_err()
+        );
         assert!(packs.read_asset("..", "theme.json").is_err());
 
         // 导入一个目录 → 目录名即 id
@@ -690,5 +710,52 @@ mod tests {
         let _ = fs::remove_dir_all(&zip_root);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 自 mt-config 拆出时的序列化形状护栏:两个对外类型的 serde 形态(camelCase
+    /// 字段名、字段集合、`theme_css` 为 `None` 时写 `null` 而非省略)一个字节都不许变。
+    ///
+    /// 主题包在 config.db 里只留一个 `customThemeId` 字符串(那是 `AppConfig` 的字段,
+    /// 没有跟着搬);本 crate 自己落盘的只有 themes/ 下原样拷贝的文件。对外能被
+    /// 序列化的就这两个结构,钉住它们的 JSON 原文,再解析回来逐字段比对。
+    #[test]
+    fn 拆_crate_后序列化形状逐字不变() {
+        let entry = ThemePackEntry {
+            theme_id: "ember-new".into(),
+            theme_json: r#"{"id":"ember-dusk"}"#.into(),
+            dir: PathBuf::from("themes/ember-new"),
+        };
+        let text = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            text,
+            r#"{"themeId":"ember-new","themeJson":"{\"id\":\"ember-dusk\"}","dir":"themes/ember-new"}"#
+        );
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["themeId"], entry.theme_id.as_str());
+        assert_eq!(back["themeJson"], entry.theme_json.as_str());
+        assert_eq!(back["dir"], "themes/ember-new");
+
+        for (css, expected) in [
+            (
+                Some("/* x */".to_string()),
+                r#"{"themeJson":"{}","themeCss":"/* x */","dir":"themes/a"}"#,
+            ),
+            (
+                None,
+                r#"{"themeJson":"{}","themeCss":null,"dir":"themes/a"}"#,
+            ),
+        ] {
+            let data = ThemePackData {
+                theme_json: "{}".into(),
+                theme_css: css.clone(),
+                dir: PathBuf::from("themes/a"),
+            };
+            let text = serde_json::to_string(&data).unwrap();
+            assert_eq!(text, expected);
+            let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(back["themeJson"], "{}");
+            assert_eq!(back["themeCss"].as_str(), css.as_deref());
+            assert_eq!(back["dir"], "themes/a");
+        }
     }
 }

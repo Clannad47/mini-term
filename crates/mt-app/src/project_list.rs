@@ -7,7 +7,7 @@
 //! 其后才轮到技术栈徽标([`mt_ui::icons::TechIcon`])与通用目录图标。
 //!
 //! 技术栈取值走 [`resolve_project_kind`]:手动 `kindOverride` 优先,没设过就用
-//! [`crate::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
+//! [`mt_project::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
 //! 探测本身丢后台)。
 //!
 //! # 键盘与悬停(清尾批)
@@ -49,10 +49,9 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
+use mt_project::project_kind::{ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, ProjectKind};
 use mt_ui::icons::vector::VectorIcon;
-use mt_ui::icons::{
-    ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
-};
+use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, TechIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::{
@@ -138,7 +137,9 @@ fn project_icon(kind: Option<ProjectKind>, remote: Option<RemoteBadge>) -> AnyEl
             .into_any_element();
     }
     match kind {
-        Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
+        Some(kind) => TechIcon::new(kind.as_str())
+            .size(px(14.0))
+            .into_any_element(),
         None => FileIcon::folder(false)
             .size(px(14.0))
             .color(ui::color_file())
@@ -2898,6 +2899,22 @@ mod tests {
             covered,
             ALL_PROJECT_KINDS.len(),
             "有类型的分组不在菜单顺序表里,它会从菜单上消失"
+        );
+    }
+
+    /// 技术栈枚举(mt-project)与徽标形状表(mt-ui)逐项对账。
+    ///
+    /// 两边出自 `gen_tech_icons.mjs` 的同一张 CATALOG,但分住两个 crate、按落盘字符串
+    /// 衔接(`TechIcon::new(kind.as_str())`)——mt-ui 不依赖 mt-project,编译期没有穷尽
+    /// 检查兜底。本 crate 是唯一同时看得见两边的地方:种类、字符串、顺序必须一一对上,
+    /// 否则某个类型的领位徽标会画成空白。
+    #[test]
+    fn 每种技术栈都有徽标且与形状表逐项对上() {
+        let kinds: Vec<&str> = ALL_PROJECT_KINDS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            mt_ui::icons::TECH_ART_KINDS,
+            "枚举与徽标表对不上:有人手改了生成物,改 CATALOG 后重跑生成器"
         );
     }
 

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use gpui::{Context, Window};
 use mt_config::ProjectConfig;
-use mt_ui::icons::ProjectKind;
+use mt_project::project_kind::ProjectKind;
 
 use crate::project_tree;
 use crate::tree::gen_unique_id;
@@ -63,7 +63,7 @@ impl AppStore {
                 let kind = cx
                     .background_executor()
                     .spawn(async move {
-                        crate::project_kind::detect_local(std::path::Path::new(&probe))
+                        mt_project::project_kind::detect_local(std::path::Path::new(&probe))
                     })
                     .await;
                 let _ = this.update(cx, |store: &mut AppStore, cx| {
