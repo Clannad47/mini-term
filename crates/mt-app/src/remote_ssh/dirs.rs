@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mt_ai::sessions::normalize_unix_path;
 use mt_config::SshConnection;
+use mt_core::path_key::posix_ci_eq_key;
 use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
 
 use super::{
@@ -108,7 +108,7 @@ pub fn list_directory(
     refresh_ignore: bool,
 ) -> Result<Vec<FileEntry>, String> {
     let st = state();
-    let ignore_key = format!("{}|{}", conn.id, normalize_unix_path(project_root));
+    let ignore_key = format!("{}|{}", conn.id, posix_ci_eq_key(project_root));
     if refresh_ignore {
         lock(&st.gitignore_cache).remove(&ignore_key);
     }

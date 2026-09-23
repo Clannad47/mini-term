@@ -184,20 +184,15 @@ pub const ALWAYS_IGNORE: &[&str] = &[
 /// - `\\?\UNC\wsl.localhost\Ubuntu\home` → `Some("\\\\wsl.localhost\\Ubuntu\\home")`
 /// - Volume GUID `\\?\Volume{...}` 等其他 verbatim 形式 → `None` (保留原样)
 /// - 非 verbatim 路径 → `None`
+///
+/// 剥法本身收在 [`mt_core::path_key::strip_verbatim_prefix`](会话记录定位、
+/// 剪贴板路径转换共用);canonicalize 在 WSL UNC 上会产出 `\\?\UNC\` 形式,
+/// 不剥前缀的话路径无法直接粘进 shell。
 #[cfg(any(windows, test))]
 fn try_strip_windows_verbatim(s: &str) -> Option<String> {
-    let rest = s.strip_prefix(r"\\?\")?;
-    // UNC verbatim: `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>`
-    // canonicalize 在 WSL UNC 上会产出这种形式,不剥前缀的话路径无法直接粘进 shell。
-    if let Some(unc_rest) = rest.strip_prefix(r"UNC\") {
-        return Some(format!(r"\\{}", unc_rest));
-    }
-    // Drive verbatim: `\\?\<drive>:\...` → `<drive>:\...`
-    let bytes = rest.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' {
-        return Some(rest.to_string());
-    }
-    None
+    let stripped = mt_core::path_key::strip_verbatim_prefix(s);
+    // 没剥动 = 原串原样借回(长度不变);剥了一定变短(盘符形态少 4 字节、UNC 少 6)
+    (stripped.len() != s.len()).then(|| stripped.into_owned())
 }
 
 /// Windows 上 `Path::canonicalize()` 会给路径加上 `\\?\` verbatim 前缀

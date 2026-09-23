@@ -17,27 +17,7 @@
 use std::path::Path;
 use std::process::Command;
 
-/// 归一化路径分隔符:`[\\/]+` 折成单个 `/`,再去掉结尾那一个。
-/// 逐条对应 TS 侧的 `value.replace(/[\\/]+/g, '/').replace(/\/$/, '')`。
-fn normalize_sep(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut prev_sep = false;
-    for ch in value.chars() {
-        let is_sep = ch == '/' || ch == '\\';
-        if is_sep {
-            if !prev_sep {
-                out.push('/');
-            }
-        } else {
-            out.push(ch);
-        }
-        prev_sep = is_sep;
-    }
-    if out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
+use mt_core::path_key::collapse_separators;
 
 /// 该用哪种分隔符:根路径里出现过 `\` 就用 `\`,否则 `/`。
 fn sep_of(root: &str) -> char {
@@ -50,8 +30,13 @@ fn sep_of(root: &str) -> char {
 /// - 不在根下面 → 原样返回(与原版一致:不猜、不报错);
 /// - 否则 → 去掉根前缀,分隔符换回根用的那一种。
 pub fn relative_path(target: &str, root: &str) -> String {
-    let normalized_root = normalize_sep(root);
-    let normalized_target = normalize_sep(target);
+    // 分隔符归一逐条对应 TS 侧的 `value.replace(/[\\/]+/g, '/').replace(/\/$/, '')`
+    // —— 那一句连根 `/` 也会去掉(折成空串),`collapse_separators` 留根,所以再
+    // 剥一次尾 `/`:否则根是 `/` 时下面会拼出 `//` 前缀,一个都匹配不上
+    let normalized_root = collapse_separators(root);
+    let normalized_root = normalized_root.trim_end_matches('/');
+    let normalized_target = collapse_separators(target);
+    let normalized_target = normalized_target.trim_end_matches('/');
     let sep = sep_of(root);
 
     if normalized_target == normalized_root {
@@ -170,6 +155,19 @@ mod tests {
             relative_path("D:\\Git\\proj2\\a.rs", "D:\\Git\\proj"),
             "D:\\Git\\proj2\\a.rs"
         );
+        // 重复分隔符折叠后再比
+        assert_eq!(
+            relative_path("D:\\\\Git\\proj\\\\src\\a.rs", "D:\\Git\\proj"),
+            "src\\a.rs"
+        );
+    }
+
+    /// 远程项目根就是 `/`:前缀不能拼成 `//`(与 TS 侧把根也折成空串同效)。
+    #[test]
+    fn 根为斜杠时照样算相对段() {
+        assert_eq!(relative_path("/home/u/a.rs", "/"), "home/u/a.rs");
+        assert_eq!(relative_path("/", "/"), ".");
+        assert_eq!(relative_path("//", "/"), ".");
     }
 
     #[test]

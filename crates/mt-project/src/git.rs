@@ -1664,8 +1664,7 @@ pub struct WorktreeInfo {
 /// 去掉路径尾部分隔符:git2 的 workdir() 带尾杠,而项目配置里的路径不带,
 /// 统一后才能做「该 worktree 是否已是项目」的对比。
 fn display_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    s.trim_end_matches(['/', '\\']).to_string()
+    mt_core::path_key::trim_trailing_separators(&p.to_string_lossy()).to_string()
 }
 
 fn head_branch(repo: &Repository) -> Option<String> {

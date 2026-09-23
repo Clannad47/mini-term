@@ -24,6 +24,7 @@
 //!    git-bash / pwsh / powershell / cmd 由环境决定、四家引号语义互斥。
 //!    事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递。
 
+use crate::agent::AgentKind;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -1045,23 +1046,30 @@ impl HookAgent {
         HookAgent::Omp,
     ];
 
-    fn key(self) -> &'static str {
+    /// 注册目标对应的 agent。标识与展示名都查 [`crate::agent`] 那张表,
+    /// 这里只管「哪几家有 hook、各自怎么注册」。
+    pub fn agent(self) -> AgentKind {
         match self {
-            HookAgent::Claude => "claude",
-            HookAgent::Codex => "codex",
-            HookAgent::Grok => "grok",
-            HookAgent::Omp => "omp",
+            HookAgent::Claude => AgentKind::Claude,
+            HookAgent::Codex => AgentKind::Codex,
+            HookAgent::Grok => AgentKind::Grok,
+            HookAgent::Omp => AgentKind::Omp,
         }
     }
 
+    /// 稳定标识(= serde 名 = 设置页勾选项的值)
+    pub fn key(self) -> &'static str {
+        self.agent().key()
+    }
+
     /// 面板展示名（与 UI 里的品牌写法一致）
-    fn label(self) -> &'static str {
-        match self {
-            HookAgent::Claude => "Claude Code",
-            HookAgent::Codex => "Codex",
-            HookAgent::Grok => "Grok",
-            HookAgent::Omp => "oh-my-pi",
-        }
+    pub fn label(self) -> &'static str {
+        self.agent().spec().label
+    }
+
+    /// [`Self::key`] 的反查;认不出返回 `None`(不退化成「全量注册」,理由见类型注释)。
+    pub fn from_key(key: &str) -> Option<HookAgent> {
+        Self::ALL.iter().copied().find(|a| a.key() == key)
     }
 
     fn events(self) -> &'static [&'static str] {
@@ -1461,6 +1469,32 @@ mod tests {
             assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
         }
         assert_eq!(keys.len(), 4);
+    }
+
+    /// key / 展示名改由 agent 表供给后,与改造前逐字相同,且与 serde 名对齐
+    /// (设置页拿 key 当勾选值、后端拿 serde 名反序列化,两边必须是同一个串)。
+    #[test]
+    fn key_label_come_from_agent_table_unchanged() {
+        let expected = [
+            (HookAgent::Claude, "claude", "Claude Code"),
+            (HookAgent::Codex, "codex", "Codex"),
+            (HookAgent::Grok, "grok", "Grok"),
+            (HookAgent::Omp, "omp", "oh-my-pi"),
+        ];
+        assert_eq!(expected.len(), HookAgent::ALL.len());
+        for (agent, key, label) in expected {
+            assert_eq!(agent.key(), key);
+            assert_eq!(agent.label(), label);
+            assert_eq!(HookAgent::from_key(key), Some(agent));
+            assert_eq!(
+                serde_json::from_str::<HookAgent>(&format!("\"{key}\"")).ok(),
+                Some(agent)
+            );
+        }
+        // 反查只认 key 原文(不走 agent 表的别名/宽松口径):勾选值只可能是 key
+        assert_eq!(HookAgent::from_key("claude-code"), None);
+        assert_eq!(HookAgent::from_key("Claude"), None);
+        assert_eq!(HookAgent::from_key("opencode"), None);
     }
 
     // ---- oh-my-pi（omp）扩展 ----

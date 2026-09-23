@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 
 use super::{
     AiQuestion, AiQuestionAnswer, AiQuestionItem, AiQuestionOption, AiSession, AiSessionMessage,
-    MAX_SESSIONS_PER_SOURCE, normalize_path,
+    MAX_SESSIONS_PER_SOURCE,
 };
+use mt_core::path_key::windows_eq_key;
 
 /// grok 会话根目录:`{$GROK_HOME | ~/.grok}/sessions`
 fn grok_sessions_dir() -> Option<PathBuf> {
@@ -70,7 +71,7 @@ pub fn find_grok_cwd_dirs(project_path: &str) -> Vec<PathBuf> {
     let Some(sessions_dir) = grok_sessions_dir() else {
         return Vec::new();
     };
-    let normalized = normalize_path(project_path);
+    let normalized = windows_eq_key(project_path);
     let Ok(entries) = fs::read_dir(&sessions_dir) else {
         return Vec::new();
     };
@@ -78,7 +79,7 @@ pub fn find_grok_cwd_dirs(project_path: &str) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .filter(|p| decode_grok_cwd_dir(p).is_some_and(|cwd| normalize_path(&cwd) == normalized))
+        .filter(|p| decode_grok_cwd_dir(p).is_some_and(|cwd| windows_eq_key(&cwd) == normalized))
         .collect()
 }
 

@@ -39,6 +39,8 @@ use codex::{
 use grok::{get_grok_sessions, read_grok_session_content};
 use lineage::latest_model_from_file_tail;
 
+use crate::agent::AgentKind;
+use mt_core::path_key::{posix_ci_eq_key, strip_verbatim_prefix, windows_eq_key};
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -105,13 +107,13 @@ fn home_dir() -> Option<PathBuf> {
 /// 输入检测能认出的 agent 比这宽（pi / opencode 也在 `detect::AI_COMMANDS` 里）。
 /// 未支持的 agent 必须跳过启发式绑定，否则会把同项目里别家的最新会话贴到该 pane。
 ///
-/// 用 `contains` 而非全等：hook 上报的 agent 是 `claude-code`，输入检测是 `claude`。
+/// 识别走 [`AgentKind::parse`](hook 上报的 `claude-code` 与输入检测的 `claude`
+/// 都认得),能力位查 [`crate::agent::AgentSpec::session_log`]。
 ///
 /// (原本长在 `mobile_mirror.rs` 里;记录形态的判定属于本 crate,镜像迁到
 /// mt-relay 后从这里引。)
 pub fn agent_has_session_log(agent: &str) -> bool {
-    let agent = agent.to_ascii_lowercase();
-    agent.contains("claude") || agent.contains("codex") || agent.contains("grok") || agent == "omp"
+    AgentKind::parse(agent).is_some_and(|k| k.spec().session_log)
 }
 
 /// 从 Claude 会话 jsonl 文本中提取首个非空 `cwd` 字段。
@@ -182,10 +184,10 @@ pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
 /// Windows 宿主与 WSL 发行版内的 cwd 语义不同,匹配时必须用对应的 normalize。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathStyle {
-    /// Windows 语义:`/`→`\` + lowercase + 去尾部 `\`
+    /// Windows 语义:[`windows_eq_key`](分隔符不分 `\` `/`、不区分大小写、去尾随分隔符)
     Windows,
-    /// Unix 语义:保留 `/` + lowercase + 去尾部 `/`。
-    /// 不能复用 Windows 版(它把 `/` 换成 `\`,WSL cwd 会永不匹配)。
+    /// Unix 语义:[`posix_ci_eq_key`](保留 `/`、`\` 不当分隔符、lowercase、去尾部 `/`)。
+    /// 不能复用 Windows 版(POSIX 文件名里的 `\` 会被它当成分隔符)。
     /// lowercase 是因为 drvfs(/mnt/*)默认大小写不敏感,同一目录可能以不同大小写出现。
     Unix,
 }
@@ -193,8 +195,8 @@ enum PathStyle {
 impl PathStyle {
     fn normalize(self, path: &str) -> String {
         match self {
-            PathStyle::Windows => normalize_path(path),
-            PathStyle::Unix => normalize_unix_path(path),
+            PathStyle::Windows => windows_eq_key(path),
+            PathStyle::Unix => posix_ci_eq_key(path),
         }
     }
 }
@@ -309,18 +311,9 @@ fn dir_matches_project(dir: &Path, normalized_project: &str, style: PathStyle) -
     false
 }
 
-/// 路径统一化(小写 + 反斜杠,去尾部斜杠),用于 Windows 路径比较
-pub fn normalize_path(path: &str) -> String {
-    path.replace('/', "\\")
-        .to_lowercase()
-        .trim_end_matches('\\')
-        .to_string()
-}
-
-/// Unix 语义路径统一化(小写 + 保留 `/`,去尾部 `/`),用于 WSL 内 / SSH 远程 cwd 比较
-pub fn normalize_unix_path(path: &str) -> String {
-    path.to_lowercase().trim_end_matches('/').to_string()
-}
+// 路径比较键(原 `normalize_path` / `normalize_unix_path`)已收进
+// `mt_core::path_key`:Windows 语义用 `windows_eq_key`,WSL 内 / SSH 远程 cwd 用
+// `posix_ci_eq_key`。
 
 // ─── WSL 路径推导 ──────────────────────────────────────────────
 
@@ -330,8 +323,9 @@ pub fn normalize_unix_path(path: &str) -> String {
 /// (drvfs 大小写不敏感,匹配阶段统一 lowercase 比较)。
 /// 非盘符路径(UNC / 相对路径)返回 None。
 fn windows_path_to_wsl_mnt(path: &str) -> Option<String> {
-    // 剥盘符 verbatim 前缀 `\\?\C:\...`;`\\?\UNC\...` 剥后首字节非盘符,自然落 None
-    let s = path.strip_prefix(r"\\?\").unwrap_or(path);
+    // 剥盘符 verbatim 前缀 `\\?\C:\...`;`\\?\UNC\...` 剥成 `\\...` 后首字节非盘符,自然落 None
+    let s = strip_verbatim_prefix(path);
+    let s = s.as_ref();
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
         return None;
@@ -879,21 +873,24 @@ pub fn get_ai_session_content(
     if !session_id_path_safe(&session_id) {
         return Err("非法会话 id".to_string());
     }
+    let kind = AgentKind::parse(&session_type);
     if let Some(distro) = wsl_distro.filter(|d| !d.is_empty()) {
         // WSL 根项目的 distro 以路径解析为准(与 get_wsl_ai_sessions 口径一致)
         let (distro, unix_cwd) = derive_wsl_target(&project_path, Some(distro))
             .ok_or_else(|| "无法推导 WSL 项目路径".to_string())?;
-        return match session_type.as_str() {
-            "claude" => read_wsl_claude_session_content(&distro, &unix_cwd, &session_id),
-            "codex" => read_wsl_codex_session_content(&distro, &session_id),
+        return match kind {
+            Some(AgentKind::Claude) => {
+                read_wsl_claude_session_content(&distro, &unix_cwd, &session_id)
+            }
+            Some(AgentKind::Codex) => read_wsl_codex_session_content(&distro, &session_id),
             _ => Err(format!("不支持的会话类型: {}", session_type)),
         };
     }
 
-    match session_type.as_str() {
-        "claude" => read_claude_session_content(&session_id, &project_path),
-        "codex" => read_codex_session_content(&session_id, &project_path),
-        "grok" => read_grok_session_content(&session_id, &project_path),
+    match kind {
+        Some(AgentKind::Claude) => read_claude_session_content(&session_id, &project_path),
+        Some(AgentKind::Codex) => read_codex_session_content(&session_id, &project_path),
+        Some(AgentKind::Grok) => read_grok_session_content(&session_id, &project_path),
         _ => Err(format!("不支持的会话类型: {}", session_type)),
     }
 }
@@ -901,7 +898,7 @@ pub fn get_ai_session_content(
 // ─── Tauri Commands ────────────────────────────────────────────
 
 pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
-    let cache_key = normalize_path(&project_path);
+    let cache_key = windows_eq_key(&project_path);
 
     {
         let cache = session_cache()
@@ -963,7 +960,7 @@ pub fn get_wsl_ai_sessions(
     let cache_key = format!(
         "wsl|{}|{}",
         distro.to_lowercase(),
-        normalize_unix_path(&unix_cwd)
+        posix_ci_eq_key(&unix_cwd)
     );
 
     if !force.unwrap_or(false) {
@@ -1274,15 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_unix_path_lowercases_and_trims_trailing_slash() {
-        assert_eq!(normalize_unix_path("/mnt/d/Git/Foo/"), "/mnt/d/git/foo");
-        assert_eq!(normalize_unix_path("/home/User/proj"), "/home/user/proj");
-        // 保留 `/`,不换成 `\`(Windows 版 normalize_path 不可复用的原因)
-        assert!(normalize_unix_path("/mnt/d/git").contains('/'));
-        assert!(!normalize_unix_path("/mnt/d/git").contains('\\'));
-    }
-
-    #[test]
     fn derive_wsl_target_prefers_unc_and_ignores_distro_param() {
         // WSL 根项目:distro 从路径推导,入参被忽略
         let (distro, cwd) =
@@ -1395,12 +1383,20 @@ mod tests {
         assert!(claude_message_from_line("not json").is_none());
     }
 
+    /// 两种语义各认各的等价:Windows 不分 `\` `/`,Unix 只认 `/`(`\` 是文件名字符)。
     #[test]
     fn path_style_normalize_uses_matching_semantics() {
-        assert_eq!(PathStyle::Windows.normalize("D:/Git/Foo/"), r"d:\git\foo");
+        assert_eq!(
+            PathStyle::Windows.normalize("D:/Git/Foo/"),
+            PathStyle::Windows.normalize(r"d:\git\foo")
+        );
         assert_eq!(
             PathStyle::Unix.normalize("/mnt/d/Git/Foo/"),
             "/mnt/d/git/foo"
+        );
+        assert_ne!(
+            PathStyle::Unix.normalize(r"/mnt/d/a\b"),
+            PathStyle::Unix.normalize("/mnt/d/a/b")
         );
     }
 }

@@ -76,29 +76,13 @@ const PAGE_SIZE: usize = 20;
 /// 出去就是开面板即卡窗口 —— 所以按页给,底下留「加载更多」。
 const PREVIEW_PAGE_SIZE: usize = 40;
 
-/// 该会话对应的 resume 命令;id 形态异常返回 `None`。
+/// 该会话对应的 resume 命令;不支持续接的 agent / id 形态异常返回 `None`。
 ///
-/// sessionId 会被原样拼进写进 PTY 的命令行,必须过白名单:字母数字与 `-_`
-/// (Claude UUID、Codex rollout id 与 Grok UUIDv7 的实际形态)。两个来源
-/// ——持久化布局与会话记录文件内容——都不是可信输入,空格/引号/管道/换行
-/// 等一切 shell 元字符在此拦截(逐条对照 `src/utils/aiResume.ts`)。
-pub fn build_resume_command(agent: &str, session_id: &str) -> Option<String> {
-    if session_id.is_empty() || session_id.len() > 128 {
-        return None;
-    }
-    if !session_id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return None;
-    }
-    Some(match agent {
-        "codex" => format!("codex resume {session_id}"),
-        "grok" => format!("grok --resume {session_id}"),
-        // omp 的会话 id 来自 hook 上报；`--resume` 按 id 前缀或路径查当前目录桶
-        "omp" => format!("omp --resume {session_id}"),
-        _ => format!("claude --resume {session_id}"),
-    })
+/// 模板、识别口径与 id 白名单都在 [`mt_ai::agent`](与启动自动续接共用一套):
+/// sessionId 会被原样拼进写进 PTY 的命令行,两个来源 —— 持久化布局与会话记录
+/// 文件内容 —— 都不是可信输入。
+fn session_resume_command(session: &AiSession) -> Option<String> {
+    mt_ai::agent::resume_command(Some(&session.session_type), &session.id)
 }
 
 /// 点一个会话节点该发生什么。对应 `src/utils/sessionJump.ts::jumpToSession`。
@@ -149,7 +133,7 @@ pub(crate) fn jump_to_session(
         return Task::ready(());
     }
 
-    let Some(command) = build_resume_command(&session.session_type, &session.id) else {
+    let Some(command) = session_resume_command(&session) else {
         // opencode / pi 之类没有 resume 能力的 agent:静默不做
         return Task::ready(());
     };
@@ -159,9 +143,11 @@ pub(crate) fn jump_to_session(
     let anchor = store.read(cx).active_pane_id(&project_id);
     // `claude --resume` 只认「启动目录」对应的会话桶:子目录里起的会话在项目根
     // 恢复会报 `No conversation found`,先反查记录的 cwd。codex 不按目录分桶;
-    // grok 虽按 cwd 分桶,但列表只捞「解码目录名全等于项目根」的会话。
+    // grok 虽按 cwd 分桶,但列表只捞「解码目录名全等于项目根」的会话
+    // (各家口径见 `mt_ai::CwdBucket`)。
     // 反查是**同步磁盘遍历**,跳转路径上照样丢后台。
-    let needs_cwd = session.session_type == "claude";
+    let needs_cwd =
+        mt_ai::AgentKind::parse(&session.session_type).is_some_and(|k| k.looks_up_session_cwd());
     let session_id = session.id.clone();
     let store = store.clone();
     window.spawn(cx, async move |cx| {
@@ -720,7 +706,7 @@ impl SessionPanel {
     /// —— 会话来自别处时把命令敲进本机终端跑不通,只留「查看 / 复制命令」。
     fn row_menu(&self, session: &AiSession, cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
         let entity = cx.entity();
-        let command = build_resume_command(&session.session_type, &session.id);
+        let command = session_resume_command(session);
         let can_resume_here = command.is_some()
             && session.wsl_distro.is_none()
             && session.ssh_connection_id.is_none();
@@ -771,7 +757,7 @@ impl SessionPanel {
             messages: Vec::new(),
             rendered_messages: Vec::new(),
             shown: PREVIEW_PAGE_SIZE,
-            command: build_resume_command(&session.session_type, &session.id),
+            command: session_resume_command(session),
         });
         let session_type = session.session_type.clone();
         let session_id = session.id.clone();
@@ -1413,27 +1399,45 @@ impl Render for SessionPanel {
 mod tests {
     use super::*;
 
-    /// resume 命令按 agent 分派,id 过白名单。
+    fn ai_session(session_type: &str, id: &str) -> AiSession {
+        AiSession {
+            id: id.to_string(),
+            session_type: session_type.to_string(),
+            title: String::new(),
+            timestamp: String::new(),
+            model: None,
+            wsl_distro: None,
+            ssh_connection_id: None,
+        }
+    }
+
+    /// resume 命令按 agent 分派,id 过白名单(模板与白名单本身的逐条用例在 `mt_ai::agent`)。
     #[test]
     fn resume_命令按_agent_分派() {
-        assert_eq!(
-            build_resume_command("claude", "abc-123").as_deref(),
-            Some("claude --resume abc-123")
-        );
-        assert_eq!(
-            build_resume_command("codex", "rollout_9").as_deref(),
-            Some("codex resume rollout_9")
-        );
-        assert_eq!(
-            build_resume_command("grok", "0199-x").as_deref(),
-            Some("grok --resume 0199-x")
-        );
-        assert_eq!(
-            build_resume_command("omp", "1f9d2a6b9c0d1234").as_deref(),
-            Some("omp --resume 1f9d2a6b9c0d1234")
-        );
-        // 未知 agent 按 claude 兜底(与旧版一致)
-        assert!(build_resume_command("whatever", "id1").is_some());
+        for (session_type, id, expected) in [
+            ("claude", "abc-123", "claude --resume abc-123"),
+            ("codex", "rollout_9", "codex resume rollout_9"),
+            ("grok", "0199-x", "grok --resume 0199-x"),
+            ("omp", "1f9d2a6b9c0d1234", "omp --resume 1f9d2a6b9c0d1234"),
+        ] {
+            assert_eq!(
+                session_resume_command(&ai_session(session_type, id)).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// 认不出 / 不支持续接的 agent 不再落到 `claude --resume`(旧口径的 bug:
+    /// 历史面板的「恢复」「复制恢复命令」会给出一条对不上号的命令)。
+    #[test]
+    fn 不支持续接的_agent_不出命令() {
+        for session_type in ["opencode", "pi", "whatever"] {
+            assert_eq!(
+                session_resume_command(&ai_session(session_type, "id1")),
+                None,
+                "{session_type:?}"
+            );
+        }
     }
 
     /// shell 元字符一律拦下 —— 这条命令是要原样写进 PTY 的。
@@ -1450,14 +1454,15 @@ mod tests {
             "a'b",
             "../../etc",
             "",
+            "--dangerously-skip-permissions",
         ] {
             assert!(
-                build_resume_command("claude", bad).is_none(),
+                session_resume_command(&ai_session("claude", bad)).is_none(),
                 "应拒绝: {bad:?}"
             );
         }
-        assert!(build_resume_command("claude", &"a".repeat(129)).is_none());
-        assert!(build_resume_command("claude", &"a".repeat(128)).is_some());
+        assert!(session_resume_command(&ai_session("claude", &"a".repeat(129))).is_none());
+        assert!(session_resume_command(&ai_session("claude", &"a".repeat(128))).is_some());
     }
 
     #[test]

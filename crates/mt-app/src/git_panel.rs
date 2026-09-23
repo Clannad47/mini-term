@@ -1045,8 +1045,8 @@ impl GitPanel {
         let project_id = self.store.read(cx).active_project_id.clone();
         let project_path = self.project_path.clone().unwrap_or_default();
         let repo_path = repo.path.to_string_lossy().to_string();
-        // 项目根仓库不带 cwd 覆盖(默认就是项目根);尾部分隔符归一化后比较
-        let same_as_root = trim_trailing_sep(&repo_path) == trim_trailing_sep(&project_path);
+        // 项目根仓库不带 cwd 覆盖(默认就是项目根)
+        let same_as_root = is_project_root_repo(&repo_path, &project_path);
         let title = if repo.is_worktree {
             format!("⎇ {}", repo.current_branch.clone().unwrap_or(repo.name.clone()))
         } else {
@@ -1102,18 +1102,18 @@ impl GitPanel {
     }
 }
 
-/// 去掉尾部的 `/` 与 `\`(原版 `replace(/[\\/]+$/,'')`)。
-pub fn trim_trailing_sep(path: &str) -> &str {
-    path.trim_end_matches(['/', '\\'])
-}
-
-/// 归一化路径:分隔符统一成 `/`、去掉尾部分隔符。
+/// 这个仓库是不是项目根自己。
 ///
-/// 两边的来源不同,不归一化没法比:项目路径是用户填的(Windows 上是 `\`),
+/// 两边的来源不同,只去尾部分隔符没法比:项目路径是用户填的(Windows 上是 `\`),
 /// 而项目根仓库那条走 `Repository::workdir()`,libgit2 内部一律用 `/`
-/// (`D:/Git/mini-term/`),直接 `starts_with` 会一个都对不上。
-fn normalize_path(path: &str) -> String {
-    trim_trailing_sep(&path.replace('\\', "/")).to_string()
+/// (`D:/Git/mini-term/`)。两边都转成 [`slash_form`](mt_core::path_key::slash_form)
+/// (分隔符统一 `/`、去尾部分隔符,大小写原样)再比 —— 与 [`repo_detail`] 同一把尺。
+///
+/// (原版 `replace(/[\\/]+$/,'')` 只去尾巴,Windows 上项目根仓库永远判成「不是
+/// 根」,「在终端中打开」会带上 cwd 覆盖并把页签改名成仓库名。)
+fn is_project_root_repo(repo_path: &str, project_path: &str) -> bool {
+    use mt_core::path_key::slash_form;
+    slash_form(repo_path) == slash_form(project_path)
 }
 
 /// 仓库在下拉/仓库栏里的**出处**:它的父目录相对项目根的那一段。
@@ -1130,11 +1130,12 @@ fn normalize_path(path: &str) -> String {
 /// - 仓库在项目**外**(项目落在某个仓库的子目录里,`discover_repo_limited`
 ///   会向上找到它)→ 仓库自己的绝对路径,免得只剩一个没有出处的叶子名。
 fn repo_detail(repo_path: &str, project_path: Option<&str>) -> Option<String> {
-    let repo = normalize_path(repo_path);
+    use mt_core::path_key::slash_form;
+    let repo = slash_form(repo_path);
     if repo.is_empty() {
         return None;
     }
-    let project = project_path.map(normalize_path).unwrap_or_default();
+    let project = project_path.map(slash_form).unwrap_or_default();
     // 项目根自己就是仓库:没有可补的出处
     if repo == project {
         return None;
@@ -1168,34 +1169,23 @@ mod tests {
     }
 
     /// 「在终端中打开」:项目根仓库**不带** cwd 覆盖,子仓库/worktree 才带。
-    /// 判据是尾部分隔符归一化后的字符串比较。
+    /// 判据是分隔符统一 + 去尾部分隔符后的字符串比较。
     #[test]
     fn 项目根仓库不带_cwd_覆盖() {
         let project = r"D:\Git\mini-term";
         // 完全相同
-        assert_eq!(
-            trim_trailing_sep(r"D:\Git\mini-term"),
-            trim_trailing_sep(project)
-        );
+        assert!(is_project_root_repo(r"D:\Git\mini-term", project));
         // 只差一个尾部反斜杠 —— 仍然算同一个,不该带覆盖
-        assert_eq!(
-            trim_trailing_sep(r"D:\Git\mini-term\"),
-            trim_trailing_sep(project)
-        );
+        assert!(is_project_root_repo(r"D:\Git\mini-term\", project));
         // 多个尾部分隔符也要吃掉
-        assert_eq!(
-            trim_trailing_sep(r"D:\Git\mini-term\\"),
-            trim_trailing_sep(project)
-        );
-        assert_eq!(
-            trim_trailing_sep("/home/u/proj//"),
-            trim_trailing_sep("/home/u/proj")
-        );
+        assert!(is_project_root_repo(r"D:\Git\mini-term\\", project));
+        assert!(is_project_root_repo("/home/u/proj//", "/home/u/proj"));
+        // libgit2 workdir 的形态(正斜杠 + 尾杠)—— 旧口径只去尾巴,这条判成
+        // 「不是根」,Windows 上项目根仓库的「在终端中打开」会带覆盖并改页签名
+        assert!(is_project_root_repo("D:/Git/mini-term/", project));
         // 子仓库:必须带覆盖
-        assert_ne!(
-            trim_trailing_sep(r"D:\Git\mini-term\sub"),
-            trim_trailing_sep(project)
-        );
+        assert!(!is_project_root_repo(r"D:\Git\mini-term\sub", project));
+        assert!(!is_project_root_repo("D:/Git/mini-term/sub/", project));
     }
 
     /// 仓库出处只在「有信息量」时才给:项目根自己、项目的直接子目录都没有。

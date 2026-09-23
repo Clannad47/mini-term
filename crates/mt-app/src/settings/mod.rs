@@ -603,7 +603,7 @@ impl SettingsView {
             hook_result: String::new(),
             snippet: None,
             show_snippet: false,
-            snippet_tab: "claude",
+            snippet_tab: mt_ai::hook_registry::HookAgent::Claude.key(),
             sound_warning: false,
             download_dir_busy: false,
             download_dir_error: None,

@@ -10,7 +10,8 @@
 /// 副本已删,改为再导出 —— 本模块内的两处调用与下面的回归测试都一字未动。
 pub(crate) use mt_core::strip_ansi_codes;
 
-/// 交互式 AI CLI 的命令名。
+/// 交互式 AI CLI 的命令名。取自 [`crate::agent`] 的表(各家 `AgentSpec::key`),
+/// 新接一家 CLI 在那张表里加一行即可,这里不再手写名单。
 ///
 /// `pi`（pi.dev，earendil-works/pi）只有两个字母，但匹配走 `ai_command_name` 的
 /// basename **全等**，`pip install` / `ping` / `pi.py` 都不会命中；它的
@@ -24,7 +25,7 @@ pub(crate) use mt_core::strip_ansi_codes;
 /// `omp`（oh-my-pi，can1357/oh-my-pi，pi 的分支）的命令名就是 `omp`，Windows 上
 /// 是 `omp.cmd`（basename 归一时剥掉）；一次性提问同样是 `-p`，`--resume` /
 /// `--continue` / `--fork` 都进交互式 TUI。它的 hook 接入见 `hook_registry` 的 omp 段。
-pub const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi", "grok", "omp"];
+pub const AI_COMMANDS: &[&str] = &crate::agent::AGENT_COMMANDS;
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &["-v", "--version", "-h", "--help", "-p", "--print"];

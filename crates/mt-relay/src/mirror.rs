@@ -17,7 +17,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use mt_ai::AgentKind;
 use mt_ai::sessions as ai_sessions;
+use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
 /// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP 四家)。
@@ -511,7 +513,7 @@ fn newest_codex_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     ai_sessions::collect_codex_session_paths(&sessions_dir, &mut paths);
     ai_sessions::sort_newest_session_paths(&mut paths, MAX_SCAN);
 
-    let normalized = ai_sessions::normalize_path(project_path);
+    let normalized = windows_eq_key(project_path);
     for path in paths {
         let Ok(content) = fs::File::open(&path) else {
             continue;
@@ -521,10 +523,10 @@ fn newest_codex_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
         for line in reader.lines().take(5) {
             let Ok(line) = line else { continue };
             if let Some(meta) = ai_sessions::codex_meta_from_line(&line) {
-                if ai_sessions::normalize_path(&meta.cwd) == normalized {
-                    if let Some(t) = mtime(&path) {
-                        return Some((path, t));
-                    }
+                if windows_eq_key(&meta.cwd) == normalized
+                    && let Some(t) = mtime(&path)
+                {
+                    return Some((path, t));
                 }
                 break;
             }
@@ -661,20 +663,24 @@ pub fn resolve_session_file_by_id(
     if !valid_session_id(session_id) {
         return None;
     }
-    let agent_lower = agent.map(|a| a.to_ascii_lowercase()).unwrap_or_default();
-    if agent_lower.contains("codex") {
-        let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
-        codex_session_file_in(&sessions_dir, session_id).map(|p| (p, MirrorAgent::Codex))
-    } else if agent_lower.contains("grok") {
-        let dir = ai_sessions::find_grok_session_dir(project_path, session_id)?;
-        ai_sessions::grok_updates_path(&dir).map(|p| (p, MirrorAgent::Grok))
-    } else if agent_lower == "omp" {
-        ai_sessions::find_omp_session_file(project_path, session_id).map(|p| (p, MirrorAgent::Omp))
-    } else if agent_lower.contains("claude") || agent_lower.is_empty() {
-        let dirs = ai_sessions::find_claude_project_dirs(project_path);
-        claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
-    } else {
-        None
+    // 识别口径统一在 mt-ai 的 agent 表(缺省 / 空串按 Claude;opencode / pi 没有
+    // 记录格式 → None)
+    match AgentKind::from_session_agent(agent)? {
+        AgentKind::Codex => {
+            let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
+            codex_session_file_in(&sessions_dir, session_id).map(|p| (p, MirrorAgent::Codex))
+        }
+        AgentKind::Grok => {
+            let dir = ai_sessions::find_grok_session_dir(project_path, session_id)?;
+            ai_sessions::grok_updates_path(&dir).map(|p| (p, MirrorAgent::Grok))
+        }
+        AgentKind::Omp => ai_sessions::find_omp_session_file(project_path, session_id)
+            .map(|p| (p, MirrorAgent::Omp)),
+        AgentKind::Claude => {
+            let dirs = ai_sessions::find_claude_project_dirs(project_path);
+            claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
+        }
+        AgentKind::OpenCode | AgentKind::Pi => None,
     }
 }
 

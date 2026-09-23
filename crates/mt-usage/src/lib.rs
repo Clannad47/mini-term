@@ -40,6 +40,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use mt_ai::AgentKind;
+use mt_core::path_key::windows_eq_key;
+
 /// 一个待解析的会话任务。
 enum SessionJob {
     /// Claude 主转录 + 其子代理转录（subagents/ 下全部 .jsonl，独立计费必须纳入）
@@ -211,11 +214,10 @@ impl ProviderResolver {
     }
 
     fn resolve(&self, s: &turns::ParsedSession) -> String {
-        if s.agent == "claude" {
-            return self.claude_host.clone();
-        }
-        if s.agent == "grok" {
-            return GROK_HOST.to_string();
+        match AgentKind::parse(s.agent) {
+            Some(AgentKind::Claude) => return self.claude_host.clone(),
+            Some(AgentKind::Grok) => return GROK_HOST.to_string(),
+            _ => {}
         }
         match s.provider.as_deref() {
             Some(id) => self.codex_hosts.get(id).cloned().unwrap_or_else(|| {
@@ -231,10 +233,11 @@ impl ProviderResolver {
 /// 会话枚举永远全量入账本、scope 只在查询层按本函数过滤——从项目子目录
 /// 启动(目录名编码与项目根不同)的 Claude 会话也能被计入。
 pub(crate) fn session_in_scope(cwd: Option<&str>, project: &str) -> bool {
-    let proj = mt_ai::sessions::normalize_path(project);
+    let proj = windows_eq_key(project);
     cwd.is_some_and(|c| {
-        let c = mt_ai::sessions::normalize_path(c);
-        c == proj || c.starts_with(&format!("{proj}\\"))
+        let c = windows_eq_key(c);
+        // 键是正斜杠形态(见 `windows_eq_key`)
+        c == proj || c.starts_with(&format!("{proj}/"))
     })
 }
 
@@ -249,13 +252,13 @@ pub enum AgentFilter {
 }
 
 /// 账本里存的 agent 字符串 → `ParsedSession` 要的 `&'static str`。
-/// 未知值一律按 claude（账本只会写入这三种，兜底只为不 panic）。
+/// 只认已接入用量统计的几家(agent 表的 `history` 位);未知值一律按 claude
+/// （账本只会写入这三种，兜底只为不 panic）。
 pub(crate) fn agent_from_db(agent: &str) -> &'static str {
-    match agent {
-        "codex" => "codex",
-        "grok" => "grok",
-        _ => "claude",
-    }
+    AgentKind::parse(agent)
+        .filter(|k| k.spec().history)
+        .unwrap_or(AgentKind::Claude)
+        .key()
 }
 
 #[cfg(test)]
@@ -271,6 +274,21 @@ mod tests {
         assert!(session_in_scope(Some("/Users/U/Proj"), "/users/u/proj"));
         assert!(!session_in_scope(Some("/Users/u/proj-other"), "/Users/u/proj"));
         assert!(!session_in_scope(None, "/Users/u/proj"));
+        // Windows 形态:盘符大小写、正反斜杠混用、尾随分隔符
+        assert!(session_in_scope(Some(r"d:\git\Proj\sub"), r"D:\Git\proj\"));
+        assert!(session_in_scope(Some("D:/Git/proj"), r"D:\Git\proj"));
+        assert!(!session_in_scope(Some(r"D:\Git\proj2"), r"D:\Git\proj"));
+    }
+
+    /// 账本 agent 串 → 解析器口径:只认接了用量统计的三家,其余按 claude(与改造前逐字相同)。
+    #[test]
+    fn agent_from_db_keeps_three_way_split() {
+        assert_eq!(agent_from_db("claude"), "claude");
+        assert_eq!(agent_from_db("codex"), "codex");
+        assert_eq!(agent_from_db("grok"), "grok");
+        for other in ["", "omp", "pi", "opencode", "什么鬼"] {
+            assert_eq!(agent_from_db(other), "claude", "{other:?}");
+        }
     }
 
     #[test]

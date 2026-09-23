@@ -93,29 +93,14 @@ pub fn is_marker_file(name: &str) -> bool {
             .any(|s| name.len() > s.len() && name.to_ascii_lowercase().ends_with(s))
 }
 
-/// 路径规范化(`useProjectKinds.ts::normPath`):分隔符统一成 `/`、去掉尾部斜杠。
+/// 路径规范化(`useProjectKinds.ts::normPath`):分隔符统一成 `/`、折叠重复分隔符、
+/// 去掉尾部斜杠,大小写原样。
 ///
 /// 只用于**失效比对**(fs-change 的父目录 vs 项目路径),缓存键仍是路径原文 ——
-/// 与原版 `dirKinds` 用原始路径当 key 同口径。
-pub fn norm_path(p: &str) -> String {
-    let mut out = String::with_capacity(p.len());
-    let mut last_sep = false;
-    for ch in p.chars() {
-        if ch == '\\' || ch == '/' {
-            if !last_sep {
-                out.push('/');
-            }
-            last_sep = true;
-        } else {
-            out.push(ch);
-            last_sep = false;
-        }
-    }
-    while out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
+/// 与原版 `dirKinds` 用原始路径当 key 同口径。实现收在
+/// [`mt_core::path_key::collapse_separators`];这里留个同名再导出只为不动调用点
+/// (`file_tree` 的 fs-change 失效分支)。
+pub use mt_core::path_key::collapse_separators as norm_path;
 
 /// 探一个目录得到的原料。纯数据,[`classify_project`] 是纯函数,单测直接打在它上面。
 #[derive(Debug, Default, Clone)]

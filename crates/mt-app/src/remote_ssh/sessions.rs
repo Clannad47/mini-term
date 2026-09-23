@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use mt_ai::AgentKind;
 use mt_ai::sessions::{
     AiSession, AiSessionMessage, CachedSessions, MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
     claude_message_from_line, claude_session_info_from_lines, codex_message_from_line,
     codex_meta_from_line, codex_user_title_from_line, encode_project_path, is_encoded_variant,
-    normalize_unix_path, session_cache, session_id_path_safe,
+    session_cache, session_id_path_safe,
 };
 use mt_config::SshConnection;
+use mt_core::path_key::posix_ci_eq_key;
 use mt_ssh::SftpHandle;
 
 use super::{
@@ -118,7 +120,7 @@ pub fn ai_sessions(
     project_path: &str,
     force: bool,
 ) -> Result<Vec<AiSession>, String> {
-    let cache_key = format!("ssh|{}|{}", conn.id, normalize_unix_path(project_path));
+    let cache_key = format!("ssh|{}|{}", conn.id, posix_ci_eq_key(project_path));
 
     if !force {
         // 锁即取即放,扫描期间不持锁(SFTP IO 秒级)。
@@ -200,7 +202,7 @@ async fn remote_claude_dir_matches(sftp: &SftpHandle, dir: &str, normalized_proj
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
                 && let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
             {
-                return normalize_unix_path(cwd) == normalized_project;
+                return posix_ci_eq_key(cwd) == normalized_project;
             }
         }
     }
@@ -220,7 +222,7 @@ async fn scan_remote_claude(
     };
 
     let encoded = encode_project_path(project_path);
-    let normalized_project = normalize_unix_path(project_path);
+    let normalized_project = posix_ci_eq_key(project_path);
 
     let mut matched_dirs: Vec<String> = Vec::new();
     for entry in dir_entries {
@@ -360,7 +362,7 @@ async fn scan_remote_codex(
         }
     };
 
-    let normalized_project = normalize_unix_path(project_path);
+    let normalized_project = posix_ci_eq_key(project_path);
     let mut sessions = Vec::new();
     for (path, mtime) in files {
         if sessions.len() >= MAX_SESSIONS_PER_SOURCE {
@@ -381,7 +383,7 @@ async fn scan_remote_codex(
             }
         }
         let Some(meta) = meta else { continue };
-        if meta.id.is_empty() || normalize_unix_path(&meta.cwd) != normalized_project {
+        if meta.id.is_empty() || posix_ci_eq_key(&meta.cwd) != normalized_project {
             continue;
         }
 
@@ -530,10 +532,14 @@ pub fn ai_session_content(
             // 拦腰截断,逐段 from_utf8_lossy 与一次性读全量等价
             let (consumed, complete) = split_complete_lines(&bytes);
             let text = String::from_utf8_lossy(complete);
-            let messages: Vec<AiSessionMessage> = match session_type {
-                "claude" => text.lines().filter_map(claude_message_from_line).collect(),
-                "codex" => text.lines().filter_map(codex_message_from_line).collect(),
-                other => return Err(format!("不支持的会话类型: {other}")),
+            let messages: Vec<AiSessionMessage> = match AgentKind::parse(session_type) {
+                Some(AgentKind::Claude) => {
+                    text.lines().filter_map(claude_message_from_line).collect()
+                }
+                Some(AgentKind::Codex) => {
+                    text.lines().filter_map(codex_message_from_line).collect()
+                }
+                _ => return Err(format!("不支持的会话类型: {session_type}")),
             };
             Ok(RemoteSessionContent {
                 messages,
@@ -567,11 +573,11 @@ async fn locate_remote_session_file(
     }
 
     let home = remote_home(st, sftp, conn_id).await?;
-    match session_type {
-        "claude" => {
+    match AgentKind::parse(session_type) {
+        Some(AgentKind::Claude) => {
             let projects_dir = join_posix(&join_posix(&home, ".claude"), "projects");
             let encoded = encode_project_path(project_path);
-            let normalized = normalize_unix_path(project_path);
+            let normalized = posix_ci_eq_key(project_path);
             let filename = format!("{session_id}.jsonl");
             let entries = sftp
                 .read_dir(&projects_dir)
@@ -595,7 +601,7 @@ async fn locate_remote_session_file(
             }
             Err("会话文件不存在".into())
         }
-        "codex" => {
+        Some(AgentKind::Codex) => {
             let sessions_dir = join_posix(&join_posix(&home, ".codex"), "sessions");
             let files =
                 collect_remote_codex_files(sftp, &sessions_dir, REMOTE_CODEX_SCAN_LIMIT).await;
@@ -607,6 +613,6 @@ async fn locate_remote_session_file(
             }
             Err("未找到 Codex 会话文件,请刷新会话列表后重试".into())
         }
-        other => Err(format!("不支持的会话类型: {other}")),
+        _ => Err(format!("不支持的会话类型: {session_type}")),
     }
 }

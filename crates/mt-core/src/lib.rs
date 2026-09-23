@@ -18,9 +18,13 @@
 //! 直接链接,任何上层 crate(mt-config、mt-project……)都**不能**出现在它的依赖里。
 //! 这条铁律决定了 `SshConnection` 的归属方向:定义留在本 crate,由 `mt-config`
 //! 反向 `pub use` 过去(config.json 仍是它的持久化归属方,回归测试也留在那边)。
+//!
+//! 路径的比较键与形态变换(大小写/分隔符/尾随分隔符/`\\?\` 前缀)统一住在
+//! [`path_key`],按语义分函数;各 crate 不再各写一份归一化。
 
 mod atomic_file;
 mod config_reader;
+pub mod path_key;
 mod ssh_connection;
 mod ssh_key;
 mod ssh_prompt;
