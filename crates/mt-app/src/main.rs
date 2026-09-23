@@ -1395,28 +1395,29 @@ impl Render for Workspace {
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
         let frost_wanted = dialog_open || self.usage_open || lightbox_open;
         if frost_wanted {
-            if self.frost.is_none() && self.frost_task.is_none() {
-                if let Some(raw) = frost::capture_raw(window) {
-                    self.frost_task = Some(cx.spawn(async move |this, cx| {
-                        let img = cx
-                            .background_executor()
-                            .spawn(async move { frost::finish(raw) })
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.frost_task = None;
-                            if let Some(img) = img {
-                                // 防御:按上面的门槛这里不该已有旧图,真有也得先把它
-                                // 的纹理摘掉再换。不在任何窗口的更新里,`drop_image`
-                                // 自己遍历得到本窗口;紧跟的 notify 让下一帧先重画再
-                                // 呈现,旧场景不会拿着已摘的图块再呈现一遍
-                                if let Some(old) = this.frost.replace(img) {
-                                    cx.drop_image(old, None);
-                                }
-                                cx.notify();
+            if self.frost.is_none()
+                && self.frost_task.is_none()
+                && let Some(raw) = frost::capture_raw(window)
+            {
+                self.frost_task = Some(cx.spawn(async move |this, cx| {
+                    let img = cx
+                        .background_executor()
+                        .spawn(async move { frost::finish(raw) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.frost_task = None;
+                        if let Some(img) = img {
+                            // 防御:按上面的门槛这里不该已有旧图,真有也得先把它
+                            // 的纹理摘掉再换。不在任何窗口的更新里,`drop_image`
+                            // 自己遍历得到本窗口;紧跟的 notify 让下一帧先重画再
+                            // 呈现,旧场景不会拿着已摘的图块再呈现一遍
+                            if let Some(old) = this.frost.replace(img) {
+                                cx.drop_image(old, None);
                             }
-                        });
-                    }));
-                }
+                            cx.notify();
+                        }
+                    });
+                }));
             }
         } else if self.frost.is_some() || self.frost_task.is_some() {
             // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
