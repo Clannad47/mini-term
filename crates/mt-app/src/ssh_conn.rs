@@ -371,28 +371,16 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            extra: Default::default(),
         }
     }
 
     fn project(enabled: bool, ids: Option<Vec<&str>>) -> ProjectConfig {
-        let mut p = ProjectConfig {
-            id: "p1".into(),
-            name: "proj".into(),
-            path: "/home/u/proj".into(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
+        ProjectConfig {
             ssh_mcp_enabled: enabled,
-            ssh_cli_token: None,
             ssh_connection_ids: ids.map(|v| v.into_iter().map(str::to_string).collect()),
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        };
-        p.ssh_mcp_enabled = enabled;
-        p
+            ..ProjectConfig::new("p1", "proj", "/home/u/proj")
+        }
     }
 
     fn ids(v: &[&str]) -> Vec<String> {

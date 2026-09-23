@@ -941,22 +941,7 @@ mod tests {
     use mt_config::{ProjectGroup, ProjectTreeItem};
 
     fn project(id: &str, name: &str) -> ProjectConfig {
-        ProjectConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            path: format!("D:/{name}"),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
+        ProjectConfig::new(id, name, format!("D:/{name}"))
     }
 
     fn pane(id: &str, status: PaneStatus, pty: Option<u32>) -> PaneFacet {

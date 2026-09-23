@@ -461,22 +461,7 @@ fn 目录汇总认两种分隔符() {
 // ─── store → 重画的闸 ─────────────────────────────────────
 
 fn project_config(id: &str, path: &str) -> ProjectConfig {
-    ProjectConfig {
-        id: id.to_string(),
-        name: format!("{id}-name"),
-        path: path.to_string(),
-        description: None,
-        saved_layout: None,
-        expanded_dirs: Vec::new(),
-        ssh_mcp_enabled: false,
-        ssh_cli_token: None,
-        ssh_connection_ids: None,
-        env_vars: Vec::new(),
-        wsl_sessions_distro: None,
-        ssh_connection_id: None,
-        parent_project_id: None,
-        kind_override: None,
-    }
+    ProjectConfig::new(id, format!("{id}-name"), path)
 }
 
 /// 签名的全部输入。`sig()` 与 `FileTree::store_signature` 走同一个函数。

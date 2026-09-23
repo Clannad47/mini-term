@@ -483,6 +483,9 @@ fn opt(value: &str) -> Option<String> {
 ///
 /// ⚠️ **密码不 trim**(原版 `password ? password : undefined`):前后空格是合法
 /// 口令字符,替用户裁掉会让人对着「密码明明没填错」发呆。
+///
+/// 表单只认识本版本的字段,`extra` 留空:编辑既有连接时,新版本写的未知字段由
+/// `AppStore::upsert_ssh_connection` 从旧条目上接过来。
 pub(crate) fn build_connection(
     id: String,
     name: &str,
@@ -506,6 +509,7 @@ pub(crate) fn build_connection(
         },
         identity_file: opt(identity),
         group: opt(group),
+        extra: Default::default(),
     }
 }
 
@@ -1966,6 +1970,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            extra: Default::default(),
         };
         assert_eq!(copy_payload(&conn), "生产 服务器");
         assert_ne!(copy_payload(&conn), connection_summary(&conn));

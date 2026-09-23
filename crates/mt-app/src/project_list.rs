@@ -839,15 +839,8 @@ fn project_menu(
             ProjectMenuAction::OpenInFolder => {
                 let path = PathBuf::from(&row.path);
                 menu::item(t("projectList", "menu.openInFolder"), move |_window, cx| {
-                    let path = path.clone();
-                    // spawn 外部进程会卡(网络盘 / 杀软),丢后台
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = fs_ops::reveal_in_file_manager(&path) {
-                                eprintln!("[projects] 打开文件夹失败: {err}");
-                            }
-                        })
-                        .detach();
+                    // spawn 外部进程会卡(网络盘 / 杀软),`open_external` 丢后台
+                    fs_ops::open_external(fs_ops::ExternalOpen::Reveal, path.clone(), cx);
                 })
             }
             ProjectMenuAction::CopyAbsolutePath => {
@@ -2771,6 +2764,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }];
         let mut p = project("p1", "/home/u/proj", None);
         assert!(remote_badge(&p, &conns).is_none(), "本地项目没有徽章");
@@ -2997,20 +2991,8 @@ mod tests {
 
     fn project(id: &str, path: &str, parent: Option<&str>) -> ProjectConfig {
         ProjectConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            path: path.to_string(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
             parent_project_id: parent.map(str::to_string),
-            kind_override: None,
+            ..ProjectConfig::new(id, id, path)
         }
     }
 

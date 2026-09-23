@@ -1716,6 +1716,7 @@ mod tests {
             password: Some("secret".into()),
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }
     }
 

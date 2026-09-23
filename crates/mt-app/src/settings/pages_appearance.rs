@@ -336,13 +336,28 @@ impl SettingsView {
             )
             .child(
                 ui::ghost_button("theme-open-dir", t("settings", "themes.openDir")).on_click(
-                    cx.listener(|this, _, _window, cx| {
+                    cx.listener(|_this, _, _window, cx| {
                         let root = crate::theme::theme_packs().root().to_path_buf();
-                        let _ = std::fs::create_dir_all(&root);
-                        if let Err(err) = crate::fs_ops::reveal_in_file_manager(&root) {
-                            this.theme_error = Some(err.to_string());
-                            cx.notify();
-                        }
+                        // 建目录 + spawn 文件管理器都是阻塞 IO(网络盘 / 杀软下会卡),
+                        // 丢后台。失败就地写进主题段的错误行,不走
+                        // `fs_ops::open_external` —— 设置是弹窗,toast 在遮罩下看不见
+                        cx.spawn(async move |this, cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    let _ = std::fs::create_dir_all(&root);
+                                    crate::fs_ops::reveal_in_file_manager(&root)
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                eprintln!("[settings] 打开主题目录失败: {err}");
+                                let _ = this.update(cx, |this: &mut Self, cx| {
+                                    this.theme_error = Some(err.to_string());
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
                     }),
                 ),
             )

@@ -428,7 +428,8 @@ impl SearchModal {
             ResultAction::ExternalEditor => {
                 self.cancel_pending_close();
                 let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
-                crate::fs_ops::open_path_with(editor, path, cx);
+                // 弹窗随即关掉,失败的 toast 不会被遮罩挡住
+                crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::Editor(editor), path, cx);
                 close_guarded(kind::GLOBAL_SEARCH, window, cx);
             }
         }

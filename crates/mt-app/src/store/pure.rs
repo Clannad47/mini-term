@@ -749,22 +749,7 @@ mod tests {
     use crate::tree::ProjectPanel;
 
     fn project(id: &str, name: &str) -> ProjectConfig {
-        ProjectConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            path: format!("/tmp/{id}"),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
+        ProjectConfig::new(id, name, format!("/tmp/{id}"))
     }
 
     fn pane<'a>(project_id: &'a str, pane_id: &'a str, status: PaneStatus, attention: bool) -> PaneRef<'a> {
@@ -1764,6 +1749,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }
     }
 
