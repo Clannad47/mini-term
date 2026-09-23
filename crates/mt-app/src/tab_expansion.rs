@@ -19,7 +19,7 @@
 //!    「Tab 缩进、空格对齐」)。空格缩进的文件不折。
 //!
 //! 不变式:`expand(restore(v)) == v` —— 写回后编辑器内容不必重建,只要用写回的文本
-//! 重算一次映射即可([`crate::file_viewer::FileViewer::finish_save`])。
+//! 重算一次映射即可(`file_viewer/document.rs` 的 `DocumentSession::finish_save`)。
 //!
 //! # 刻意的取舍
 //!

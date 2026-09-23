@@ -25,7 +25,7 @@ frame-profiler = ["gpui/profiler"]
 [dependencies]
 gpui.workspace = true
 gpui_platform.workspace = true
-# `tree-sitter-languages` 是文件预览器(`file_viewer.rs`)语法高亮的唯一来源:
+# `tree-sitter-languages` 是文件预览器(`file_viewer/`)语法高亮的唯一来源:
 # 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
 # (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
 # 与原版 CodeMirror `@codemirror/language-data` 的覆盖面同量级。
@@ -77,7 +77,7 @@ markdown = "1.0"
 # Markdown 预览里 ```mermaid 围栏的图表渲染(issue #80),纯 Rust:Mermaid 文本 →
 # SVG 字符串,不要浏览器 / Node。`default-features = false` 砍掉它自带的 CLI(clap)
 # 与 PNG 输出(resvg 0.47 —— 与 gpui 锁定的 0.46 不同版本,开了就是第二份 resvg);
-# 那份 SVG 的栅格化走 gpui 自带的 `SvgRenderer`(`file_viewer::render_mermaid_image`),
+# 那份 SVG 的栅格化走 gpui 自带的 `SvgRenderer`(`file_viewer::mermaid::render_mermaid_image`),
 # 本 crate 因此不直接依赖 resvg / usvg / tiny-skia,也不必再人肉对齐它们的 feature 集。
 # 余下依赖(fontdb 0.23 / ttf-parser 0.25 / regex / serde / once_cell)全在树里,
 # 净新增只有 json5(+ucd-trie)。

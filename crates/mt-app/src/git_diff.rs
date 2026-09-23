@@ -745,7 +745,7 @@ fn render_body(
 ///
 /// 原版是 `font-mono`(`--app-font-mono`:JetBrains Mono → Cascadia Code →
 /// Consolas);gpui 的字族是单值 + fallback 链,这里与文件查看器
-/// (`file_viewer.rs` 的编辑器分支)用同一条链,连「用户配过 uiFontFamily 就让它
+/// (`file_viewer/mod.rs` 的编辑器分支)用同一条链,连「用户配过 uiFontFamily 就让它
 /// 优先」的口径也一致(原版 `fontManager.ts:8-18` 会一并覆盖 `--app-font-mono`)。
 ///
 /// 不挂字族的话 diff 会继承界面字体 —— 比例字体下行号与代码列全对不齐。

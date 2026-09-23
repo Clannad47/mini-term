@@ -1424,7 +1424,7 @@ impl Render for Workspace {
             // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
             // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
             // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
-            // `App.windows`,见 `file_viewer::release_mermaid_assets`);本帧不再画它,
+            // `App.windows`,见 `file_viewer::mermaid::release_mermaid_assets`);本帧不再画它,
             // 上一帧的场景画完本帧就被替换,摘掉是安全的
             if let Some(old) = self.frost.take() {
                 cx.drop_image(old, Some(window));

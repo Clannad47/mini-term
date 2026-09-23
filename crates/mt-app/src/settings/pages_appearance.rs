@@ -192,7 +192,7 @@ fn downscale(full: &RenderImage, target: (u32, u32)) -> Option<Arc<RenderImage>>
 }
 
 /// 把这些缩略图从资源缓存与图集里放掉。`window` 的口径同
-/// `file_viewer::release_mermaid_assets`:渲染途中递当前窗口(它此刻被摘出了
+/// `file_viewer::mermaid::release_mermaid_assets`:渲染途中递当前窗口(它此刻被摘出了
 /// `App.windows`),`on_release` 传 `None`。只对要过的 key 调用 —— `fetch_asset`
 /// 对没见过的 key 会先发起一次生成。
 pub(super) fn release_theme_thumbs(
