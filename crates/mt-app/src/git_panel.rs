@@ -47,7 +47,7 @@ use crate::git_history::{GitHistoryContent, GitHistoryEvent};
 use crate::git_watch;
 use crate::i18n::t;
 use crate::menu::{self, MenuItem};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::ui;
 
 /// 两块折叠区的会话级视图状态。**有意不落盘**。
@@ -143,19 +143,28 @@ impl GitPanel {
                 GitHistoryEvent::RefreshRepos => this.refresh_repo_meta(cx),
             }
         }));
-        subs.push(cx.observe(&store, |this: &mut Self, _, cx| {
-            let path = this.store.read(cx).active_project().map(|p| p.path.clone());
-            if path != this.project_path {
-                this.project_path = path;
-                if this.visible {
-                    this.on_project_changed(cx);
-                } else {
-                    // 收着的时候不扫盘 —— 原版收起时组件根本没挂载
-                    this.stale = true;
+        // render 读活动项目(空态 / 远程)与更改视图模式,任何变化都照旧重画
+        subs.push(cx.observe(&store, |_, _, cx| cx.notify()));
+        // 项目路径的比对只在活动项目可能变了时做(`StoreEvent::touches_active_project`),
+        // 不再被 OSC 标题 / AI 状态这些与仓库无关的变化叫醒
+        subs.push(
+            cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+                if !event.touches_active_project() {
+                    return;
                 }
-            }
-            cx.notify();
-        }));
+                let path = this.store.read(cx).active_project().map(|p| p.path.clone());
+                if path != this.project_path {
+                    this.project_path = path;
+                    if this.visible {
+                        this.on_project_changed(cx);
+                    } else {
+                        // 收着的时候不扫盘 —— 原版收起时组件根本没挂载
+                        this.stale = true;
+                    }
+                    cx.notify();
+                }
+            }),
+        );
 
         Self {
             store,

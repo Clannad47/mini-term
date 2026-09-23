@@ -13,8 +13,9 @@ use crate::ai::AiBridge;
 use crate::pane::TerminalPane;
 use crate::shell_ops::ShellList;
 
+use super::events::StoreChanged;
 use super::pure::{find_pane_of_pty, rename_pane_in_states, resolve_scrollback};
-use super::{AppStore, UsagePrefs};
+use super::{AppStore, ConfigSection, StoreEvent, UsagePrefs};
 
 impl AppStore {
     // === AI 历史面板视图偏好 ===
@@ -34,7 +35,7 @@ impl AppStore {
         }
         self.config.session_list_view = Some(view.to_string());
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::View));
     }
 
     // === 用量面板偏好 ===
@@ -66,7 +67,7 @@ impl AppStore {
             }
         }
         if changed {
-            cx.notify();
+            cx.changed(StoreEvent::PaneStatusChanged);
         }
     }
 
@@ -99,7 +100,7 @@ impl AppStore {
             let theme = applied.terminal.clone();
             entity.update(cx, |pane, cx| pane.set_theme(theme, cx));
         }
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Appearance));
     }
 
     /// 当前主题的背景图参数(渲染归 mt-ui,这里只是取数口)。
@@ -166,20 +167,21 @@ impl AppStore {
         self.config.available_shells = list.shells;
         self.config.default_shell = list.default_shell;
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Shells));
     }
 
     // === 通用配置补丁 ===
 
     /// 写一份配置补丁并落盘(对应原版 `SettingsModal.tsx:59-70` 的 `useConfigPatch`)。
     ///
-    /// 设置页上百个开关全走这一条:改字段 → 500ms 防抖落盘 → `cx.notify()`。
+    /// 设置页上百个开关全走这一条:改字段 → 500ms 防抖落盘 → 发
+    /// `Config(Settings)` 事件并 notify(改了哪个字段这里看不出来,只能整段报)。
     /// 需要**额外副作用**的那几项(主题 / 字号 / 字族 / 回滚行数 / 停留时长)
     /// 各有自己的 setter,不要拿这个入口去改它们 —— 热更新会漏。
     pub fn patch_config(&mut self, edit: impl FnOnce(&mut AppConfig), cx: &mut Context<Self>) {
         edit(&mut self.config);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 
     // === 终端渲染参数(四项热更新)===
@@ -195,7 +197,7 @@ impl AppStore {
         self.config.terminal_font_size = size;
         self.apply_terminal_style(cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
     /// 终端字族。空串 = 回落默认(写 `None`,不落空串)。
@@ -212,7 +214,7 @@ impl AppStore {
         self.config.terminal_font_family = next;
         self.apply_terminal_style(cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
     /// 连体字开关。**字族本身得带 `calt` 表**才看得见效果 —— 默认的
@@ -226,7 +228,7 @@ impl AppStore {
         self.config.terminal_ligatures = enabled;
         self.apply_terminal_style(cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
     /// 回滚行数。**热更新全部已开终端**:调小时 alacritty 的 `update_history`
@@ -242,7 +244,7 @@ impl AppStore {
             entity.update(cx, |pane, _| pane.set_scrollback(lines as usize));
         }
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
     /// 拖选停留自动复制时长。`0` = 关掉停留语义(退回「松手即复制」)。
@@ -259,7 +261,7 @@ impl AppStore {
             entity.update(cx, |pane, cx| pane.set_selection_dwell(dwell, cx));
         }
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
     /// 把当前的终端字号/字族下发给**全部**已开终端。
@@ -296,7 +298,7 @@ impl AppStore {
         // 与切语言同一处理:让所有窗口重画(设置页一辈子也拖不了几次滑块)
         cx.refresh_windows();
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Appearance));
     }
 
     /// 界面字族。空串 = 回落平台默认(写 `None`,不落空串)。
@@ -311,7 +313,7 @@ impl AppStore {
         self.apply_ui_font();
         cx.refresh_windows();
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Appearance));
     }
 
     // === AI 感知(hook 页要用)===
@@ -348,7 +350,7 @@ impl AppStore {
         // 进程内切换 + 全窗口重绘(观察者顺带把 gpui-component 的 rust-i18n 也改了)
         crate::i18n::switch(locale, cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::Locale));
     }
 
     // === pane 重命名 ===
@@ -373,7 +375,7 @@ impl AppStore {
             } else {
                 Some(title.to_string())
             };
-            cx.notify();
+            cx.changed(StoreEvent::PaneRenamed);
         }
     }
 
@@ -389,7 +391,7 @@ impl AppStore {
     /// 这里不再叠加任何收敛,否则两处限长会打架。
     pub fn rename_pane_by_id(&mut self, pane_id: &str, title: &str, cx: &mut Context<Self>) {
         if rename_pane_in_states(&mut self.project_states, pane_id, title) {
-            cx.notify();
+            cx.changed(StoreEvent::PaneRenamed);
         }
     }
 
@@ -440,7 +442,7 @@ impl AppStore {
             return;
         }
         self.mobile_relay_status = Some(status);
-        cx.notify();
+        cx.changed(StoreEvent::MobileRelayStatusChanged);
     }
 
     /// 移动端中转配置的**读**口径:整块缺失时回落 `Default`(含预置两条启动器),
@@ -489,7 +491,7 @@ impl AppStore {
         relay.desktop_key = sealed.clone().unwrap_or_default();
         self.config.mobile_relay = Some(relay);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::MobileRelay));
         sealed.map(|_| ())
     }
 
@@ -499,6 +501,6 @@ impl AppStore {
         relay.launchers = launchers;
         self.config.mobile_relay = Some(relay);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::MobileRelay));
     }
 }

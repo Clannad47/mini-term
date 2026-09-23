@@ -60,7 +60,7 @@ use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;
 use crate::session_branch::{build_session_tree, flatten_session_tree, merge_lineage_edges};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::toast;
 use crate::tree::{AiSessionRef, PaneStatus};
 use crate::ui;
@@ -404,8 +404,14 @@ pub struct SessionPanel {
 
 impl SessionPanel {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |this: &mut Self, _, cx| {
-            // 项目切了才重拉;别的 store 变化(状态灯之类)只重画
+        // 别的 store 变化(状态灯之类)只重画
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 项目切了才重拉。比对只在活动项目可能变了时做
+        // (`StoreEvent::touches_active_project`),不再被 OSC 标题 / AI 状态叫醒
+        cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+            if !event.touches_active_project() {
+                return;
+            }
             let path = this.store.read(cx).active_project().map(|p| p.path.clone());
             if path != this.project_path {
                 if this.visible {
@@ -415,8 +421,8 @@ impl SessionPanel {
                     // 项目」触发(旧版收起时组件根本没挂载)
                     this.stale = true;
                 }
+                cx.notify();
             }
-            cx.notify();
         })
         .detach();
         let view = match store.read(cx).session_list_view() {

@@ -13,8 +13,9 @@ use mt_ui::icons::ProjectKind;
 use crate::project_tree;
 use crate::tree::gen_unique_id;
 
+use super::events::StoreChanged;
 use super::pure::remove_from_tree;
-use super::{AppStore, ProjectState};
+use super::{AppStore, ProjectState, StoreEvent};
 
 impl AppStore {
     /// 新项目 id:对 `projects` **与** `projectTree` 双双去重。树里也要查 ——
@@ -77,13 +78,13 @@ impl AppStore {
     /// 写缓存并通知(`setDirKind`)。识别不出也要写 —— 否则每帧重探。
     pub fn set_dir_kind(&mut self, path: String, kind: Option<ProjectKind>, cx: &mut Context<Self>) {
         self.dir_kinds.insert(path, kind);
-        cx.notify();
+        cx.changed(StoreEvent::DirKindsChanged);
     }
 
     /// 失效(`removeDirKind`):项目根的标记文件变动时调。下一轮 `ensure` 会重探。
     pub fn remove_dir_kind(&mut self, path: &str, cx: &mut Context<Self>) {
         if self.dir_kinds.remove(path).is_some() {
-            cx.notify();
+            cx.changed(StoreEvent::DirKindsChanged);
         }
     }
 
@@ -101,7 +102,7 @@ impl AppStore {
         // 切过去才起 PTY:恢复出来的布局在这一刻补齐(旧版的懒创建时机)
         self.hydrate_project(id, cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ActiveProjectChanged);
     }
 
     /// 添加项目之后的「打开」:切过去,并且**一个终端都没有**时用默认 shell
@@ -186,7 +187,10 @@ impl AppStore {
         self.project_states.insert(id.clone(), ProjectState::new());
         self.expanded_dirs.insert(id.clone(), HashSet::new());
         self.save_config_soon(cx);
-        cx.notify();
+        if parent_ok.is_none() {
+            cx.emit(StoreEvent::ProjectTreeChanged);
+        }
+        cx.changed(StoreEvent::ProjectsChanged);
         id
     }
 
@@ -204,7 +208,7 @@ impl AppStore {
         for pty_id in pty_ids {
             self.dispose_terminal(pty_id, cx);
         }
-        cx.notify();
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 改项目显示名(`store.ts::renameProject`)。空名不接受 —— 列表上会变成
@@ -222,7 +226,7 @@ impl AppStore {
         }
         project.name = name.to_string();
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 设置项目需求描述;空串 = 清除(`store.ts::setProjectDescription` 的
@@ -241,7 +245,7 @@ impl AppStore {
         }
         project.description = next;
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 项目级环境变量(`ProjectEnvVarsModal` 的落盘那一半)。
@@ -263,7 +267,7 @@ impl AppStore {
         };
         project.env_vars = vars;
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 项目类型徽标覆盖:`None` = 自动探测,`Some("none")` = 不显示,
@@ -284,7 +288,7 @@ impl AppStore {
         }
         project.kind_override = next;
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 移除项目:先回收它所有 pane 的 PTY,再从配置里摘掉。
@@ -325,13 +329,15 @@ impl AppStore {
         if self.active_project_id.as_deref() == Some(id) {
             self.active_project_id = self.config.projects.first().map(|p| p.id.clone());
             self.config.last_active_project_id = self.active_project_id.clone();
+            cx.emit(StoreEvent::ActiveProjectChanged);
         }
         // 它在布局库里的那一行一并删掉。`flush_layout_now` 查不到项目时按删行
         // 处理,所以这里只要把 id 标脏即可(项目 id 不复用,不怕标错)。
         self.layout_dirty_projects.insert(id.to_string());
         self.schedule_layout_flush(cx);
         self.save_config_soon(cx);
-        cx.notify();
+        cx.emit(StoreEvent::ProjectTreeChanged);
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     // === 项目分组(`store.ts:1266-1313` 的五个 action) ===
@@ -396,7 +402,7 @@ impl AppStore {
             None,
         );
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectTreeChanged);
     }
 
     /// 删分组。**组员(含子组)原位晋升到父级,一个都不删** —— 与原版
@@ -409,7 +415,7 @@ impl AppStore {
             return;
         }
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectTreeChanged);
     }
 
     /// 改分组名。空名不接受(调用方那边也 `trim` 过一道,两处都拦)。
@@ -429,7 +435,7 @@ impl AppStore {
         }
         group.name = name.to_string();
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectTreeChanged);
     }
 
     /// 折叠 / 展开。**只影响侧栏渲染**:移动端快照那条路
@@ -443,7 +449,7 @@ impl AppStore {
         };
         group.collapsed = !group.collapsed;
         self.save_config_soon(cx);
-        cx.notify();
+        cx.changed(StoreEvent::ProjectTreeChanged);
     }
 
     /// 把节点(项目或分组)移到 `target_group_id` 里的 `index` 位置。
@@ -473,7 +479,9 @@ impl AppStore {
             return false;
         }
         self.save_config_soon(cx);
-        cx.notify();
+        // 挪出父项目的 worktree 子项目会改 `parent_project_id`,项目表也算变了
+        cx.emit(StoreEvent::ProjectsChanged);
+        cx.changed(StoreEvent::ProjectTreeChanged);
         true
     }
 }

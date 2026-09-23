@@ -64,7 +64,7 @@ use crate::menu::{self, MenuEntry, MenuItem};
 use crate::modal;
 use crate::pane_preview::{self, MiniLayout};
 use crate::project_tree::{self, MAX_DEPTH, OrderedItem};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::tree::PaneStatus;
 use crate::ui;
 
@@ -1108,7 +1108,15 @@ pub struct ProjectList {
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |this: &mut Self, _, cx| {
+        // 本视图套了 view 级缓存(`main.rs::cached_panel`),render 读的状态灯 / 名字 /
+        // 完成标全靠这条 notify 重画
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 三道后台探测的闸只在项目表 / 技术栈缓存 / 窗口聚焦变了时过
+        // (`StoreEvent::touches_project_probes`),不再被 OSC 标题 / AI 状态叫醒
+        cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+            if !event.touches_project_probes() {
+                return;
+            }
             // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章
             this.probe_worktrees(false, cx);
             // 技术栈探测(原版 `useProjectKinds` 那个 effect):列表变了就补探,
@@ -1122,7 +1130,6 @@ impl ProjectList {
                 this.reconcile_worktrees(cx);
             }
             this.was_focused = focused;
-            cx.notify();
         })
         .detach();
         let mut this = Self {
@@ -1157,10 +1164,11 @@ impl ProjectList {
     /// 「探过就不再探」的判据在 store 那边(`dir_kinds`),这里只负责**不去白喂**
     /// ——见下面那道与 [`Self::probe_worktrees`] 同款的去重闸。
     fn ensure_project_kinds(&mut self, cx: &mut Context<Self>) {
-        // 去重闸,与 [`Self::probe_worktrees`] 同款:这个方法挂在 store 观察者上,
-        // 每次 notify 都会走一遍(AI 状态跳一下就有一次),此前每次都要把全部
-        // 项目路径克隆成一个 `Vec<String>` 再喂给一个只会全部命中缓存的去重表。
-        // 先只拼一条比较用的键,确定有新东西要探了才真去收集路径。
+        // 去重闸,与 [`Self::probe_worktrees`] 同款:这个方法挂在 store 事件上,
+        // 项目表 / 技术栈缓存 / 窗口聚焦任一变化都会走一遍(每探完一个目录就有
+        // 一次),此前每次都要把全部项目路径克隆成一个 `Vec<String>` 再喂给一个
+        // 只会全部命中缓存的去重表。先只拼一条比较用的键,确定有新东西要探了
+        // 才真去收集路径。
         //
         // ⚠️ **键只统计「还没探过」的路径**,不是全部路径。缓存被
         // `remove_dir_kind` 失效(项目根的标记文件变动)之后,那条路径会重新
@@ -1511,7 +1519,7 @@ impl ProjectList {
     ///
     /// `get_worktree_branches` 逐个 `Repository::open`,**阻塞**,必须丢后台。
     fn probe_worktrees(&mut self, force: bool, cx: &mut Context<Self>) {
-        // 这个方法挂在 store 观察者上、每次 notify 都会走一遍(AI 状态变化就有一次),
+        // 这个方法挂在 store 事件上、项目表 / 技术栈缓存 / 聚焦变化都会走一遍,
         // 所以先只拼一条比较用的键,确定要探了才真去收集路径
         let mut key = String::new();
         for p in self
@@ -2191,7 +2199,9 @@ impl ProjectList {
                         id: p.id.clone(),
                         name: p.name.clone(),
                         path: p.path.clone(),
-                        status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
+                        status: state
+                            .map(|s| s.highest_status())
+                            .unwrap_or(PaneStatus::Idle),
                         needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
                         kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
                         detected_kind,

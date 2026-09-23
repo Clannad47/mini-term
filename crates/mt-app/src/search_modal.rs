@@ -47,7 +47,7 @@ use crate::menu;
 use crate::notify::ToastKind;
 use crate::overlay::kind;
 use crate::prompt::{autofocus, close_guarded, open_guarded};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::ui;
 
 /// 结果上限。与原版 `SearchModal.tsx` 里那两个字面量 1000 同一个数
@@ -216,8 +216,14 @@ impl SearchModal {
                 this.run(cx);
             }
         });
-        let project_sub = cx.observe(&store, |this: &mut Self, _, cx| {
-            if this.search_project.is_some() && this.current_search_root(cx).is_none() {
+        // 活动项目换了 / 被删了 / 变成远程的,旧结果就作废。只在活动项目可能变了时
+        // 比对(`StoreEvent::touches_active_project`)。与改造前一样只在作废时 notify
+        // (render 里「搜索钮可不可点」那一处读取随根视图重画,不靠这里)
+        let project_sub = cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+            if event.touches_active_project()
+                && this.search_project.is_some()
+                && this.current_search_root(cx).is_none()
+            {
                 this.reset(cx);
                 cx.notify();
             }
