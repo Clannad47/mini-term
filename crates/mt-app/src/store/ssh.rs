@@ -78,6 +78,11 @@ impl AppStore {
         {
             Some(slot) => {
                 identity_changed = crate::ssh_conn::ssh_session_identity_changed(slot, &conn);
+                // 表单只认识本版本的字段:新版本写进来的未知字段从旧条目上接过来,
+                // 否则编辑一次连接就把它们抹了(见 mt-config `db.rs`「前向兼容」段)
+                if conn.extra.is_empty() {
+                    conn.extra = std::mem::take(&mut slot.extra);
+                }
                 *slot = conn;
             }
             None => self.config.ssh_connections.push(conn),
@@ -289,20 +294,8 @@ impl AppStore {
         let final_name = crate::ssh_conn::remote_project_name(name, remote_path);
         let id = self.fresh_project_id();
         self.config.projects.push(ProjectConfig {
-            id: id.clone(),
-            name: final_name,
-            path: remote_path.to_string(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
             ssh_connection_id: Some(connection_id.to_string()),
-            parent_project_id: None,
-            kind_override: None,
+            ..ProjectConfig::new(id.clone(), final_name, remote_path)
         });
         let tree = self.config.project_tree.get_or_insert_with(Vec::new);
         tree.push(mt_config::ProjectTreeItem::ProjectId(id.clone()));

@@ -2153,7 +2153,7 @@ impl FileTree {
                 return;
             };
             let editor = fs_ops::configured_editor(this.store.read(cx).config());
-            fs_ops::open_path_with(editor, root, cx);
+            fs_ops::open_external(fs_ops::ExternalOpen::Editor(editor), root, cx);
         });
 
         let mut picker = div()
@@ -2229,7 +2229,11 @@ impl FileTree {
                                             let editor = fs_ops::configured_editor(
                                                 tree.store.read(cx).config(),
                                             );
-                                            fs_ops::open_path_with(editor, root, cx);
+                                            fs_ops::open_external(
+                                                fs_ops::ExternalOpen::Editor(editor),
+                                                root,
+                                                cx,
+                                            );
                                         });
                                     })
                                 })

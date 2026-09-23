@@ -126,15 +126,7 @@ pub(super) fn file_menu(
         entries.push(match action {
             FileMenuAction::OpenWithDefault => {
                 menu::item(t("fileTree", "menu.openWithDefault"), move |_window, cx| {
-                    let path = path.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path)
-                            {
-                                eprintln!("[files] 默认程序打开失败: {err:#}");
-                            }
-                        })
-                        .detach();
+                    fs_ops::open_external(fs_ops::ExternalOpen::DefaultApp, path.clone(), cx);
                 })
             }
             FileMenuAction::CopyEntry => {
@@ -210,14 +202,7 @@ pub(super) fn file_menu(
             }
             FileMenuAction::RevealInFolder => {
                 menu::item(t("fileTree", "menu.revealInFolder"), move |_window, cx| {
-                    let path = path.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = fs_ops::reveal_in_file_manager(&path) {
-                                eprintln!("[files] 在文件夹中打开失败: {err}");
-                            }
-                        })
-                        .detach();
+                    fs_ops::open_external(fs_ops::ExternalOpen::Reveal, path.clone(), cx);
                 })
             }
             FileMenuAction::OpenInTerminal => {

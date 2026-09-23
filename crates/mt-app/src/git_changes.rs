@@ -12,10 +12,22 @@
 //! 行为 —— 所以行的 `ElementId` 必须带区名前缀(原版 key 是 `${area}-${path}`,
 //! 规格 §11 第 29 条),否则 gpui 会撞 id。
 //!
-//! # 失败一律静默
+//! # 失败要让用户看得见
 //!
-//! 原版每个 `invoke` 的 catch 都只 `console.error`(不弹 toast、不显红),
-//! 这里对应 `eprintln!`。**唯一的例外**是「丢弃」前的确认框(§4.5)。
+//! 原版每个 `invoke` 的 catch 都只 `console.error`(不弹 toast、不显红)。这里
+//! 不照抄 —— 只打日志的结果是「点了没反应」,而提交被 hook 拒掉恰恰是用户最需要
+//! 知道原因的时候。口径按失败出在哪儿分三种(日志照打):
+//!
+//! - **提交失败**(hook 拒绝 / GPG 出错 / 60s 超时):错误原文**就地**挂在提交按钮
+//!   下方,错误色、可滚动 —— 与仓库栏 pull/push 的 ✕ 同一套红,但提交的错误常是
+//!   hook 的多行输出,tooltip 装不下,所以成段显示。下一次提交、提交成功或换仓库
+//!   时清掉,不像 pull/push 那样 1.5s 自己消失(hook 输出得留给人读);
+//! - **暂存 / 取消暂存 / 丢弃失败**:推 toast。抽屉不是弹窗,toast 层画在抽屉之上
+//!   看得见;这几个动作的结果本来就体现在列表上,就地再挂一行反倒挤占列表;
+//! - **取变更失败**:列表区的「暂无变更」换成错误原文 —— 否则读失败会被误认成
+//!   「工作区是干净的」。它随 pty 输出每 500ms 去抖重取,推 toast 会刷屏,所以就地。
+//!
+//! 「丢弃」前的确认框(§4.5)照旧。
 //!
 //! # 阻塞调用
 //!
@@ -216,8 +228,12 @@ pub struct GitChanges {
     repo_path: String,
     changes: Vec<ChangeFileStatus>,
     loading: bool,
+    /// 上一次取变更失败的原文;`Some` 时列表区显示它而不是「暂无变更」。
+    load_error: Option<String>,
     commit_input: Entity<TextareaState>,
     committing: bool,
+    /// 上一次提交失败的原文(hook / GPG / 超时),挂在提交按钮下方。
+    commit_error: Option<String>,
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
     /// 迟到响应丢弃。
@@ -240,8 +256,10 @@ impl GitChanges {
             repo_path: String::new(),
             changes: Vec::new(),
             loading: false,
+            load_error: None,
             commit_input,
             committing: false,
+            commit_error: None,
             collapsed_dirs: HashSet::new(),
             request: 0,
             debounce_until: None,
@@ -256,6 +274,9 @@ impl GitChanges {
         self.repo_path = repo_path.to_string();
         self.changes.clear();
         self.collapsed_dirs.clear();
+        // 错误都属于上一个仓库
+        self.load_error = None;
+        self.commit_error = None;
         self.load(cx);
         cx.notify();
     }
@@ -295,11 +316,16 @@ impl GitChanges {
                 }
                 this.loading = false;
                 match result {
-                    Ok(list) => this.changes = list,
+                    Ok(list) => {
+                        this.changes = list;
+                        this.load_error = None;
+                    }
                     Err(err) => {
-                        // 原版 `.catch(() => setChanges([]))` —— 失败即清空
+                        // 原版 `.catch(() => setChanges([]))` —— 失败即清空;
+                        // 这里另把原因留给列表区显示,别让人当成「没有变更」
                         eprintln!("[git] 取变更失败: {err:#}");
                         this.changes.clear();
+                        this.load_error = Some(format!("{err:#}"));
                     }
                 }
                 cx.notify();
@@ -325,7 +351,8 @@ impl GitChanges {
             .collect()
     }
 
-    /// 跑一件阻塞的 git 动作,完成后重取列表。失败静默(照原版)。
+    /// 跑一件阻塞的 git 动作(暂存 / 取消暂存 / 丢弃),完成后重取列表。
+    /// 失败推 toast(口径见模块注释)。
     fn run_op(
         &mut self,
         op: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
@@ -340,12 +367,33 @@ impl GitChanges {
                 .background_executor()
                 .spawn(async move { op(&repo) })
                 .await;
-            if let Err(err) = result {
-                eprintln!("[git] 变更操作失败: {err:#}");
-            }
-            let _ = this.update(cx, |this: &mut Self, cx| this.load(cx));
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if let Err(err) = result {
+                    eprintln!("[git] 变更操作失败: {err:#}");
+                    this.notify_op_failure(format!("{err:#}"), cx);
+                }
+                this.load(cx);
+            });
         })
         .detach();
+    }
+
+    /// 暂存 / 丢弃这类动作失败的 toast。标题是当前项目名(与粘贴失败同一档:
+    /// `!` 图标、点击只关闭),正文带错误原文。
+    fn notify_op_failure(&self, detail: String, cx: &mut Context<Self>) {
+        let (project_id, project_name) = self
+            .store
+            .read(cx)
+            .active_project()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .unwrap_or_else(|| (String::new(), "Git".to_string()));
+        crate::toast::push_message(
+            crate::notify::ToastKind::PasteError,
+            project_id,
+            project_name,
+            tr!("gitChanges", "operationFailed", detail = detail),
+            cx,
+        );
     }
 
     fn stage(&mut self, path: String, cx: &mut Context<Self>) {
@@ -408,6 +456,7 @@ impl GitChanges {
             return;
         }
         self.committing = true;
+        self.commit_error = None;
         cx.notify();
         let repo = std::path::PathBuf::from(&self.repo_path);
         let input = self.commit_input.clone();
@@ -426,7 +475,11 @@ impl GitChanges {
                         this.load(cx);
                         cx.emit(GitChangesEvent::Committed);
                     }
-                    Err(err) => eprintln!("[git] 提交失败: {err:#}"),
+                    Err(err) => {
+                        // 提交消息留在框里不清,改完(或修好 hook)直接再点
+                        eprintln!("[git] 提交失败: {err:#}");
+                        this.commit_error = Some(format!("{err:#}"));
+                    }
                 }
                 cx.notify();
             });
@@ -473,6 +526,19 @@ fn placeholder_text(text: impl Into<SharedString>) -> AnyElement {
         .into_any_element()
 }
 
+/// 取变更失败时顶替占位文案的那一段:同一个位置,错误色,左右留边好折行
+/// (错误原文常带路径,居中折行难读,所以左对齐)。
+fn error_text(text: impl Into<SharedString>) -> AnyElement {
+    div()
+        .py(px(24.0))
+        .px(px(8.0))
+        .w_full()
+        .text_size(ui::font_px(12.0))
+        .text_color(ui::color_error())
+        .child(text.into())
+        .into_any_element()
+}
+
 impl Render for GitChanges {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tree_mode = self.store.read(cx).git_changes_view_mode() == "tree";
@@ -494,6 +560,8 @@ impl Render for GitChanges {
 
         if self.loading && empty {
             list = list.child(placeholder_text(t("gitChanges", "loading")));
+        } else if let Some(err) = self.load_error.as_deref().filter(|_| empty) {
+            list = list.child(error_text(tr!("gitChanges", "loadFailed", detail = err)));
         } else if empty {
             list = list.child(placeholder_text(t("gitChanges", "empty")));
         } else {
@@ -563,7 +631,21 @@ impl Render for GitChanges {
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.commit(window, cx)
                     })),
-            );
+            )
+            // 提交失败的原文(hook 输出可能很长:限高、可滚动)
+            .when_some(self.commit_error.as_deref(), |el, err| {
+                el.child(
+                    div()
+                        .id("git-commit-error")
+                        .w_full()
+                        .mt(px(8.0))
+                        .max_h(px(160.0))
+                        .overflow_y_scroll()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_error())
+                        .child(tr!("gitChanges", "commitFailed", detail = err)),
+                )
+            });
 
         div()
             .size_full()

@@ -551,20 +551,8 @@ mod tests {
 
     fn project_cfg(id: &str, parent: Option<&str>) -> ProjectConfig {
         ProjectConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            path: format!("/tmp/{id}"),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
             parent_project_id: parent.map(str::to_string),
-            kind_override: None,
+            ..ProjectConfig::new(id, id, format!("/tmp/{id}"))
         }
     }
 

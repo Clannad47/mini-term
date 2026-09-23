@@ -102,6 +102,8 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
 | `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件 | 主程序（`mt-app::logfile`） |
 
+⚠️ **config.db 前向兼容**：预览版与正式版会来回装、共用同一个库，所以旧版本**只删自己认识的键**，不认识的 settings 键、项目/连接行里不认识的字段（`extra`）、读不懂的键与行都原样留着（口径见 `mt-config/src/db.rs` 模块注释）。由此两条硬规矩：**删 `AppConfig` 字段时把键名加进 `db.rs` 的 `RETIRED_KEYS`**（否则库里旧值永远留着）；**下线的键名永不复用**。
+
 ### config.json 为什么还在（且必须还在）
 
 它不再是配置的家，只剩 `sshConnections` + `projects[]` 的四个 SSH 字段。**那条 sidecar 链路不能动**：

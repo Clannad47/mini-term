@@ -1010,13 +1010,7 @@ impl FileViewer {
             return;
         }
         let path = self.current_path.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = mt_project::editor::open_path_in_browser(&path) {
-                    eprintln!("[file-viewer] 浏览器打开失败: {err:#}");
-                }
-            })
-            .detach();
+        crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::Browser, path, cx);
     }
 
     fn open_with_default_app(&self, cx: &mut App) {
@@ -1024,13 +1018,7 @@ impl FileViewer {
             return;
         }
         let path = self.current_path.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = mt_project::editor::open_path_with_default_app(&path) {
-                    eprintln!("[file-viewer] 默认程序打开失败: {err:#}");
-                }
-            })
-            .detach();
+        crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::DefaultApp, path, cx);
     }
 
     fn download_remote_file(&self, window: &mut Window, cx: &mut App) {

@@ -82,6 +82,8 @@ pub const WSL_INFO_PROJECT: &str = "__wsl_info__";
 /// 配置后台写盘失败那条用的占位项目 id。与 [`WSL_INFO_PROJECT`] 同一种用法:
 /// 不跳转、不随关项目清理。
 const CONFIG_SAVE_PROJECT: &str = "__config_save__";
+/// 调外部程序失败那条用的占位项目 id(同上)。
+const OPEN_EXTERNAL_PROJECT: &str = "__open_external__";
 
 /// 队列里的一条。字段与 `types.ts:306-319` 的 `AiCompletionNotification` 对齐
 /// (`timestamp` 没搬:原版留着它也只是排序用,而这里本来就是插入序)。
@@ -298,6 +300,19 @@ pub fn push_config_save_failure(detail: &str, cx: &mut App) {
         CONFIG_SAVE_PROJECT.to_string(),
         t("app", "configSaveFailed.title").to_string(),
         crate::i18n::tr!("app", "configSaveFailed.message", detail = detail),
+        cx,
+    );
+}
+
+/// 调外部程序(编辑器 / 默认程序 / 浏览器 / 文件管理器)失败的告知,由
+/// `fs_ops::open_external` 推。不属于任何项目,`paste-error` 档(`!` 图标、点击
+/// 只关闭);**不去重** —— 每次点击都是一次独立的尝试,该有一次回应。
+pub fn push_open_external_failure(title: String, message: String, cx: &mut App) {
+    push_message(
+        ToastKind::PasteError,
+        OPEN_EXTERNAL_PROJECT.to_string(),
+        title,
+        message,
         cx,
     );
 }

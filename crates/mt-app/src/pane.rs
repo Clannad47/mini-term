@@ -1128,6 +1128,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            extra: Default::default(),
         }
     }
 

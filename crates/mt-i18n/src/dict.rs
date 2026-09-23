@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 912;
+pub const ZH_ENTRY_COUNT: usize = 916;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 912;
+pub const EN_ENTRY_COUNT: usize = 916;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -337,9 +337,10 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.moveConfirm", "确定要把 \"{name}\" 移动到 \"{target}\" 吗？"),
     ("dialog.moveOk", "移动"),
     ("dialog.moveTitle", "移动"),
-    ("dialog.noEditorMessage", "请先在『设置 → 系统设置 → 外部编辑器』中添加编辑器。"),
+    ("dialog.noEditorMessage", "请先在『设置 → 系统 → 外部编辑器』中添加编辑器。"),
     ("dialog.noEditorTitle", "未配置外部编辑器"),
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
+    ("dialog.openExternalFailedTitle", "打开失败"),
     ("dialog.renameFailedMessage", "重命名失败：{error}"),
     ("dialog.renameFailedTitle", "重命名失败"),
     ("download.contextChanged", "下载上下文已变化，请重新打开或刷新文件后再试。"),
@@ -422,9 +423,10 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.moveConfirm", "Move \"{name}\" to \"{target}\"?"),
     ("dialog.moveOk", "Move"),
     ("dialog.moveTitle", "Move"),
-    ("dialog.noEditorMessage", "Add an editor under Settings → System → External Editors first."),
+    ("dialog.noEditorMessage", "Add an editor under Settings → System → Editors first."),
     ("dialog.noEditorTitle", "No External Editor Configured"),
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
+    ("dialog.openExternalFailedTitle", "Failed to Open"),
     ("dialog.renameFailedMessage", "Rename failed: {error}"),
     ("dialog.renameFailedTitle", "Rename Failed"),
     ("download.contextChanged", "The download context changed. Reopen or refresh the file and try again."),
@@ -578,6 +580,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static GIT_CHANGES_ZH: &[(&str, &str)] = &[
+    ("commitFailed", "提交失败：{detail}"),
     ("committing", "提交中..."),
     ("contextDiscard", "丢弃修改"),
     ("contextViewDiff", "查看 Diff"),
@@ -586,7 +589,9 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
     ("discardOk", "丢弃"),
     ("discardTitle", "丢弃修改"),
     ("empty", "暂无变更"),
+    ("loadFailed", "读取变更失败：{detail}"),
     ("loading", "加载中..."),
+    ("operationFailed", "Git 操作失败：{detail}"),
     ("refresh", "刷新"),
     ("stageAll", "↑ 全部暂存"),
     ("switchToList", "切换到列表视图"),
@@ -595,6 +600,7 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static GIT_CHANGES_EN: &[(&str, &str)] = &[
+    ("commitFailed", "Commit failed: {detail}"),
     ("committing", "Committing..."),
     ("contextDiscard", "Discard Changes"),
     ("contextViewDiff", "View Diff"),
@@ -603,7 +609,9 @@ static GIT_CHANGES_EN: &[(&str, &str)] = &[
     ("discardOk", "Discard"),
     ("discardTitle", "Discard Changes"),
     ("empty", "No changes"),
+    ("loadFailed", "Failed to read changes: {detail}"),
     ("loading", "Loading..."),
+    ("operationFailed", "Git operation failed: {detail}"),
     ("refresh", "Refresh"),
     ("stageAll", "↑ Stage all"),
     ("switchToList", "Switch to list view"),

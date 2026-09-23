@@ -451,7 +451,12 @@ pub struct ProjectEnvVar {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 一个项目(`projects[]` 的元素)。
+///
+/// `Default` 是「刚添加的本地项目」:没有描述、没关联 SSH、不挂父项目、类型自动探测,
+/// 与此前各处全字段字面量的取值一致。新建走 [`ProjectConfig::new`],远程项目 /
+/// 子项目在返回值上改对应字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     pub id: String,
@@ -496,6 +501,26 @@ pub struct ProjectConfig {
     /// 项目类型徽标覆盖:`None` = 自动探测,"none" = 不显示,其余为技术栈 key。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_override: Option<String>,
+    /// 本版本不认识的字段(多半是更新的版本写的),原样带着往返 —— 旧版本存一次
+    /// 配置不该把新版本的项目字段抹掉(口径见 [`crate::db`] 的「前向兼容」段)。
+    ///
+    /// 只由反序列化填充:已知字段(含只读不写的 `savedLayout`)先被各自的字段吃掉,
+    /// 落不进这里。**不许手工往里塞已知字段名** —— flatten 序列化时会与真字段
+    /// 重复成两个同名键。SSH 投影只取四个已知字段,不带它。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ProjectConfig {
+    /// 新建一个项目:只给 id / 名字 / 路径,其余取 [`Default`]。
+    pub fn new(id: impl Into<String>, name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            path: path.into(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1012,10 +1037,20 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
         })
         .collect();
 
+    // 连接上的未知字段(`extra`,新版本写的)不进投影:投影形状只认本版本
+    // 已知的字段,sidecar 与本程序同版本,读不懂也用不上;新版本自己会写它的投影。
+    let connections: Vec<SshConnection> = config
+        .ssh_connections
+        .iter()
+        .map(|c| SshConnection {
+            extra: Map::new(),
+            ..c.clone()
+        })
+        .collect();
     let mut root = Map::new();
     root.insert(
         "sshConnections".into(),
-        serde_json::to_value(&config.ssh_connections).unwrap_or(Value::Array(vec![])),
+        serde_json::to_value(&connections).unwrap_or(Value::Array(vec![])),
     );
     root.insert("projects".into(), Value::Array(projects));
     Value::Object(root)
@@ -1845,10 +1880,6 @@ mod tests {
             middle_column_visible: false,
             right_drawer_width: Some(400.0),
             projects: vec![ProjectConfig {
-                id: "p1".into(),
-                name: "proj".into(),
-                path: "/tmp".into(),
-                description: None,
                 saved_layout: Some(SavedProjectLayout {
                     tabs: vec![SavedTab {
                         custom_title: None,
@@ -1863,15 +1894,7 @@ mod tests {
                     }],
                     active_tab_index: 0,
                 }),
-                expanded_dirs: vec![],
-                ssh_mcp_enabled: false,
-                ssh_cli_token: None,
-                ssh_connection_ids: None,
-                env_vars: vec![],
-                wsl_sessions_distro: None,
-                ssh_connection_id: None,
-                parent_project_id: None,
-                kind_override: None,
+                ..ProjectConfig::new("p1", "proj", "/tmp")
             }],
             ..Default::default()
         };
@@ -2243,11 +2266,13 @@ mod tests {
             password: None,
             identity_file: Some("/k".into()),
             group: Some("内网".into()),
+            extra: Default::default(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(json.contains(r#""identityFile":"/k""#), "{json}");
         assert!(!json.contains("password"), "None 不应序列化: {json}");
-        // 老配置里残留的 proxyJump 之类未知字段必须被静默忽略
+        // 老配置里残留的 proxyJump 之类未知字段不许拖垮反序列化
+        // (它落进 `extra`,入库前由 `db.rs` 的下线字段表剥掉)
         let parsed: SshConnection = serde_json::from_str(
             r#"{"id":"1","name":"n","host":"h","port":22,"user":"u","proxyJump":"user@bastion"}"#,
         )
@@ -2606,6 +2631,8 @@ mod tests {
                     password: Some("secret".into()),
                     identity_file: None,
                     group: None,
+                    // 新版本写的未知字段:库里原样往返,但不许进投影
+                    extra: serde_json::from_str(r#"{"jumpHost":"bastion"}"#).unwrap(),
                 },
                 SshConnection {
                     id: "c2".into(),
@@ -2616,6 +2643,7 @@ mod tests {
                     password: None,
                     identity_file: None,
                     group: None,
+                    extra: Default::default(),
                 },
             ],
             projects: vec![
@@ -2656,6 +2684,14 @@ mod tests {
             "sidecar 只读打开同目录的密钥文件就能解"
         );
 
+        // 连接上的未知字段只进库、不进投影:投影形状与本版本已知字段逐字一致
+        let projection = fs::read_to_string(&path).unwrap();
+        assert!(
+            !projection.contains("jumpHost"),
+            "未知字段漏进了投影: {projection}"
+        );
+        assert!(scoped[0].extra.is_empty());
+
         // 未知令牌仍 fail closed
         assert!(mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "nope").is_err());
 
@@ -2665,6 +2701,90 @@ mod tests {
         let unscoped = mt_core::read_ssh_connections_for_project_at(Some(path), Some("p2"));
         assert_eq!(unscoped.len(), 2, "没设范围的项目仍是全部可见");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 整条链路(`ConfigStore::load` → 改一项 → `ConfigStore::save`,含密码兜底封存):
+    /// 新版本写进库里的未知键 / 未知字段 / 读不懂的值都活着出来,库也没进只读。
+    #[test]
+    fn 新版本写过的库经完整读写链路不丢东西() {
+        let root = unique_test_root("forward-compat");
+        let path = root.join("config.json");
+        let store = ConfigStore::at(&path);
+        let token = store.load().unwrap().token;
+        let config = AppConfig {
+            projects: vec![ProjectConfig::new("p1", "甲", "D:/a")],
+            ssh_connections: vec![conn_with_plain_password("c1", "pw")],
+            ..Default::default()
+        };
+        store.save(token, &config).unwrap();
+
+        // 模拟更新的版本写过这个库
+        {
+            let db = rusqlite::Connection::open(root.join("config.db")).unwrap();
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES('futureFeature', '{\"on\":true}')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE settings SET value = '{\"px\":13}' WHERE key = 'uiFontSize'",
+                [],
+            )
+            .unwrap();
+            let raw: String = db
+                .query_row("SELECT data FROM projects WHERE id = 'p1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut project: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            project["pinned"] = serde_json::Value::Bool(true);
+            db.execute(
+                "UPDATE projects SET data = ?1 WHERE id = 'p1'",
+                [project.to_string()],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.load().expect("坏值不许让整库加载失败");
+        assert_eq!(loaded.config.ui_font_size, default_ui_font_size());
+        assert_eq!(
+            loaded.config.projects[0].extra.get("pinned"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let mut next = loaded.config;
+        next.theme = "dark".into();
+        store.save(loaded.token, &next).unwrap();
+
+        let db = rusqlite::Connection::open(root.join("config.db")).unwrap();
+        let setting = |key: &str| -> String {
+            db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(setting("futureFeature"), r#"{"on":true}"#);
+        assert_eq!(
+            setting("uiFontSize"),
+            r#"{"px":13}"#,
+            "没改过的坏值原样留着"
+        );
+        assert_eq!(setting("theme"), r#""dark""#);
+        let raw: String = db
+            .query_row("SELECT data FROM projects WHERE id = 'p1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(raw.contains(r#""pinned":true"#), "{raw}");
+        let conn_raw: String = db
+            .query_row(
+                "SELECT data FROM ssh_connections WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(conn_raw.contains("enc:v1:"), "密码仍是信封: {conn_raw}");
+        drop(db);
         fs::remove_dir_all(&root).ok();
     }
 
@@ -2678,6 +2798,7 @@ mod tests {
             password: Some(password.into()),
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }
     }
 
@@ -2921,22 +3042,7 @@ mod tests {
     }
 
     fn project_stub() -> ProjectConfig {
-        ProjectConfig {
-            id: String::new(),
-            name: String::new(),
-            path: String::new(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: vec![],
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: vec![],
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
+        ProjectConfig::default()
     }
 
     #[test]

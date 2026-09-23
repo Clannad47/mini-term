@@ -657,21 +657,6 @@ mod tests {
     }
 
     fn project(id: &str) -> mt_config::ProjectConfig {
-        mt_config::ProjectConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            path: format!("/tmp/{id}"),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
+        mt_config::ProjectConfig::new(id, id, format!("/tmp/{id}"))
     }
 }

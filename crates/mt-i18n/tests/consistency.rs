@@ -103,8 +103,13 @@ use mt_i18n::{
 /// 布局库降级正文（`app.{storageIssueTitle,layoutLoadFailed}`）、后台写盘失败 toast
 /// （`app.configSaveFailed.{title,message}`），中转面板的密钥解不开 / 封存失败 /
 /// 明文 ws:// 三条就地提示（`mobileRelay.{keyUnreadable,keySealFailed,urlInsecure}`）。
+/// 912 → 916：Git 面板与外部程序两处静默失败补可见反馈 —— 提交失败就地提示、
+/// 取变更失败占位、暂存/丢弃失败 toast（`gitChanges.{commitFailed,loadFailed,operationFailed}`），
+/// 调外部程序失败 toast 的通用标题（`fileTree.dialog.openExternalFailedTitle`）；
+/// 同批启用 Tauri 版留下的孤儿键 `fileTree.dialog.{openEditorFailedTitle,noEditorTitle,noEditorMessage}`，
+/// `noEditorMessage` 的设置路径改成 GPUI 设置页的实际层级（系统 → 外部编辑器）。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 912;
+const EXPECTED_ENTRIES_PER_LANG: usize = 916;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

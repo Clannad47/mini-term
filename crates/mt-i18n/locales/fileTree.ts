@@ -46,9 +46,10 @@ export const fileTree = {
       moveTitle: "移动",
       moveConfirm: '确定要把 "{name}" 移动到 "{target}" 吗？',
       moveOk: "移动",
-      noEditorMessage: "请先在『设置 → 系统设置 → 外部编辑器』中添加编辑器。",
+      noEditorMessage: "请先在『设置 → 系统 → 外部编辑器』中添加编辑器。",
       noEditorTitle: "未配置外部编辑器",
       openEditorFailedTitle: "打开编辑器失败",
+      openExternalFailedTitle: "打开失败",
     },
     header: {
       searchTitle: "搜索文件 ({mod}+Shift+F)",
@@ -154,9 +155,10 @@ export const fileTree = {
       moveTitle: "Move",
       moveConfirm: 'Move "{name}" to "{target}"?',
       moveOk: "Move",
-      noEditorMessage: "Add an editor under Settings → System → External Editors first.",
+      noEditorMessage: "Add an editor under Settings → System → Editors first.",
       noEditorTitle: "No External Editor Configured",
       openEditorFailedTitle: "Failed to Open Editor",
+      openExternalFailedTitle: "Failed to Open",
     },
     header: {
       searchTitle: "Search Files ({mod}+Shift+F)",

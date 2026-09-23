@@ -167,20 +167,8 @@ impl AppStore {
         let parent_ok = parent.filter(|pid| self.config.projects.iter().any(|p| p.id == *pid));
 
         self.config.projects.push(ProjectConfig {
-            id: id.clone(),
-            name,
-            path: path_str,
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
             parent_project_id: parent_ok.map(str::to_string),
-            kind_override: None,
+            ..ProjectConfig::new(id.clone(), name, path_str)
         });
         if parent_ok.is_none() {
             let tree = self.config.project_tree.get_or_insert_with(Vec::new);

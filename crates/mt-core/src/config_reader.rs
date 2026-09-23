@@ -223,6 +223,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }
     }
 

@@ -16,6 +16,7 @@ fn conn(id: &str) -> SshConnection {
         password: None,
         identity_file: None,
         group: None,
+        extra: Default::default(),
     }
 }
 
