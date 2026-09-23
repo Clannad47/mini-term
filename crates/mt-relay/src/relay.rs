@@ -1134,6 +1134,72 @@ fn normalize_relay_url(input: &str) -> Option<String> {
     Some(format!("{}/ws/desktop", with_scheme.trim_end_matches('/')))
 }
 
+/// 中转设置界面要不要亮「明文传输」警告:地址会走 `ws://`(非 TLS),且主机
+/// 不是回环 / 私网地址。
+///
+/// 前缀判定与 [`normalize_relay_url`] 逐条对齐:`ws://` 与被映射过去的 `http://`
+/// 才算明文;`wss://` / `https://` / 无前缀(默认 wss)都不算。走明文时桌面端密钥
+/// 在握手里、移动端指令在帧里,链路上谁都看得见 —— 拿到密钥就能向中转申请配对码、
+/// 顶掉用户的手机并往 PTY 写命令。
+///
+/// **只警告不阻断**:本机 / 局域网自测、前面有反代终结 TLS 都是正当用法,所以
+/// 回环(`localhost` / 127.0.0.0/8 / `::1`)与私网(10/8、172.16/12、192.168/16、
+/// 169.254/16、fc00::/7、fe80::/10,含 IPv4 映射的 IPv6)地址不提示。认不出的主机名
+/// 一律提示 —— 宁可多提醒一句。
+pub fn relay_url_needs_tls_warning(input: &str) -> bool {
+    let trimmed = input.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("ws://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    // authority 到第一个 `/` `?` `#` 为止;userinfo(`user:pass@`)不是主机
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = relay_url_host(host_port);
+    // 还没敲出主机名(输入框里只有 `ws://`)时先不吵
+    !host.is_empty() && !is_local_relay_host(&host)
+}
+
+/// authority 里去掉端口后的主机名(小写、去掉结尾的 `.`)。
+/// `[v6]:port` 取括号内(连同 `%zone` 一起去掉);不带括号却有多个 `:` 的
+/// 当作裸 IPv6 整体取(这种写法连不上,但判定上别把它截成半截)。
+fn relay_url_host(host_port: &str) -> String {
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else if host_port.matches(':').count() > 1 {
+        host_port
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    let host = host.split('%').next().unwrap_or_default();
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// 回环或私网主机(见 [`relay_url_needs_tls_warning`] 的清单)。
+fn is_local_relay_host(host: &str) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn local_v4(ip: Ipv4Addr) -> bool {
+        ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    }
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return local_v4(ip);
+    }
+    if let Ok(ip) = host.parse::<Ipv6Addr>() {
+        return ip.is_loopback()
+            || ip.is_unique_local()
+            || ip.is_unicast_link_local()
+            || ip.to_ipv4_mapped().is_some_and(local_v4);
+    }
+    false
+}
+
 /// 校验一条启动命令能否被识别为 AI 会话(「移动端」面板保存启动器时的非阻塞提示)。
 ///
 /// 这只是把失败从"手机上等 15 秒超时"前移到配置时,**不是安全防线**:
@@ -1192,6 +1258,74 @@ mod tests {
         // 空白 = 未配置
         assert_eq!(normalize_relay_url("   "), None);
         assert_eq!(normalize_relay_url(""), None);
+    }
+
+    /// 明文警告只看两件事:最终会不会走 `ws://`、主机是不是回环 / 私网。
+    #[test]
+    fn tls_warning_only_for_plaintext_ws_to_public_hosts() {
+        // 公网主机走明文:要警告(含 http:// 被映射成 ws:// 的那条)
+        for url in [
+            "ws://relay.example.com",
+            "ws://relay.example.com:8080/",
+            "http://relay.example.com",
+            "  ws://Relay.Example.COM  ",
+            "ws://8.8.8.8:8080",
+            "ws://172.32.0.1",
+            "ws://[2001:db8::1]:8080",
+            "ws://user:pass@relay.example.com",
+            "ws://relay.example.com.",
+            // 不是 `.localhost` 结尾,只是长得像
+            "ws://localhost.example.com",
+        ] {
+            assert!(relay_url_needs_tls_warning(url), "{url} 应当警告");
+        }
+
+        // TLS(显式或默认)一律不警告
+        for url in [
+            "wss://relay.example.com",
+            "https://relay.example.com",
+            "relay.example.com",
+            "",
+            "   ",
+            // 还没敲出主机名
+            "ws://",
+        ] {
+            assert!(!relay_url_needs_tls_warning(url), "{url:?} 不该警告");
+        }
+
+        // 回环 / 私网走明文:不警告
+        for url in [
+            "ws://localhost:8080",
+            "ws://LOCALHOST",
+            "ws://relay.localhost",
+            "http://127.0.0.1:8080",
+            "ws://127.8.9.10",
+            "ws://10.0.0.5",
+            "ws://172.16.3.4:9000",
+            "ws://172.31.255.255",
+            "ws://192.168.1.5:8080/ws",
+            "ws://169.254.10.20",
+            "ws://[::1]:8080",
+            "ws://[fd12:3456::1]",
+            "ws://[fe80::1%25eth0]:8080",
+            "ws://[::ffff:192.168.1.5]",
+            "ws://admin@192.168.1.5",
+        ] {
+            assert!(!relay_url_needs_tls_warning(url), "{url} 不该警告");
+        }
+    }
+
+    #[test]
+    fn relay_url_host_strips_port_brackets_and_zone() {
+        assert_eq!(
+            relay_url_host("relay.example.com:8080"),
+            "relay.example.com"
+        );
+        assert_eq!(relay_url_host("[::1]:8080"), "::1");
+        assert_eq!(relay_url_host("[fe80::1%eth0]"), "fe80::1");
+        assert_eq!(relay_url_host("::1"), "::1", "裸 IPv6 不能被截成半截");
+        assert_eq!(relay_url_host("Example.COM."), "example.com");
+        assert_eq!(relay_url_host(""), "");
     }
 
     fn project(id: &str, name: &str, panes: &[(&str, &str)]) -> MobileProject {

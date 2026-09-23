@@ -578,12 +578,17 @@ impl RelayBridge {
     ///
     /// 顺序与原版 `applyRelaySettings` 一致:**先落盘再 apply**
     /// (`set_mobile_relay_endpoint` 内部走 `save_config_now`)。
-    pub fn apply_settings(&self, url: &str, key: &str, cx: &mut App) {
+    ///
+    /// `key` 是面板里的明文:落盘前在 store 那边封存,建连用的仍是这份明文。
+    /// 封存失败时密钥没存下来,但**这一次照样建连**(用户刚填的值就在手上),
+    /// 原因经 `Err` 交回面板就地提示。
+    pub fn apply_settings(&self, url: &str, key: &str, cx: &mut App) -> Result<(), String> {
         let (url, key) = (url.trim().to_string(), key.trim().to_string());
-        self.store.update(cx, |store, cx| {
+        let saved = self.store.update(cx, |store, cx| {
             store.set_mobile_relay_endpoint(&url, &key, cx)
         });
         self.manager.apply(&url, &key);
+        saved
     }
 
     /// 启动器名单变化后:落盘 + 让中转重发一次全量快照
@@ -878,7 +883,14 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
     entity.update(cx, |this, cx| this.sync_now(cx));
     let relay = store.read(cx).mobile_relay();
     if !relay.relay_url.trim().is_empty() {
-        manager.apply(&relay.relay_url, &relay.desktop_key);
+        // 库里是信封,建连前在这里解开。解不开(换机器 / 密钥文件丢了)就按
+        // 「未填密钥」建连:中转回「密钥不正确」后连接循环停在那个状态上,
+        // 不重试不刷屏;面板打开时再就地提示重填(`mobile_panel::open`)。
+        let key = crate::secrets::reveal_relay_key(&relay.desktop_key).unwrap_or_else(|err| {
+            eprintln!("[mobile-relay] 已存桌面密钥无法解密,按未填写处理: {err}");
+            String::new()
+        });
+        manager.apply(&relay.relay_url, &key);
     }
     entity
 }

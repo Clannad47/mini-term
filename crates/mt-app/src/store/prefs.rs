@@ -459,13 +459,25 @@ impl AppStore {
     ///
     /// 立即落盘而不是 500ms 防抖(坑 8):原版是 `await saveConfigToDisk` 之后
     /// 才 `apply`,用户点完「保存并连接」立刻关掉应用,地址不该丢。
-    pub fn set_mobile_relay_endpoint(&mut self, url: &str, key: &str, cx: &mut Context<Self>) {
+    ///
+    /// **密钥在这里封存**(`key` 是面板交来的明文,见
+    /// [`crate::secrets::stored_relay_key`]),与 SSH 密码的
+    /// [`Self::upsert_ssh_connection`] 同一口径:封存失败就**不存密钥**(地址照存)
+    /// 并把原因交给调用方就地提示 —— 宁可下次启动让用户再填一次,也不把明文写进库。
+    pub fn set_mobile_relay_endpoint(
+        &mut self,
+        url: &str,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let mut relay = self.mobile_relay_for_patch();
         relay.relay_url = url.to_string();
-        relay.desktop_key = key.to_string();
+        let sealed = crate::secrets::stored_relay_key(key, &relay.desktop_key);
+        relay.desktop_key = sealed.clone().unwrap_or_default();
         self.config.mobile_relay = Some(relay);
         self.save_config_now();
         cx.notify();
+        sealed.map(|_| ())
     }
 
     /// 写启动器名单,**地址与密钥一个不动**。同样立即落盘。

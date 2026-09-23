@@ -37,7 +37,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
+use futures::StreamExt as _;
 use gpui::{App, Context, Entity, Global, Subscription, Task};
 use mt_config::{AppConfig, ConfigStore, ProjectConfig};
 use mt_relay::MobileRelayStatusPayload;
@@ -306,15 +308,55 @@ pub struct PendingAlert {
     pub sound_path: Option<String>,
 }
 
+/// 启动时持久化层的降级:本次运行哪些改动存不下来,以及原因。
+///
+/// 两种降级都**不拦着用**(本仓红线:存不下也照常让用),但必须让用户知道 ——
+/// 此前只在 stderr 留一行,用户照常改了一整天,重启后全没了,事前毫无征兆。
+/// 首帧之后由 `main.rs` 据此弹一次提示框(见 [`Self::dialog_message`])。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadOnlyState {
+    /// 配置加载失败:令牌留 0,之后每一次配置保存都被自己挡下(见
+    /// [`AppStore::save_config_now`])。值是错误详情。
+    pub config_error: Option<String>,
+    /// 布局库打不开 / 迁移失败:布局只在内存里活着,退出即忘。值是错误详情。
+    pub layout_error: Option<String>,
+}
+
+impl ReadOnlyState {
+    /// 有没有哪一路存不下来。
+    pub fn is_degraded(&self) -> bool {
+        self.config_error.is_some() || self.layout_error.is_some()
+    }
+
+    /// 启动提示框的正文;没有降级返回 `None`。两路都坏时两段依次排开。
+    pub fn dialog_message(&self) -> Option<String> {
+        if !self.is_degraded() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if let Some(detail) = &self.config_error {
+            parts.push(crate::i18n::tr!("app", "configLoadFailed", detail = detail));
+        }
+        if let Some(detail) = &self.layout_error {
+            parts.push(crate::i18n::tr!("app", "layoutLoadFailed", detail = detail));
+        }
+        Some(parts.join("\n\n"))
+    }
+}
+
 pub struct AppStore {
     config: AppConfig,
     /// 写盘令牌(乐观并发);0 = 还没成功 load 过,此时一律不写盘。
     token: u64,
+    /// 启动时哪一路持久化降级了(配置只读 / 布局不落盘)。启动后不再变。
+    read_only: ReadOnlyState,
     config_store: Arc<ConfigStore>,
     /// 配置落盘的单写者后台线程。主线程只把**完整快照**入队(见
     /// [`crate::store::config_writer`]):那条链末端是 `synchronous=FULL` 的
     /// SQLite 事务加一次投影文件 fsync,慢盘上几百毫秒,不能留在 UI 线程上。
     config_writer: ConfigWriter,
+    /// 写线程回报的写盘失败 → toast(去重后)。句柄一丢泵就停。
+    _save_failure_pump: Task<()>,
     /// 界面布局的落盘口(`layout.db`)。`None` = 库开不起来(盘满 / 权限),
     /// 此时布局**只在内存里活着**:界面照常用,退出即忘 —— 与配置加载失败时
     /// 「只读模式」同一条红线,绝不因为存不下就不让用。
@@ -399,22 +441,26 @@ pub struct AppStore {
 
 /// 开布局库,顺带跑一次「从 config.json 迁入」。
 ///
-/// 返回 `None` 的三种情形都按同一档降级处理:**布局本次不落盘**,界面照常用。
-/// 其中迁移失败也返回 `None` 是刻意的 —— 让本次继续走内存里那份、下次启动重试,
+/// 返回 `Err(错误详情)` 的三种情形都按同一档降级处理:**布局本次不落盘**,界面
+/// 照常用,详情进 [`ReadOnlyState::layout_error`] 由启动提示框告知用户。
+/// 其中迁移失败也返回 `Err` 是刻意的 —— 让本次继续走内存里那份、下次启动重试,
 /// 比拿一份半截数据把用户的布局盖掉强。
-fn open_layout_store(config: &AppConfig, may_migrate: bool) -> Option<Arc<mt_layout::LayoutStore>> {
+fn open_layout_store(
+    config: &AppConfig,
+    may_migrate: bool,
+) -> Result<Arc<mt_layout::LayoutStore>, String> {
     let dir = match mt_config::active_data_dir() {
         Ok(dir) => dir,
         Err(err) => {
             eprintln!("[layout] 定位数据目录失败({err:#}),本次布局不落盘");
-            return None;
+            return Err(format!("{err:#}"));
         }
     };
     let store = match mt_layout::LayoutStore::open_at(&dir) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("[layout] 布局库打不开({err:#}),本次布局不落盘");
-            return None;
+            return Err(format!("{err:#}"));
         }
     };
     if may_migrate && store.needs_config_migration() {
@@ -427,11 +473,11 @@ fn open_layout_store(config: &AppConfig, may_migrate: bool) -> Option<Arc<mt_lay
             ),
             Err(err) => {
                 eprintln!("[layout] 布局迁移失败({err:#}),本次布局不落盘");
-                return None;
+                return Err(format!("{err:#}"));
             }
         }
     }
-    Some(Arc::new(store))
+    Ok(Arc::new(store))
 }
 
 /// 布局迁移的**兜底数据源**:`{dir}/config.json.pre-sqlite`(配置搬进 config.db
@@ -469,9 +515,14 @@ fn layout_migration_fallback(config: &AppConfig, dir: &Path) -> Option<AppConfig
 ///
 /// 返回窗口几何与终端列表竖条显隐(config 里没有它们的位置 —— 都是 GPUI 版
 /// 新加的能力,只住在 `layout.db` 与 `AppStore` 的字段上,由调用方单独接住)。
+///
+/// `config_loaded = false`(配置加载失败、手上是空默认值)时**不对账**:拿一份
+/// 没有项目的配置去 `retain_projects`,会把布局库里全部项目行当无主行删光 ——
+/// 等下次配置恢复,项目回来了、分屏树全没了。只读模式下布局库只读不删。
 fn apply_layout_db(
     store: &mt_layout::LayoutStore,
     config: &mut AppConfig,
+    config_loaded: bool,
 ) -> (Option<mt_layout::WindowGeometry>, Option<bool>) {
     let globals = store.load_globals();
     if globals.layout_sizes.is_some() {
@@ -492,9 +543,11 @@ fn apply_layout_db(
         project.saved_layout = layouts.remove(&project.id);
     }
     // 对一次账:删项目那条路径漏调也不会攒出无主行(项目 id 不复用)。
-    let live: HashSet<String> = config.projects.iter().map(|p| p.id.clone()).collect();
-    if let Err(err) = store.retain_projects(&live) {
-        eprintln!("[layout] 清理无主项目行失败: {err:#}");
+    if config_loaded {
+        let live: HashSet<String> = config.projects.iter().map(|p| p.id.clone()).collect();
+        if let Err(err) = store.retain_projects(&live) {
+            eprintln!("[layout] 清理无主项目行失败: {err:#}");
+        }
     }
 
     // 明显不可用的几何(尺寸为 0、NaN、小得放不下内容)当没存过 —— 让开窗
@@ -508,25 +561,30 @@ fn apply_layout_db(
 impl AppStore {
     /// 装配 store:加载配置 → 恢复各项目布局(不起 PTY,PTY 在首次显示时懒起)。
     pub fn new(config_store: Arc<ConfigStore>, ai: AiBridge, cx: &mut Context<Self>) -> Self {
-        let (mut config, token) = match config_store.load() {
-            Ok(loaded) => (loaded.config, loaded.token),
+        let (mut config, token, config_error) = match config_store.load() {
+            Ok(loaded) => (loaded.config, loaded.token, None),
             Err(err) => {
                 // 加载失败**绝不**伪装成空配置:令牌留 0,后续所有保存都会被自己挡下,
                 // 免得一次读盘故障把用户的项目列表清空(旧版同一条红线)。
+                // 详情留给首帧之后的提示框(`ReadOnlyState`),不能只进 stderr。
                 eprintln!("[store] 配置加载失败({err:#}),本次以只读模式运行");
-                (AppConfig::default(), 0)
+                (AppConfig::default(), 0, Some(format!("{err:#}")))
             }
         };
 
         // 布局库:开库 →(首次)从 config.json 灌一次 → 把库里的值覆盖回
         // `config` 的对应字段。**覆盖这一步是整个改造的支点** —— 各处 getter
         // 照旧读 `self.config.*`(它现在是内存缓存),只有落盘那一步改了道。
-        // 配置加载失败(token=0)时不迁移:那份 config 是空默认值,灌进去等于
-        // 拿一份伪造的空布局把用户真实的布局盖掉。
-        let layout_store = open_layout_store(&config, token != 0);
+        // 配置加载失败(token=0)时不迁移、也不对账删行:那份 config 是空默认值,
+        // 灌进去等于拿一份伪造的空布局把用户真实的布局盖掉(对账同理,见
+        // `apply_layout_db`)。
+        let (layout_store, layout_error) = match open_layout_store(&config, token != 0) {
+            Ok(store) => (Some(store), None),
+            Err(err) => (None, Some(err)),
+        };
         let (window_geometry, terminals_panel_visible) = layout_store
             .as_ref()
-            .map(|store| apply_layout_db(store, &mut config))
+            .map(|store| apply_layout_db(store, &mut config, token != 0))
             .unwrap_or_default();
 
         let mut project_states = HashMap::new();
@@ -560,8 +618,20 @@ impl AppStore {
         // 跑完**(`main.rs` 那个在函数体里补的最后一次 `save_config_now()` 于是
         // 已经入队),**再**统一 await 收上来的 future。所以本观察者虽然注册得更
         // 早,轮到它的 future 被 poll 时看到的已是最终队列。
-        let config_writer = ConfigWriter::spawn(config_store.clone());
+        let (config_writer, mut save_failures) = ConfigWriter::spawn(config_store.clone());
         let drain = config_writer.drain_handle();
+        // 后台写盘失败 → 主线程推 toast(写线程里不碰 GPUI,经 channel 回来)。
+        // 盘满 / 杀软锁库会让之后每一次保存都失败,同类 60s 内只提示一次。
+        // ⚠️ toast 层画在弹窗遮罩之下:失败恰好发生在弹窗开着时这条会被挡住,
+        // 等 60s 窗口过了、再有保存失败时才会重新冒出来。
+        let save_failure_pump = cx.spawn(async move |_, cx| {
+            let mut throttle = config_writer::FailureThrottle::default();
+            while let Some(failure) = save_failures.next().await {
+                if throttle.admit(failure.kind, Instant::now()) {
+                    cx.update(|cx| crate::toast::push_config_save_failure(&failure.detail, cx));
+                }
+            }
+        });
         // 显式走 `App::on_app_quit` 而不是 `Context::on_app_quit`:排干不需要
         // `&mut AppStore`,而后者会在退出那一刻回头 `update` 本实体 —— 平白多一
         // 条「实体还在不在」的依赖。
@@ -576,8 +646,13 @@ impl AppStore {
         Self {
             config,
             token,
+            read_only: ReadOnlyState {
+                config_error,
+                layout_error,
+            },
             config_store,
             config_writer,
+            _save_failure_pump: save_failure_pump,
             layout_store,
             window_geometry,
             // 缺省展开:面板是发现型入口,收着的话没人知道它存在
@@ -626,6 +701,11 @@ impl AppStore {
 
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// 启动时持久化层降级了没有(配置只读 / 布局不落盘)与原因。
+    pub fn read_only_state(&self) -> &ReadOnlyState {
+        &self.read_only
     }
 
     pub fn projects(&self) -> &[ProjectConfig] {

@@ -92,7 +92,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 |------|------|--------|
 | `config.db` | **配置本体**（项目、SSH 连接、全部设置） | 只有主程序（`mt-config::db`） |
 | `config.json` | **给 sidecar 读的 SSH 投影**，派生物 | 主程序写，三个 sidecar 二进制读 |
-| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，除密码字段封存外不删不改 | 只在回退/排查时用 |
+| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，除密码与中转密钥字段封存外不删不改 | 只在回退/排查时用 |
 | `config.db.bak` | 每次成功加载后留的一代库备份 | 库损坏时自动顶上 |
 | `credential.key` | SSH 密码信封的主密钥（Windows 内容经 DPAPI 包裹；Unix 0600） | 主程序生成，sidecar 只读（见下节） |
 | `layout.db` | 界面布局（见下节） | 只有主程序（`mt-layout`） |
@@ -119,6 +119,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - **迁移**：`ConfigStore::load` 把存量明文一次性封存并回写库，随后 `VACUUM` + `wal_checkpoint(TRUNCATE)`（SQLite 更新一行不会抹掉页内旧 cell 字节，WAL 旧帧里也躺着明文页），再做这一代 `.bak`；`.pre-sqlite` 存档只改密码字段
 - **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙
 - **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
+- **中转桌面密钥同一套**：`mobileRelay.desktopKey` 与 SSH 密码同一把钥匙、同一迁移时机（`ConfigStore::load`）与兜底封存；封存点 `AppStore::set_mobile_relay_endpoint`，解封点 `mobile_relay::install`（建连）与 `mobile_panel::open`（回填），交给 mt-relay 的是明文。空串 = 未填不封存；解不开按未填写处理（中转回「密钥不正确」后停住）并在面板就地标红
 - **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
 - `mt-secret` 的依赖表只许有 mt-core / ring / base64 / serde / serde_json / zeroize，Windows 另加 DPAPI 用的 windows-sys（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
 

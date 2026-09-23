@@ -2383,5 +2383,20 @@ fn main() {
                 });
             });
         }
+
+        // 持久化降级的告知:配置加载失败 → 本次只读;布局库不可用 → 布局不落盘。
+        // 此前两者都只在 stderr 留一行,用户照常改了一整天、重启后全丢才发现。
+        // 同样排在**首帧呈现之后**(两层 `on_next_frame`,理由同上):弹窗挂在
+        // Root 上,首帧之前开的话会跟着窗口一起闪出来。只有一个「知道了」。
+        if let Some(message) = store.read(cx).read_only_state().dialog_message() {
+            let _ = window.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.refresh();
+                    window.on_next_frame(move |window, cx| {
+                        prompt::show_alert(t("app", "storageIssueTitle"), message, window, cx);
+                    });
+                });
+            });
+        }
     });
 }
