@@ -35,7 +35,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub mod width;
 
@@ -112,6 +112,8 @@ pub struct TerminalEmulator {
     scrollback: AtomicUsize,
     /// 光标绝对行的最低水位。`Some` = 追踪中,见 [`Self::arm_cursor_floor`]。
     cursor_floor: Mutex<Option<CursorFloor>>,
+    /// 内容代数,见 [`Self::generation`]。
+    generation: AtomicU64,
 }
 
 /// VT 解析器与它的随身暂存。
@@ -179,7 +181,18 @@ impl TerminalEmulator {
             events,
             scrollback: AtomicUsize::new(scrollback),
             cursor_floor: Mutex::new(None),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// 内容代数:每推进一批字节、每次 resize、每次真改了回滚行数都 +1。
+    ///
+    /// **在 term 锁里改**,所以持锁([`Self::with_term`])读到的值与 grid 当时的
+    /// 状态是一致的。终端查找靠它判断「上次扫描之后有没有新输出」—— 光看内容
+    /// 指纹判不出「周期性输出恰好滚过整数个周期、屏幕逐字相同」这种变化,
+    /// 而那时回看缓冲里的内容已经变了。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// 当前的回滚行数。
@@ -200,7 +213,9 @@ impl TerminalEmulator {
             scrolling_history: scrollback,
             ..Config::default()
         };
-        self.term.lock().set_options(config);
+        let mut term = self.term.lock();
+        term.set_options(config);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 把刚从 PTY 读到的字节推进状态机。直接接 mt-pty 里 `PtySession::spawn`
@@ -213,6 +228,8 @@ impl TerminalEmulator {
     /// 理由与手法见 [`width`] 模块注释。
     pub fn advance(&self, bytes: &[u8]) {
         let mut term = self.term.lock();
+        // 持着 term 锁记账:读的人持锁看到的代数与内容必然同步
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let mut parser = self.parser.lock();
         let mut floor = self.cursor_floor.lock();
         let Some(floor) = floor.as_mut().filter(|f| f.budget > 0) else {
@@ -260,7 +277,9 @@ impl TerminalEmulator {
     }
 
     pub fn resize(&self, size: TermSize) {
-        self.term.lock().resize(size);
+        let mut term = self.term.lock();
+        term.resize(size);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 供渲染侧读取 grid。持锁期间 reader 线程会被挡住 —— 这正是我们要的背压。
@@ -658,5 +677,26 @@ mod tests {
         assert!(e.events().drain().is_empty(), "同值 set 不该发事件");
         e.set_scrollback(11);
         assert!(!e.events().drain().is_empty(), "值变了才走 set_options");
+    }
+
+    /// 内容代数:推进字节 / resize / 真改回滚行数都要 +1;只读访问与同值
+    /// set_scrollback 不动它(查找引擎拿它判「有没有新输出」)。
+    #[test]
+    fn 内容代数随改动推进() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(20, 4), 10);
+        let g0 = e.generation();
+        e.advance(b"x");
+        let g1 = e.generation();
+        assert!(g1 > g0, "推进字节必须 +1");
+        let _ = e.visible_lines();
+        e.with_term(|_| ());
+        assert_eq!(e.generation(), g1, "只读访问不动代数");
+        e.resize(TermSize::new(30, 4));
+        let g2 = e.generation();
+        assert!(g2 > g1, "resize 会 reflow,必须 +1");
+        e.set_scrollback(10);
+        assert_eq!(e.generation(), g2, "同值不重设,代数不动");
+        e.set_scrollback(3);
+        assert!(e.generation() > g2, "调小回滚会裁历史,必须 +1");
     }
 }

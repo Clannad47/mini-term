@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use futures::StreamExt as _;
 use gpui::{App, Context, Entity, Global, Subscription, Task};
-use mt_config::{AppConfig, ConfigStore, ProjectConfig};
+use mt_config::{AppConfig, ConfigStore, LoadedConfig, ProjectConfig};
 use mt_project::project_kind::ProjectKind;
 use mt_relay::MobileRelayStatusPayload;
 use mt_ui::theme_bridge::BackgroundArt;
@@ -569,9 +569,19 @@ fn apply_layout_db(
 }
 
 impl AppStore {
-    /// 装配 store:加载配置 → 恢复各项目布局(不起 PTY,PTY 在首次显示时懒起)。
-    pub fn new(config_store: Arc<ConfigStore>, ai: AiBridge, cx: &mut Context<Self>) -> Self {
-        let (mut config, token, config_error) = match config_store.load() {
+    /// 装配 store:接过配置 → 恢复各项目布局(不起 PTY,PTY 在首次显示时懒起)。
+    ///
+    /// `loaded` 是调用方对 `config_store` 做的那次
+    /// [`ConfigStore::load_without_backup`](mt_config::ConfigStore::load_without_backup)
+    /// 的结果(首帧前只读一遍配置,见 `main.rs`)。加载成功时这一代库备份交给配置
+    /// 写线程当第一件活做,见 [`ConfigWriter::spawn`]。
+    pub fn new(
+        config_store: Arc<ConfigStore>,
+        loaded: anyhow::Result<LoadedConfig>,
+        ai: AiBridge,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (mut config, token, config_error) = match loaded {
             Ok(loaded) => (loaded.config, loaded.token, None),
             Err(err) => {
                 // 加载失败**绝不**伪装成空配置:令牌留 0,后续所有保存都会被自己挡下,
@@ -627,7 +637,9 @@ impl AppStore {
         // 跑完**(`main.rs` 那个在函数体里补的最后一次 `save_config_now()` 于是
         // 已经入队),**再**统一 await 收上来的 future。所以本观察者虽然注册得更
         // 早,轮到它的 future 被 poll 时看到的已是最终队列。
-        let (config_writer, mut save_failures) = ConfigWriter::spawn(config_store.clone());
+        // 加载失败(令牌 0)时不备份:与原来 `load()` 失败就走不到备份那一步同口径
+        let (config_writer, mut save_failures) =
+            ConfigWriter::spawn(config_store.clone(), token != 0);
         let drain = config_writer.drain_handle();
         // 后台写盘失败 → 主线程推 toast(写线程里不碰 GPUI,经 channel 回来)。
         // 盘满 / 杀软锁库会让之后每一次保存都失败,同类 60s 内只提示一次。

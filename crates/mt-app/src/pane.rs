@@ -917,6 +917,9 @@ impl TerminalPane {
             line
         });
         self.flash_line(line, cx);
+        // 闪烁那一行没变时 `set_flash` 不 notify(同一条标记 300ms 内连跳两次),
+        // 回看位置却可能刚被滚过 —— pane 套着 view 级缓存,这里自己 notify
+        cx.notify();
         true
     }
 
@@ -1077,9 +1080,11 @@ impl TerminalPane {
 
     /// 换回滚行数。调小时 alacritty 当场裁历史并释放内存。
     ///
-    /// **不碰视图**:grid 的容量变化不改任何渲染参数,下一帧照常读当前 grid。
-    pub fn set_scrollback(&mut self, lines: usize) {
+    /// 不改任何渲染参数,但裁掉历史会改滚动条的长度与位置 —— pane 套着 view 级
+    /// 缓存(`terminal_area::cached_terminal`),不 notify 就要等下一次输出才重画。
+    pub fn set_scrollback(&mut self, lines: usize, cx: &mut Context<Self>) {
         self.emulator.set_scrollback(lines);
+        cx.notify();
     }
 
     /// 丢弃组合中的预编辑串。切 tab / 关 pane 之前调,免得残影留在画面上。

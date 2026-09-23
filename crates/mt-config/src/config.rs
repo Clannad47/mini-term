@@ -1181,7 +1181,22 @@ impl ConfigStore {
     /// 伪装成加载成功(那会让调用方拿着空配置开始运行,下一次保存就把库覆盖了)。
     ///
     /// 加载成功才轮换发放令牌;上一轮的令牌随之作废。
+    ///
+    /// 成功后当场留一代库备份(见 [`backup_db`](Self::backup_db))。启动路径改走
+    /// [`load_without_backup`](Self::load_without_backup),把备份挪去写线程。
     pub fn load(&self) -> Result<LoadedConfig> {
+        let loaded = self.load_without_backup()?;
+        self.backup_db();
+        Ok(loaded)
+    }
+
+    /// 与 [`load`](Self::load) 相同,只是**不做**这一代库备份。
+    ///
+    /// ⚠️ 调用方必须保证在这之后、**任何一次 [`save`](Self::save) 之前**调
+    /// [`backup_db`](Self::backup_db) —— 备份存在的意义是留住「本次运行改动之前」
+    /// 的那一代,晚于第一次写入就不是那一代了。应用侧的保证方式见 mt-app 的
+    /// `store::config_writer`(备份是单写者线程的第一件活)。
+    pub fn load_without_backup(&self) -> Result<LoadedConfig> {
         let db = self.db()?;
         let mut config = match db.load()? {
             Some(config) => migrate_config(config),
@@ -1190,17 +1205,23 @@ impl ConfigStore {
         // 密码封存:存量明文一次性换成信封并回写库(存档同理)。放在备份**之前**,
         // 这一代 .bak 里才不会再躺着明文。
         self.seal_passwords_on_load(&db, &mut config);
-        // 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
-        // 失败只记日志:备份不该拦住启动。
-        if let Err(err) = db.backup_to(&self.db_backup_path()) {
-            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
-        }
         // 投影与库对齐 —— sidecar 读的是它。内容没变时是 no-op。
         self.write_ssh_projection(&config);
 
         let token = self.token.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         eprintln!("[config] load ok, token={token}");
         Ok(LoadedConfig { config, token })
+    }
+
+    /// 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
+    /// 失败只记日志:备份不该拦住启动。
+    pub fn backup_db(&self) {
+        let result = self
+            .db()
+            .and_then(|db| db.backup_to(&self.db_backup_path()));
+        if let Err(err) = result {
+            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
+        }
     }
 
     /// 库是空的 → 从 `config.json` 灌一次(存量用户),或落一份默认配置(全新安装)。

@@ -241,7 +241,7 @@ impl AppStore {
         self.config.terminal_scrollback = lines;
         let entities: Vec<Entity<TerminalPane>> = self.terminals.values().cloned().collect();
         for entity in entities {
-            entity.update(cx, |pane, _| pane.set_scrollback(lines as usize));
+            entity.update(cx, |pane, cx| pane.set_scrollback(lines as usize, cx));
         }
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Terminal));

@@ -1500,7 +1500,9 @@ impl Render for Workspace {
                                 .min_w(px(0.0))
                                 // ⚠️ 终端区**不套** [`cached_panel`]:它就是每一拍
                                 // 真在变的那块内容,套上等于每帧必然未命中,白付
-                                // 一次 cache_key 比较
+                                // 一次 cache_key 比较。缓存下沉到了**每个 pane**
+                                // (`terminal_area::cached_terminal`):刷屏的那个
+                                // 未命中,闲着的照走缓存
                                 .child(self.workbench_area.clone()),
                         )
                         .when(terminals_visible && terminal_page_active, |el| {
@@ -2296,21 +2298,37 @@ fn main() {
                 }
             }
         };
+        // 配置在首帧前只读**一遍**:这一次严格加载的结果同时交给界面语言、hook 开关
+        // 与 `AppStore`。此前是先 `read()` 整读一遍只为取这两个字段,`AppStore::new`
+        // 里再 `load()` 整读一遍。这一代库备份也不在这里同步做了 —— 挪成配置写线程
+        // 的第一件活,「备份先于本次运行的任何写入」由单写者线程的顺序保证(见
+        // `store::config_writer` 模块注释)。
+        let loaded = config_store.load_without_backup();
+        startup_trace::mark("setup: read_config done");
+        // 加载失败时 `AppStore` 按默认配置以只读模式跑,这两个字段同样取默认值
+        // (与此前 `read()` 失败时回落默认配置的结果一致)
+        let (locale, hook_enabled) = match &loaded {
+            Ok(loaded) => (loaded.config.locale.clone(), loaded.config.hook_enabled),
+            Err(_) => {
+                let fallback = mt_config::AppConfig::default();
+                (fallback.locale, fallback.hook_enabled)
+            }
+        };
         // 界面语言必须在**任何视图建出来之前**定下来:`t()` 读的是进程级全局量,
         // 晚一步的话首帧会以默认中文画出来再被刷成英文(闪一下)。
         // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
         // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
-        let startup_config = config_store.read();
-        startup_trace::mark("setup: read_config done");
-        i18n::install(startup_config.locale.as_deref());
+        i18n::install(locale.as_deref());
 
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
         // 走 mt_config::app_data_dir(),端口文件与装机版落在同一处。
-        let hook_enabled = startup_config.hook_enabled;
         let (ai_bridge, ai_events) = AiBridge::new(hook_enabled);
         let ai_for_quit = ai_bridge.clone();
 
-        AppStore::set_global(cx.new(|cx| AppStore::new(config_store, ai_bridge, cx)), cx);
+        AppStore::set_global(
+            cx.new(|cx| AppStore::new(config_store, loaded, ai_bridge, cx)),
+            cx,
+        );
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
 
