@@ -37,8 +37,21 @@
 //! (同一个去抖)/ 头部刷新按钮。第三条走 [`crate::git_watch`] 的**输出旁路**,
 //! 本模块是它的第二个订阅者([`git_watch::Subscriber::FileTree`])——
 //! `isAiPty` 那道闸在旁路里,AI pane 刷屏带不起这边的刷新。
+//!
+//! 文件树是常驻面板,所以这两条都**按需唤醒**,不挂常驻节拍:旁路有新字节时由
+//! reader 线程经唤醒口叫醒(见 `git_watch` 模块注释「唤醒」),去抖计时任务只在
+//! 真排了一次刷新时才存在。没项目 / 远程项目 / 终端没输出时主线程一次都不被叫。
+//! 目录行的汇总字母在状态加载完成时一次性预算成表(见 [`GitLabels`]),render 只查表。
+//!
+//! # store 变化 → 重画的闸
+//!
+//! [`AppStore`] 任何改动都会 notify(AI 跑着时 OSC 标题约 4Hz/pane),而本面板
+//! render 是整树拍平重建。observe 回调先比 [`store_render_signature`] —— render
+//! 从 store 读的**全部**东西的指纹(清单在那个函数的注释里),变了才 notify。
+//! ⚠️ render 里新读了 store 的什么,必须同步进那份清单,否则界面会不跟着刷。
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,10 +64,11 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder,
     px,
 };
+use mt_config::{AppConfig, ProjectConfig};
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
-use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
+use mt_ui::icons::{FileIcon, ProjectKind};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::DragFilePath;
@@ -203,10 +217,15 @@ pub struct FileTree {
     suppressed_subtrees: HashSet<PathBuf>,
     /// 拖放当前命中的目标目录(外部文件上传 / 树内移动)。
     drop_target: Option<DropTarget>,
-    /// git 状态:相对项目根的 `/` 分隔路径 → 状态字母(M/A/D/R/?/C)。
-    git_status: HashMap<String, String>,
+    /// git 状态表 + 目录汇总表(相对项目根的 `/` 分隔路径 → 状态字母)。
+    git: GitLabels,
     /// 排着的 git 状态刷新(去抖到点时刻);`None` = 没排。
     git_refresh_at: Option<Instant>,
+    /// 去抖计时任务在不在睡。只在排了刷新时才起一个,见 [`Self::schedule_git_refresh`]。
+    git_refresh_armed: bool,
+    /// 上一次 render 看到的 [`store_render_signature`]。store notify 时与它比,
+    /// 相同就不重画。
+    rendered_store_signature: u64,
     /// 压缩链的每一段 → 「产出这条链的那次列目录」。中段变化要重列它、重新压缩。
     chain_owner: HashMap<PathBuf, PathBuf>,
     /// 根目录还在列、且一份内容都还没有 —— 三态占位里的 loading 那一档。
@@ -326,9 +345,13 @@ impl FileTree {
     }
 
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
+        // store 的 notify 大多与文件树无关(OSC 标题、AI 状态、焦点……),先比一遍
+        // render 真正从 store 读的那些东西,变了才重画(见模块注释「store 变化 → 重画的闸」)
         cx.observe(&store, |this: &mut Self, _, cx| {
-            this.sync_project(cx);
-            cx.notify();
+            let source_changed = this.sync_project(cx);
+            if source_changed || this.store_signature(cx) != this.rendered_store_signature {
+                cx.notify();
+            }
         })
         .detach();
 
@@ -354,7 +377,7 @@ impl FileTree {
                         tree.invalidate(&dir, cx);
                         // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
                         // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
-                        tree.schedule_git_refresh();
+                        tree.schedule_git_refresh(cx);
                         tree.invalidate_dir_kind(&path, &dir, cx);
                     })
                     .is_err()
@@ -364,19 +387,24 @@ impl FileTree {
             }
         });
 
-        // 100ms 节拍:收 git 输出旁路的命中 + 到点跑去抖的那次刷新。
-        // 与 Git 面板同一条旁路、同一个节拍常数,只是各自一个游标(见 git_watch)。
+        // git 输出旁路:reader 线程往窗口里塞了新字节才叫醒这里,扫一遍、命中就排
+        // 一次去抖刷新。与 Git 面板同一条旁路,各自一个游标(见 git_watch)。
+        //
+        // 此前是 100ms 常驻节拍,无项目 / 远程项目 / 窗口最小化时主线程也每秒被
+        // 空唤醒 10 次。现在没输出就不醒(订阅关着时连叫都不叫);两次扫描之间
+        // 至少隔 POLL_MS —— 刷屏时最多每秒醒 10 次,与原先的上限相同。
+        let mut git_wake = git_watch::wake_channel_for(git_watch::Subscriber::FileTree);
         let git_task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(git_watch::POLL_MS))
-                    .await;
+            while git_wake.next().await.is_some() {
                 if this
-                    .update(cx, |tree: &mut FileTree, cx| tree.tick_git(cx))
+                    .update(cx, |tree: &mut FileTree, cx| tree.on_git_output(cx))
                     .is_err()
                 {
                     return;
                 }
+                cx.background_executor()
+                    .timer(Duration::from_millis(git_watch::POLL_MS))
+                    .await;
             }
         });
 
@@ -399,8 +427,10 @@ impl FileTree {
             active_operation_suppressed_path: None,
             suppressed_subtrees: HashSet::new(),
             drop_target: None,
-            git_status: HashMap::new(),
+            git: GitLabels::default(),
             git_refresh_at: None,
+            git_refresh_armed: false,
+            rendered_store_signature: 0,
             chain_owner: HashMap::new(),
             root_loading: false,
             root_error: None,
@@ -414,18 +444,53 @@ impl FileTree {
     }
 
     /// 排一次去抖刷新(原版 `debouncedRefresh`,500ms)。重复排只推后到点时刻。
-    fn schedule_git_refresh(&mut self) {
-        self.git_refresh_at = Some(Instant::now() + Duration::from_millis(git_watch::DEBOUNCE_MS));
+    ///
+    /// 计时任务**只在排着刷新时才存在**:已经有一个在睡就只改到点时刻,它醒来
+    /// 发现被顺延了会按剩余时长再睡一觉([`Self::fire_git_refresh`]);
+    /// 没排的时候什么都不跑。
+    fn schedule_git_refresh(&mut self, cx: &mut Context<Self>) {
+        let delay = Duration::from_millis(git_watch::DEBOUNCE_MS);
+        self.git_refresh_at = Some(Instant::now() + delay);
+        if self.git_refresh_armed {
+            return;
+        }
+        self.git_refresh_armed = true;
+        cx.spawn(async move |this, cx| {
+            let mut wait = delay;
+            loop {
+                cx.background_executor().timer(wait).await;
+                match this.update(cx, |tree: &mut FileTree, cx| tree.fire_git_refresh(cx)) {
+                    Ok(Some(rest)) => wait = rest,
+                    _ => return,
+                }
+            }
+        })
+        .detach();
     }
 
-    /// 节拍:旁路命中就排一次去抖,到点就真去拉。
-    fn tick_git(&mut self, cx: &mut Context<Self>) {
-        if git_watch::drain_hit_for(git_watch::Subscriber::FileTree) {
-            self.schedule_git_refresh();
+    /// 去抖计时任务醒了:到点就真去拉并收摊;被顺延过就回报还要再睡多久;
+    /// 排的那次已被撤掉(换项目)就直接收摊。
+    fn fire_git_refresh(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
+        let now = Instant::now();
+        match self.git_refresh_at {
+            Some(at) if now < at => Some(at - now),
+            Some(_) => {
+                self.git_refresh_at = None;
+                self.git_refresh_armed = false;
+                self.load_git_status(cx);
+                None
+            }
+            None => {
+                self.git_refresh_armed = false;
+                None
+            }
         }
-        if self.git_refresh_at.is_some_and(|at| Instant::now() >= at) {
-            self.git_refresh_at = None;
-            self.load_git_status(cx);
+    }
+
+    /// 旁路叫醒了:扫一遍新字节,命中就排一次去抖。
+    fn on_git_output(&mut self, cx: &mut Context<Self>) {
+        if git_watch::drain_hit_for(git_watch::Subscriber::FileTree) {
+            self.schedule_git_refresh(cx);
         }
     }
 
@@ -435,19 +500,23 @@ impl FileTree {
     /// 不是 git 仓库 / 仓库坏了的时候,留着上一个项目的状态字母比没有更糟。
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
         let Some(context) = self.operation_context(cx) else {
-            self.git_status.clear();
+            self.git.clear();
             return;
         };
         if !matches!(&context.backend, FileBackendIdentity::Local) {
-            self.git_status.clear();
+            self.git.clear();
             return;
         }
         let root = context.root.clone();
         cx.spawn(async move |this, cx| {
             let probe = root.clone();
+            // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
             let result = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::get_git_status(&probe) })
+                .spawn(async move {
+                    mt_project::git::get_git_status(&probe)
+                        .map(|files| GitLabels::new(git_status_table(files)))
+                })
                 .await;
             let _ = this.update(cx, |tree: &mut FileTree, cx| {
                 // 回来时项目、连接或 source generation 都可能已经变化；完整上下文
@@ -455,22 +524,15 @@ impl FileTree {
                 if tree.operation_context(cx).as_ref() != Some(&context) {
                     return;
                 }
-                tree.git_status = result
-                    .map(|files| {
-                        files
-                            .into_iter()
-                            .map(|f| (f.path.replace('\\', "/"), f.status_label))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                tree.git = result.unwrap_or_default();
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// 活动项目变了:清空缓存与监听,重列根目录。
-    fn sync_project(&mut self, cx: &mut Context<Self>) {
+    /// 活动项目变了:清空缓存与监听,重列根目录。返回是否真换了(调用方据此重画)。
+    fn sync_project(&mut self, cx: &mut Context<Self>) -> bool {
         let (project_id, root, remote, broken, signature) = {
             let store = self.store.read(cx);
             match store.active_project() {
@@ -500,7 +562,7 @@ impl FileTree {
             }
         };
         if signature == self.source_signature {
-            return;
+            return false;
         }
         for dir in std::mem::take(&mut self.watched) {
             self.watcher.unwatch(&dir);
@@ -510,7 +572,8 @@ impl FileTree {
         self.dir_request_ids.clear();
         self.pending_reload.clear();
         self.chain_owner.clear();
-        self.git_status.clear();
+        self.git.clear();
+        // 排着的去抖刷新作废;在睡的计时任务醒来看到 `None` 自己收摊
         self.git_refresh_at = None;
         self.root_error = None;
         self.current_project = project_id;
@@ -529,7 +592,6 @@ impl FileTree {
         }
         self.drop_target = None;
         self.remote_broken = broken;
-        self.git_status.clear();
         // 没有项目 / 远程项目都把旁路那一份关掉:远程不拉 git 状态,
         // reader 线程上那道总闸能少开一个人是一个
         git_watch::set_enabled_for(
@@ -540,7 +602,7 @@ impl FileTree {
             // 断链:不发任何请求,直接给那句明确提示(项目仍可见、可删)
             self.root_loading = false;
             self.root_error = Some(t("fileTree", "remote.broken").to_string());
-            return;
+            return true;
         }
         if let Some(root) = root {
             self.root_loading = true;
@@ -553,6 +615,27 @@ impl FileTree {
         } else {
             self.root_loading = false;
         }
+        true
+    }
+
+    /// 本次 store 状态下的 [`store_render_signature`]。observe 回调与 render 各算一次:
+    /// render 记下「画的时候看到的」,回调拿现值去比。
+    fn store_signature(&self, cx: &App) -> u64 {
+        let store = self.store.read(cx);
+        let project = store.active_project();
+        let fingerprint = project
+            .and_then(|p| crate::ssh_conn::remote_connection(p, &store.config().ssh_connections))
+            .map(crate::remote_ssh::connection_fingerprint);
+        let project_id = project.map(|p| p.id.as_str()).unwrap_or_default();
+        store_render_signature(
+            store.active_project_id.as_deref(),
+            project,
+            fingerprint,
+            store.config(),
+            &self.entries,
+            &|key| store.is_dir_expanded(project_id, key),
+            &|key| store.dir_kind(key),
+        )
     }
 
     /// 当前项目的远程连接(`None` = 本地项目 **或** 断链)。
@@ -976,6 +1059,9 @@ impl FileTree {
     }
 
     /// 把树按展开状态拍平成可渲染的行。
+    ///
+    /// ⚠️ 这里从 store 读的(展开态、一级子目录的技术栈)要与
+    /// [`hash_visible_tree`] 走同一条路,改一边必须同步另一边。
     #[allow(clippy::too_many_arguments)]
     fn rows(
         &self,
@@ -994,16 +1080,8 @@ impl FileTree {
         for entry in entries {
             let key = entry.path.to_string_lossy().to_string();
             let expanded = entry.is_dir && store.is_dir_expanded(project_id, &key);
-            // git 状态表的键是 `/` 分隔的相对路径,与 `getRelativePath().replace(/\\/g,'/')` 同构
-            let rel = fs_ops::relative_path(&key, &root_str).replace('\\', "/");
-            let git = match self.git_status.get(&rel) {
-                Some(label) => Some((label.clone(), false)),
-                // 目录自身没有状态时才汇总子树(原版就是这个 if/else 的顺序)
-                None if entry.is_dir => {
-                    rollup_dir_label(&self.git_status, &rel).map(|l| (l.to_string(), true))
-                }
-                None => None,
-            };
+            let rel = row_rel(&key, &root_str);
+            let git = self.git.label_for(&rel, entry.is_dir);
             out.push(Row {
                 name: entry.name.clone(),
                 path: entry.path.clone(),
@@ -1155,27 +1233,197 @@ fn git_priority(label: &str) -> u8 {
     }
 }
 
-/// 目录行的汇总字母:扫状态表里所有以 `rel/` 开头的条目,取优先级最高的那个。
-///
-/// `rel` 传空串(理论上的项目根)时前缀是 `"/"`,与原版一样谁也匹配不上 ——
-/// 根不是树里的一行,不会真的走到这一支。
-fn rollup_dir_label<'a>(status: &'a HashMap<String, String>, rel: &str) -> Option<&'a str> {
-    let prefix = if rel.ends_with('/') {
-        rel.to_string()
-    } else {
-        format!("{rel}/")
-    };
-    let mut best: Option<(&str, u8)> = None;
-    for (path, label) in status {
-        if !path.starts_with(&prefix) {
-            continue;
-        }
-        let p = git_priority(label);
-        if p > best.map(|(_, bp)| bp).unwrap_or(0) {
-            best = Some((label.as_str(), p));
+/// 行的相对路径:git 状态表的键口径(`/` 分隔、相对项目根),
+/// 与 `getRelativePath().replace(/\\/g,'/')` 同构。「查看变更」也拿它当参数。
+fn row_rel(key: &str, root: &str) -> String {
+    fs_ops::relative_path(key, root).replace('\\', "/")
+}
+
+/// 后端给的状态列表 → 状态表。键统一成 `/` 分隔(后端已经换过一道,这里再兜一次,
+/// 与 [`row_rel`] 同一口径)。
+fn git_status_table(files: Vec<mt_project::git::GitFileStatus>) -> HashMap<String, String> {
+    files
+        .into_iter()
+        .map(|f| (f.path.replace('\\', "/"), f.status_label))
+        .collect()
+}
+
+/// git 状态表 + 目录汇总表。汇总表是状态表的派生物,**只能一起换**
+/// (构造只有 [`GitLabels::new`] 一条路),render 时逐行只查表。
+#[derive(Default)]
+struct GitLabels {
+    /// 相对项目根的 `/` 分隔路径 → 状态字母(M/A/D/R/?/C)。
+    files: HashMap<String, String>,
+    /// 目录(同一口径)→ 子树里优先级最高的状态字母。子树里没有可汇总条目的
+    /// 目录不在表里。见 [`rollup_dirs`]。
+    dirs: HashMap<String, String>,
+}
+
+impl GitLabels {
+    fn new(files: HashMap<String, String>) -> Self {
+        let dirs = rollup_dirs(&files);
+        Self { files, dirs }
+    }
+
+    fn clear(&mut self) {
+        self.files.clear();
+        self.dirs.clear();
+    }
+
+    /// 一行的状态徽标:`(字母, 是不是汇总来的)`。`rel` 见 [`row_rel`]。
+    ///
+    /// 目录自身有状态时用自身的,没有才汇总子树(原版就是这个 if/else 的顺序);
+    /// 文件没有状态就是没有。
+    fn label_for(&self, rel: &str, is_dir: bool) -> Option<(String, bool)> {
+        match self.files.get(rel) {
+            Some(label) => Some((label.clone(), false)),
+            None if is_dir => self.dir_rollup(rel).map(|l| (l.to_string(), true)),
+            None => None,
         }
     }
-    best.map(|(label, _)| label)
+
+    /// 目录行的汇总字母。口径与原版「扫状态表里所有以 `rel/` 开头的条目,取优先级
+    /// 最高的那个」逐条等价:汇总表的键是每条路径里**每个 `/` 之前的那一截**,
+    /// 「以 `键/` 开头」的条目恰好全登记在这个键下。`rel` 自带结尾 `/` 时原版不再补
+    /// 一个,这里相应去掉一个再查。
+    ///
+    /// `rel` 传空串(理论上的项目根)时前缀是 `"/"`,与原版一样谁也匹配不上 ——
+    /// 根不是树里的一行,不会真的走到这一支。
+    fn dir_rollup(&self, rel: &str) -> Option<&str> {
+        self.dirs
+            .get(rel.strip_suffix('/').unwrap_or(rel))
+            .map(String::as_str)
+    }
+}
+
+/// 预算「目录 → 汇总字母」:每条变更路径向上逐级登记到各祖先目录,同一目录取
+/// 优先级最高的那个([`git_priority`];0 = 不参与)。复杂度约为「变更数 × 深度」,
+/// 只在 git 状态加载完成时跑一次 —— 此前是 render 时**每个目录行**都线性扫一遍
+/// 整张状态表(目录数 × 变更数)。
+///
+/// 从最深的祖先往上走,碰到已经不低于本条的祖先就停:每条路径都登记到它的全部
+/// 祖先,所以表里任何目录的字母都不低于它子目录的,再往上只会更高。
+/// 优先级与字母一一对应,「同优先级」就是同一个字母,停下不会换掉结果。
+fn rollup_dirs(files: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut dirs: HashMap<String, String> = HashMap::new();
+    for (path, label) in files {
+        let priority = git_priority(label);
+        if priority == 0 {
+            continue;
+        }
+        for (slash, _) in path.rmatch_indices('/') {
+            let dir = &path[..slash];
+            match dirs.get_mut(dir) {
+                Some(best) if git_priority(best) >= priority => break,
+                Some(best) => best.clone_from(label),
+                None => {
+                    dirs.insert(dir.to_string(), label.clone());
+                }
+            }
+        }
+    }
+    dirs
+}
+
+// ─── store → 重画的闸 ─────────────────────────────────────────
+
+/// 文件树 render 从 [`AppStore`] 读到的**全部**数据的指纹。store notify 时只有它
+/// 变了才重画(见模块注释「store 变化 → 重画的闸」)。
+///
+/// 依赖清单(逐条对应 render / `rows` / `render_row` / `render_editor_picker` 的读取点,
+/// 漏一条那一项就不会跟着刷):
+///
+/// 1. `active_project_id` 与活动项目的 id / 名字(头部「文件 · 项目名」)/
+///    根路径 / `ssh_connection_id`(本地 or 远程:搜索钮、编辑器钮、上传钮、
+///    拖放落点的父目录切法)/ 连接指纹(`None` = 本地或断链;头部动作的可用性与
+///    行上的操作上下文都认它);
+/// 2. `config.editors` 的名字与 `config.default_editor`(头部编辑器分裂按钮);
+/// 3. 可见树上每个目录的展开态(拍平成行 + 展开着却没列过的补列);
+/// 4. 一级子目录的技术栈缓存 `dir_kind`(徽标换图标);
+/// 5. 界面字号 / 字族、主题(`theme` + `custom_theme_id`)、界面语言。这几样经
+///    进程级快照(`ui::font_px`、`ui::*` 取色、`t()`)进 render,改的时候另有
+///    `refresh_windows` / `Theme::change` 让所有 cached 视图失效;这里再记一笔,
+///    那条路哪天漏了也不至于不刷。
+///
+/// 不在里面的:终端 / pane / AI 状态 / 布局尺寸 / 其它项目的一切 —— render 不读。
+/// FileTree 自己的状态(`entries`、git 状态、拖放高亮、剪贴板……)变化时它自己 notify。
+///
+/// 只做哈希,不克隆、不序列化配置;展开态只走可见的那几层(与 `rows` 同一条路)。
+fn store_render_signature(
+    active_project_id: Option<&str>,
+    project: Option<&ProjectConfig>,
+    connection_fingerprint: Option<u64>,
+    config: &AppConfig,
+    entries: &HashMap<PathBuf, Vec<FileEntry>>,
+    is_expanded: &dyn Fn(&str) -> bool,
+    dir_kind: &dyn Fn(&str) -> Option<Option<ProjectKind>>,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    // ①
+    active_project_id.hash(&mut h);
+    match project {
+        Some(p) => {
+            true.hash(&mut h);
+            p.id.hash(&mut h);
+            p.name.hash(&mut h);
+            p.path.hash(&mut h);
+            p.ssh_connection_id.hash(&mut h);
+            connection_fingerprint.hash(&mut h);
+        }
+        None => false.hash(&mut h),
+    }
+    // ②
+    config.editors.len().hash(&mut h);
+    for editor in &config.editors {
+        editor.name.hash(&mut h);
+    }
+    config.default_editor.hash(&mut h);
+    // ⑤
+    config.ui_font_size.to_bits().hash(&mut h);
+    config.ui_font_family.hash(&mut h);
+    config.theme.hash(&mut h);
+    config.custom_theme_id.hash(&mut h);
+    config.locale.hash(&mut h);
+    // ③④
+    if let Some(p) = project {
+        hash_visible_tree(
+            entries,
+            Path::new(&p.path),
+            0,
+            is_expanded,
+            dir_kind,
+            &mut h,
+        );
+    }
+    h.finish()
+}
+
+/// 顺着可见树(与 [`FileTree::rows`] 同一条路:只进展开着的目录)把每个目录的
+/// 展开态、一级子目录的技术栈缓存喂进哈希。文件行不读 store,跳过。
+fn hash_visible_tree(
+    entries: &HashMap<PathBuf, Vec<FileEntry>>,
+    dir: &Path,
+    depth: usize,
+    is_expanded: &dyn Fn(&str) -> bool,
+    dir_kind: &dyn Fn(&str) -> Option<Option<ProjectKind>>,
+    h: &mut DefaultHasher,
+) {
+    let Some(rows) = entries.get(dir) else {
+        return;
+    };
+    for entry in rows.iter().filter(|e| e.is_dir) {
+        let key = entry.path.to_string_lossy();
+        let expanded = is_expanded(&key);
+        expanded.hash(h);
+        // 与 `rows` 的 `kind` 同一条件、同一展平:「还没探」与「探过但识别不出」
+        // 画出来都是普通文件夹,不算变化
+        if depth == 0 && !entry.ignored {
+            dir_kind(&key).flatten().hash(h);
+        }
+        if expanded {
+            hash_visible_tree(entries, &entry.path, depth + 1, is_expanded, dir_kind, h);
+        }
+    }
 }
 
 /// 头部 26×26 图标钮共用的外观(`FileTree.tsx:734`)。
@@ -1342,6 +1590,8 @@ const CARET_SHAPES: &[Shape] = &[Shape::line(
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 记下这一帧看到的 store(下面各处的读取点都在这份指纹里,见 store_render_signature)
+        self.rendered_store_signature = self.store_signature(cx);
         if !cx.has_active_drag() {
             self.drop_target = None;
         }
