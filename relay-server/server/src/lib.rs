@@ -944,16 +944,18 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
             inner.subscriptions.remove(&pane_id);
             Some(RelayToDesktop::UnsubscribePane { pane_id })
         }
+        // 先 let 再 then_some:「解构模式 => 方法链」这一形状 rustfmt 排不了,
+        // 会把整个 match 退成 `let forward =\n match` 的回退排版
         MobileToRelay::RequestMirrorHistory {
             pane_id,
             before_seq,
-        } => inner
-            .subscriptions
-            .contains(&pane_id)
-            .then_some(RelayToDesktop::RequestMirrorHistory {
+        } => {
+            let subscribed = inner.subscriptions.contains(&pane_id);
+            subscribed.then_some(RelayToDesktop::RequestMirrorHistory {
                 pane_id,
                 before_seq,
-            }),
+            })
+        }
         // 移动端指令:桌面端离线即拒(路由层生成失败回执,不做存储转发)
         MobileToRelay::MobileCommand {
             pane_id,
