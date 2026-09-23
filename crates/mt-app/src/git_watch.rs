@@ -20,13 +20,28 @@
 //! reader 线程 ──► observe_output(pty_id, bytes)
 //!                   ├─ ENABLED 是 false(Git 面板没开着)→ 一次 relaxed 原子读后 return
 //!                   └─ 否则 上锁 → isAiPty 过滤 → 把尾部若干字节塞进有界环形缓冲
-//! 主线程节拍 ──► drain_hit() → 跑 5 条口径 → 命中则清空缓冲并返回 true
+//!                                → 给登记了唤醒口、这一轮还没叫过的订阅者丢一声
+//! 主线程 ──► drain_hit() → 跑 5 条口径 → 命中则清空缓冲并返回 true
 //! ```
 //!
 //! **reader 线程上不跑任何模式匹配**(规格 §4.9 的原话:刷屏时会拖垮吞吐),
-//! 它只做「塞缓冲」这一件常数开销的事;5 条口径全部挪到主线程的节拍上跑。
+//! 它只做「塞缓冲」这一件常数开销的事;5 条口径全部挪到主线程上跑。
 //! Git 面板收起 / 切到 sessions 时 [`set_enabled`] 关掉旁路,常态下这条路
 //! 只剩一次原子读。
+//!
+//! # 唤醒:谁来叫主线程扫
+//!
+//! 两个订阅者的扫法不一样:
+//!
+//! - **Git 面板**:面板开着时 100ms 节拍轮询(收起即停,见 `git_panel.rs`);
+//! - **文件树**:常驻面板,再挂一个 100ms 常驻节拍就是「无项目 / 窗口最小化时
+//!   主线程每秒也被空唤醒 10 次」。它改为**按需唤醒**:用 [`wake_channel_for`]
+//!   登记一个唤醒口,reader 线程往窗口里塞了新字节就往口里丢一声。
+//!
+//! 叫醒**一轮只叫一次**:丢过一声之后置 `wake_sent`,直到该订阅者来
+//! [`drain_hit_for`] 扫过才复位 —— 刷屏时 reader 一秒读几千次,口里也只躺着一声,
+//! 主线程被叫醒的次数由消费方自己节流(文件树两次扫描之间至少隔 [`POLL_MS`])。
+//! 置位与复位都在同一把锁里,「扫完之后又来的字节」一定能再叫醒一次,不会漏。
 //!
 //! # 多订阅者(Y 批扩)
 //!
@@ -61,6 +76,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures::channel::mpsc;
 use parking_lot::Mutex;
 
 /// 滚动窗口容量。git 的完成行(`3 files changed, 12 insertions(+)`)不过百字节,
@@ -70,9 +86,10 @@ const RING_CAP: usize = 8 * 1024;
 /// 去抖窗口。原版两个面板各一个 500ms 定时器(`GitChanges.tsx:128-132`)。
 pub const DEBOUNCE_MS: u64 = 500;
 
-/// 主线程扫描节拍。原版是事件驱动(来一条 payload 判一条),这里改成轮询 ——
+/// 主线程扫描间隔。原版是事件驱动(来一条 payload 判一条),这里按批扫 ——
 /// 100ms 的粒度对「命令跑完刷一下列表」完全够用,而且把 5 条口径的开销
-/// 从 reader 线程挪到了这里。
+/// 从 reader 线程挪到了主线程。Git 面板拿它当轮询节拍,文件树拿它当两次
+/// 扫描之间的最小间隔(节流,见模块注释「唤醒」一节)。
 pub const POLL_MS: u64 = 100;
 
 /// 扫描接缝:两次 drain 之间要多回看这么多字节,免得跨拍被切成两半的模式漏掉。
@@ -113,7 +130,16 @@ struct Sub {
     cursor: u64,
     /// 上一次是命中收的场:这一次从 `cursor` 起扫,不留接缝(否则重复命中)。
     skip_overlap: bool,
+    /// 已经往唤醒口丢过一声、该订阅者还没来扫。期间再来字节不重复叫醒。
+    wake_sent: bool,
 }
+
+const IDLE_SUB: Sub = Sub {
+    enabled: false,
+    cursor: 0,
+    skip_overlap: false,
+    wake_sent: false,
+};
 
 struct Tap {
     /// `aiPtyIds`(`src/utils/terminalCache.ts:106`)的对应物。
@@ -122,6 +148,8 @@ struct Tap {
     /// `ring` 首字节的全局序号。滚掉多少就加多少,单调不回头。
     head_seq: u64,
     subs: [Sub; SUB_COUNT],
+    /// 逐订阅者的唤醒口(见 [`wake_channel_for`])。`None` = 该订阅者自己轮询。
+    wakers: [Option<mpsc::UnboundedSender<()>>; SUB_COUNT],
 }
 
 impl Tap {
@@ -137,13 +165,24 @@ static TAP: LazyLock<Mutex<Tap>> = LazyLock::new(|| {
         ai_panes: HashSet::new(),
         ring: VecDeque::new(),
         head_seq: 0,
-        subs: [Sub {
-            enabled: false,
-            cursor: 0,
-            skip_overlap: false,
-        }; SUB_COUNT],
+        subs: [IDLE_SUB; SUB_COUNT],
+        wakers: [const { None }; SUB_COUNT],
     })
 });
+
+/// 给某个订阅者登记唤醒口,返回接收端:此后该订阅者**开着**时,窗口里每进一批
+/// 新字节(AI pane 的不算)就往口里丢一声,一轮只丢一次(见模块注释「唤醒」)。
+///
+/// 收到一声 ≠ 命中,只是「有新字节,值得扫一遍」—— 该订阅者照旧调
+/// [`drain_hit_for`] 判定,扫过之后才会被再次叫醒。重复登记 = 换新口,
+/// 旧的接收端从此收不到。
+pub fn wake_channel_for(sub: Subscriber) -> mpsc::UnboundedReceiver<()> {
+    let (tx, rx) = mpsc::unbounded();
+    let mut tap = TAP.lock();
+    tap.wakers[sub.idx()] = Some(tx);
+    tap.subs[sub.idx()].wake_sent = false;
+    rx
+}
 
 /// 开/关某个订阅者。
 ///
@@ -157,6 +196,7 @@ pub fn set_enabled_for(sub: Subscriber, on: bool) {
     slot.enabled = on;
     slot.cursor = total;
     slot.skip_overlap = true;
+    slot.wake_sent = false;
     let any = tap.subs.iter().any(|s| s.enabled);
     if !any {
         tap.head_seq = total;
@@ -195,16 +235,39 @@ pub fn observe_output(pty_id: u32, bytes: &[u8]) {
     if tap.ai_panes.contains(&pty_id) {
         return;
     }
-    // 一次读进来的量可能远超窗口(cat 大文件),只留尾部
-    let tail = &bytes[bytes.len().saturating_sub(RING_CAP)..];
-    tap.ring.extend(tail.iter().copied());
-    while tap.ring.len() > RING_CAP {
-        tap.ring.pop_front();
-        tap.head_seq += 1;
+    let tap = &mut *tap;
+    tap.head_seq += push_bounded(&mut tap.ring, bytes, RING_CAP);
+    // 叫醒:开着、登记了唤醒口、这一轮还没叫过的订阅者各丢一声。
+    // `unbounded_send` 不阻塞;接收端没了(订阅者已销毁)就当没这回事
+    for (slot, waker) in tap.subs.iter_mut().zip(&tap.wakers) {
+        if slot.enabled
+            && !slot.wake_sent
+            && let Some(waker) = waker
+        {
+            slot.wake_sent = true;
+            let _ = waker.unbounded_send(());
+        }
     }
 }
 
-/// 主线程节拍:替**某一个订阅者**扫一遍它还没看过的那段窗口。
+/// 把 `bytes` 追加进容量为 `cap` 的滚动窗口,返回**从窗口头部滚掉**的字节数
+/// (调用方据此推进 `head_seq`)。
+///
+/// 一次读进来的量可能远超窗口(cat 大文件),只留尾部;尾部本身不超过 `cap`,
+/// 所以要滚掉的一定全是窗口里的旧字节 —— 先整段 `drain` 腾位置再追加,
+/// 不逐字节 `pop_front`,窗口也不会临时涨到两倍容量。
+fn push_bounded(ring: &mut VecDeque<u8>, bytes: &[u8], cap: usize) -> u64 {
+    let tail = &bytes[bytes.len().saturating_sub(cap)..];
+    let overflow = (ring.len() + tail.len())
+        .saturating_sub(cap)
+        .min(ring.len());
+    ring.drain(..overflow);
+    ring.extend(tail);
+    overflow as u64
+}
+
+/// 替**某一个订阅者**扫一遍它还没看过的那段窗口(Git 面板在节拍上调,
+/// 文件树在被唤醒口叫醒后调)。
 ///
 /// 命中后把游标推到末尾并抹掉接缝(不抹的话同一段文字下一拍会再命中一次);
 /// 窗口本身**不清空** —— 那是共享的,清了别的订阅者就扫了个空。
@@ -215,6 +278,8 @@ pub fn drain_hit_for(sub: Subscriber) -> bool {
     let mut tap = TAP.lock();
     let total = tap.total_seq();
     let head = tap.head_seq;
+    // 丢过的那一声就算领走了:从这一刻起再进来的字节要重新叫醒它
+    tap.subs[sub.idx()].wake_sent = false;
     let slot = tap.subs[sub.idx()];
     if !slot.enabled || slot.cursor >= total {
         return false;
@@ -285,11 +350,53 @@ mod tests {
         tap.ai_panes.clear();
         tap.ring.clear();
         tap.head_seq = 0;
-        tap.subs = [Sub {
-            enabled: false,
-            cursor: 0,
-            skip_overlap: false,
-        }; SUB_COUNT];
+        tap.subs = [IDLE_SUB; SUB_COUNT];
+        tap.wakers = [const { None }; SUB_COUNT];
+    }
+
+    /// 旧实现(逐字节 `pop_front`)原样留作对照。
+    fn push_bounded_by_pop(ring: &mut VecDeque<u8>, bytes: &[u8], cap: usize) -> u64 {
+        let tail = &bytes[bytes.len().saturating_sub(cap)..];
+        ring.extend(tail.iter().copied());
+        let mut dropped = 0;
+        while ring.len() > cap {
+            ring.pop_front();
+            dropped += 1;
+        }
+        dropped
+    }
+
+    /// 批量出队与逐字节出队逐步等价:窗口内容、滚掉的字节数(`head_seq` 的增量)
+    /// 两样都要一致,且窗口任何时刻都不超过容量。纯函数,不碰进程级 `TAP`。
+    #[test]
+    fn 批量出队与逐字节出队等价() {
+        const CAP: usize = 8;
+        let writes: [&[u8]; 9] = [
+            b"",
+            b"abc",
+            b"defgh",       // 恰好填满
+            b"i",           // 溢出 1
+            b"jklmnopq",    // 恰好一整窗
+            b"rstuvwxyz01", // 单次就超过容量:只留尾部
+            b"",
+            b"23",
+            b"456789ABCDEFGHIJKLMNOP",
+        ];
+        let mut batch = VecDeque::new();
+        let mut naive = VecDeque::new();
+        let (mut batch_head, mut naive_head) = (0u64, 0u64);
+        for bytes in writes {
+            batch_head += push_bounded(&mut batch, bytes, CAP);
+            naive_head += push_bounded_by_pop(&mut naive, bytes, CAP);
+            assert_eq!(batch, naive, "写入 {:?} 后窗口内容不一致", bytes);
+            assert_eq!(
+                batch_head, naive_head,
+                "写入 {:?} 后 head_seq 不一致",
+                bytes
+            );
+            assert!(batch.len() <= CAP);
+        }
+        assert_eq!(batch.iter().copied().collect::<Vec<u8>>(), b"IJKLMNOP");
     }
 
     /// 五条口径逐条命中;不相干的输出不命中。
@@ -425,6 +532,62 @@ mod tests {
         // 紧接着来一段无关输出:回看接缝里还压着上一段,但命中过的不再算数
         observe_output(1, b"$ ls");
         assert!(!drain_hit_for(Subscriber::FileTree));
+
+        // ─── 按需唤醒(文件树不再挂 100ms 常驻节拍) ───────────
+        // 同上,只能挂在这一条里。
+        reset();
+        let mut wake = wake_channel_for(Subscriber::FileTree);
+        let pending = |rx: &mut mpsc::UnboundedReceiver<()>| {
+            let mut n = 0;
+            while rx.try_recv().is_ok() {
+                n += 1;
+            }
+            n
+        };
+
+        // ⑪ 订阅者没开:有字节也不叫(Git 面板开着让总闸通电,文件树关着)
+        set_enabled_for(Subscriber::GitPanel, true);
+        observe_output(1, b"create mode 100644 a.txt");
+        assert_eq!(pending(&mut wake), 0, "没开的订阅者不该被叫醒");
+
+        // ⑫ 开着:第一批字节叫一声,扫之前再来多少批都不重复叫
+        set_enabled_for(Subscriber::FileTree, true);
+        observe_output(1, b"$ git st");
+        observe_output(1, b"atus\n");
+        observe_output(1, b"On branch main\n");
+        assert_eq!(pending(&mut wake), 1, "一轮只叫一次");
+
+        // ⑬ 扫过(不管命没命中)才复位,之后的新字节再叫一次
+        assert!(!drain_hit_for(Subscriber::FileTree));
+        assert_eq!(pending(&mut wake), 0, "扫描本身不叫醒");
+        observe_output(1, b" 1 file changed, 1 insertion(+)");
+        assert_eq!(pending(&mut wake), 1);
+        assert!(drain_hit_for(Subscriber::FileTree));
+
+        // ⑭ AI pane 的输出不进窗口,也就不叫醒
+        set_ai_pane(9, true);
+        observe_output(9, b"create mode 100644 b.txt");
+        assert_eq!(pending(&mut wake), 0, "AI pane 刷屏不该叫醒文件树");
+
+        // ⑮ 没登记唤醒口的订阅者(Git 面板自己轮询)不受影响,照旧扫得到
+        observe_output(1, b"Switched to branch 'z'");
+        assert_eq!(pending(&mut wake), 1);
+        assert!(drain_hit_for(Subscriber::GitPanel));
+        assert!(drain_hit_for(Subscriber::FileTree));
+
+        // ⑯ 关掉再开:复位叫醒标记,开闸后的第一批字节照常叫
+        observe_output(1, b"x");
+        set_enabled_for(Subscriber::FileTree, false);
+        set_enabled_for(Subscriber::FileTree, true);
+        let _ = pending(&mut wake);
+        observe_output(1, b"y");
+        assert_eq!(pending(&mut wake), 1, "重开之后不许卡在「叫过了」");
+
+        // ⑰ 重新登记 = 换新口:旧接收端收不到,新接收端接得上
+        let mut fresh = wake_channel_for(Subscriber::FileTree);
+        observe_output(1, b"z");
+        assert_eq!(pending(&mut wake), 0);
+        assert_eq!(pending(&mut fresh), 1);
 
         reset();
     }
