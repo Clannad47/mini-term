@@ -752,7 +752,7 @@ impl WorkbenchArea {
         let close = {
             let (area, project_id, key) = (area.clone(), project_id.to_string(), key.clone());
             MenuItem::new(t("fileViewer", "closeTab"))
-                // 键位见 file_viewer.rs 的 on_key_down(Ctrl/Cmd+W)
+                // 键位见 file_viewer/mod.rs 的 on_key_down(Ctrl/Cmd+W)
                 .shortcut(menu::hotkey_label(true, false, false, "W"))
                 .on_click(move |window, cx| {
                     let (project_id, key) = (project_id.clone(), key.clone());
