@@ -92,7 +92,6 @@ mod pane_actions;
 mod pane_preview;
 mod persist;
 mod pricing;
-mod project_kind;
 mod project_list;
 mod project_switcher;
 mod project_tree;
@@ -261,7 +260,7 @@ const MOTION_PANEL_SWAP_MS: u64 = 200;
 /// 个隔离出去,与 Tauri 那边靠 `--config` 覆盖 identifier 是同一招。
 ///
 /// 判据本体在 [`mt_config::active_data_dir`](mt_config::paths::active_data_dir)
-/// —— themes/ 也走同一口径(`ThemePacks::open()`),这里只是它的「不返错」版本,
+/// —— themes/ 也走同一口径(`mt_config::themes_dir`),这里只是它的「不返错」版本,
 /// 两处各判一次环境变量的旧写法已收掉。
 pub fn app_data_dir() -> PathBuf {
     mt_config::active_data_dir().unwrap_or_else(|_| PathBuf::from("."))

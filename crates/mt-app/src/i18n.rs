@@ -107,6 +107,27 @@ fn win32_user_locale_name() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..(len as usize - 1)]))
 }
 
+/// 终端查找条的全部文案(`terminalSearch` 命名空间,与旧版同 key),按**当前**语言取一份。
+///
+/// mt-ui 不依赖 mt-i18n(`dict.rs` 是生成物、改得勤,依赖它就意味着每次重生成都把
+/// mt-ui 整个重编),文案由这里注入:`TerminalSearchBar::new` 收的是这个函数本身,
+/// 查找条每帧调一次,切语言照旧立刻生效;输入框占位符只在创建时取一次 —— 两个时机
+/// 都与注入前(mt-ui 里的 `SearchBarLabels::from_i18n`)一致。
+pub fn terminal_search_labels() -> mt_ui::SearchBarLabels {
+    let label = |key: &'static str| gpui::SharedString::new_static(t("terminalSearch", key));
+    mt_ui::SearchBarLabels {
+        title: label("title"),
+        placeholder: label("placeholder"),
+        no_results: label("noResults"),
+        case_sensitive: label("caseSensitive"),
+        whole_word: label("wholeWord"),
+        regex: label("regex"),
+        previous: label("previous"),
+        next: label("next"),
+        close: label("close"),
+    }
+}
+
 /// mt-app 用到的**全部**文案 key(`ns.key` 全路径,按字典序)。
 ///
 /// 存在的意义只有一个:让 [`tests::用到的每个_key_两种语言都在`] 能一次性验完。
@@ -124,7 +145,8 @@ fn win32_user_locale_name() -> Option<String> {
 /// `app.trayStatus.*` 来自 `store::AiProjectKind::tray_status_key`,
 /// `app.titleBar.{maximize,restore}` 来自 `title_bar::max_button_face`,
 /// 首启引导那三条键位说明来自 `hotkeys::hotkey_desc_key`(值是 `hotkeys.rs`
-/// 表里的 `shortcuts.*` 字面量,已在下面的 settings 段里)。
+/// 表里的 `shortcuts.*` 字面量,已在下面的 settings 段里),
+/// `terminalSearch.*` 来自 [`terminal_search_labels`](逐 key 经闭包查)。
 #[cfg(test)]
 const USED_KEYS: &[&str] = &[
     "app.activityBar.closeDrawer",
@@ -856,6 +878,15 @@ const USED_KEYS: &[&str] = &[
     "terminalArea.remoteConnectFailedTitle",
     "terminalArea.renamePanel",
     "terminalArea.terminal",
+    "terminalSearch.caseSensitive",
+    "terminalSearch.close",
+    "terminalSearch.next",
+    "terminalSearch.noResults",
+    "terminalSearch.placeholder",
+    "terminalSearch.previous",
+    "terminalSearch.regex",
+    "terminalSearch.title",
+    "terminalSearch.wholeWord",
     // 提交行的相对时间。命名空间是 **`time`**,不是会话面板那套
     // `sessionList.time.*` —— 两套 key 并存,别串
     "time.daysAgo",
@@ -1011,5 +1042,48 @@ mod tests {
         assert_eq!(Locale::Zh.bcp47(), "zh-CN");
         assert_eq!(Locale::En.bcp47(), "en");
         assert_ne!(Locale::Zh.bcp47(), Locale::Zh.code());
+    }
+
+    /// 查找条文案 key 与旧版 `src/i18n/locales/terminalSearch.ts` 逐条对齐 ——
+    /// 打错一个 key 不会崩,只会在界面上显示成 key 本身,肉眼很难第一时间发现。
+    /// (随文案注入自 mt-ui 的 `search_bar` 挪来,那边已不依赖 mt-i18n。)
+    ///
+    /// 这里**不动全局语言**(它是进程级的,并行测试会互相踩),用
+    /// `t_in` 指定语言来验两侧;[`terminal_search_labels`] 走全局这条,逐字段
+    /// 对照当前语言的 `t()`,钉住「哪个字段取哪个 key」的接线。
+    #[test]
+    fn 查找条文案_key_与旧版字典逐条对上() {
+        use mt_i18n::t_in;
+        let zh = |key: &'static str| t_in(Locale::Zh, "terminalSearch", key);
+        let en = |key: &'static str| t_in(Locale::En, "terminalSearch", key);
+
+        assert_eq!(zh("title"), "在终端中查找");
+        assert_eq!(zh("placeholder"), "查找…");
+        assert_eq!(zh("noResults"), "无结果");
+        assert_eq!(zh("caseSensitive"), "区分大小写");
+        assert_eq!(zh("wholeWord"), "全词匹配");
+        assert_eq!(zh("regex"), "正则表达式");
+        assert_eq!(zh("previous"), "上一个 (Shift+Enter)");
+        assert_eq!(zh("next"), "下一个 (Enter)");
+        assert_eq!(zh("close"), "关闭 (Esc)");
+
+        assert_eq!(en("placeholder"), "Find…");
+        assert_eq!(en("noResults"), "No results");
+        assert_eq!(en("caseSensitive"), "Match case");
+        assert_eq!(en("close"), "Close (Esc)");
+
+        // 打错 key 在 debug 下会直接 panic(mt-i18n 的静态断言),
+        // 所以上面这一堆同时也是「key 都存在」的证明。
+        let labels = terminal_search_labels();
+        let now = |key: &'static str| t("terminalSearch", key);
+        assert_eq!(labels.title.as_ref(), now("title"));
+        assert_eq!(labels.placeholder.as_ref(), now("placeholder"));
+        assert_eq!(labels.no_results.as_ref(), now("noResults"));
+        assert_eq!(labels.case_sensitive.as_ref(), now("caseSensitive"));
+        assert_eq!(labels.whole_word.as_ref(), now("wholeWord"));
+        assert_eq!(labels.regex.as_ref(), now("regex"));
+        assert_eq!(labels.previous.as_ref(), now("previous"));
+        assert_eq!(labels.next.as_ref(), now("next"));
+        assert_eq!(labels.close.as_ref(), now("close"));
     }
 }

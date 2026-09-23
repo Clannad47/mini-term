@@ -652,11 +652,15 @@ impl TerminalPane {
         let emulator = self.emulator.clone();
         let this = cx.weak_entity();
         let bar = cx.new(|cx| {
-            TerminalSearchBar::new(search, emulator, window, cx).on_close(move |window, cx| {
-                let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
-                    pane.dismiss_search(window, cx);
-                });
-            })
+            // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效
+            let labels = crate::i18n::terminal_search_labels;
+            TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
+                move |window, cx| {
+                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.dismiss_search(window, cx);
+                    });
+                },
+            )
         });
         // 开引擎 + 按已有关键词搜一遍 + 聚焦全选
         bar.update(cx, |bar, cx| bar.open(window, cx));

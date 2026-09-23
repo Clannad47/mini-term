@@ -4849,11 +4849,10 @@ dependencies = [
  "dirs 6.0.0",
  "mt-core",
  "mt-secret",
+ "mt-theme-packs",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.11.0",
- "zip",
 ]
 
 [[package]]
@@ -4896,6 +4895,7 @@ dependencies = [
  "pathdiff",
  "regex",
  "serde",
+ "serde_json",
  "windows-registry 0.2.0",
 ]
 
@@ -4991,6 +4991,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-theme-packs"
+version = "1.13.7"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "zip",
+]
+
+[[package]]
 name = "mt-ui"
 version = "1.13.7"
 dependencies = [
@@ -4998,9 +5009,8 @@ dependencies = [
  "anyhow",
  "gpui-component",
  "gpui-pre",
- "mt-config",
- "mt-i18n",
  "mt-terminal",
+ "mt-theme-packs",
  "serde",
  "serde_json",
 ]

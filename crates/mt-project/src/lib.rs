@@ -1,4 +1,4 @@
-//! 项目侧的本地能力:文件树、目录监听、搜索、Git、外部编辑器、WSL 发行版枚举。
+//! 项目侧的本地能力:文件树、目录监听、搜索、Git、外部编辑器、WSL 发行版枚举、技术栈探测。
 //!
 //! **不依赖 Tauri,也不依赖 GPUI。** 全是同步阻塞的普通函数 + 少量长生命周期对象
 //! ([`watch::FsWatcher`] / [`search::SearchManager`]),线程调度由调用方决定。
@@ -12,6 +12,7 @@
 //! | `src-tauri/src/search.rs` | [`search`] | 全文搜索(可取消) |
 //! | `src-tauri/src/editor.rs` | [`editor`] | 用外部编辑器 / 默认程序打开路径 |
 //! | `src-tauri/src/wsl_distros.rs` | [`wsl_distros`] | 读 `HKCU\...\Lxss` 注册表枚举发行版 |
+//! | `mt-app/src/project_kind.rs` + mt-ui `icons/tech_art.rs` 里的枚举 | [`project_kind`] | 技术栈枚举 `ProjectKind`(落盘)+ 目录标记文件探测 |
 //!
 //! # 移植时改掉的
 //!
@@ -49,6 +50,7 @@
 pub mod editor;
 pub mod fs;
 pub mod git;
+pub mod project_kind;
 pub mod search;
 pub mod watch;
 pub mod wsl_distros;

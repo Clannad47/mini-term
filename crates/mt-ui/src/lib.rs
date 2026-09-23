@@ -15,7 +15,7 @@
 //!
 //! ## 2. 主题桥([`theme_bridge`])
 //!
-//! `themes/<id>/theme.json`(由 `mt_config::ThemePacks` 读出原文)→
+//! `themes/<id>/theme.json`(由 `mt_theme_packs::ThemePacks` 读出原文)→
 //! 终端配色 [`TerminalTheme`] + `gpui_component` 的 `ThemeConfig`,
 //! 外加「按主题包 id 切换」的运行时入口。
 //!
@@ -103,10 +103,8 @@ pub mod tooltip;
 
 pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
 pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};
+pub use icons::{AiVendor, BrandIcon, FileArt, FileIcon, StatusDot, StatusKind, TechIcon};
 pub use motion::{Transition, TransitionSpec, TweenMap, reduce_motion, set_reduce_motion};
-pub use icons::{
-    AiVendor, BrandIcon, FileArt, FileIcon, ProjectKind, StatusDot, StatusKind, TechIcon,
-};
 pub use terminal::{
     CopiedTip, DamageStats, DwellConfig, FlashLine, FrameGeometry, HighlightKind, HighlightSpan,
     InstallInputHandler, MINI_REFRESH_MS, MiniTerminalElement, OnGridResize, OnInput, OnPaste,

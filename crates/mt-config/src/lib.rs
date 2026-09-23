@@ -9,7 +9,7 @@
 //! | 类型 | 职责 |
 //! |---|---|
 //! | [`ConfigStore`] | `config.json` 的读/写 + 写盘令牌(乐观并发) |
-//! | [`ThemePacks`](theme_packs::ThemePacks) | `{app_data_dir}/themes` 的列举 / 导入 / 删除 / 资源读取 |
+//! | [`ThemePacks`] | `{app_data_dir}/themes` 的列举 / 导入 / 删除 / 资源读取 —— 本体在 `mt-theme-packs`,这里再导出;目录口径取 [`themes_dir`] 后交给 `ThemePacks::at` |
 //! | [`paths`] | app data 目录定位与历史 identifier 迁移 |
 //!
 //! ```no_run
@@ -34,7 +34,9 @@
 //! 唯一的外发信号是写盘令牌,已经是返回值。
 
 pub mod paths;
-pub mod theme_packs;
+/// 主题包文件层,本体已拆到 `mt-theme-packs`(mt-ui 只要这一个类型,不该为它
+/// 连带依赖本 crate 的 rusqlite)。模块名原样保留,`mt_config::theme_packs::*` 仍可用。
+pub use mt_theme_packs as theme_packs;
 
 mod config;
 mod db;
@@ -46,8 +48,8 @@ pub use config::{
     SavedProjectLayout, SavedSplitNode, SavedTab, ShellConfig, SshConnection,
     default_remote_paste_dir, migrate_config, normalize_saved_layout, read_config_from,
 };
+pub use mt_theme_packs::{ThemePackData, ThemePackEntry, ThemePacks};
 pub use paths::{
     APP_IDENTIFIER, DATA_DIR_ENV, LEGACY_IDENTIFIER, active_data_dir, app_data_dir, config_path,
     migrate_legacy_app_data, themes_dir,
 };
-pub use theme_packs::{ThemePackData, ThemePackEntry, ThemePacks};

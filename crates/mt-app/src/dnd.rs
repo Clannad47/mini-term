@@ -62,8 +62,9 @@ use gpui::{
     App, AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Point, Render,
     SharedString, Styled, Window, div, px,
 };
+use mt_project::project_kind::ProjectKind;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
-use mt_ui::icons::{FileIcon, ProjectKind, TechIcon};
+use mt_ui::icons::{FileIcon, TechIcon};
 
 use crate::tree::DropZone;
 use crate::ui;
@@ -377,7 +378,9 @@ impl DragPreview {
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let icon = match &self.icon {
-            PreviewIcon::Project(Some(kind)) => TechIcon::new(*kind).size(px(14.0)).into_any_element(),
+            PreviewIcon::Project(Some(kind)) => TechIcon::new(kind.as_str())
+                .size(px(14.0))
+                .into_any_element(),
             PreviewIcon::Project(None) => FileIcon::folder(false)
                 .size(px(14.0))
                 .color(ui::color_file())
