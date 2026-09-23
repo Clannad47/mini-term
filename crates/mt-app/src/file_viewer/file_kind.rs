@@ -46,14 +46,13 @@ pub(super) fn file_name_of(path: &str) -> &str {
 
 /// 两个路径指的是不是同一个文件。
 ///
-/// **反斜杠归一 + 小写**,照抄 `FileViewerModal.tsx:277` 的 `norm` ——
+/// **反斜杠归一 + 小写**(原版 `FileViewerModal.tsx:277` 的 `norm`,现走
+/// [`mt_core::path_key::windows_eq_key`],多去一截尾随分隔符,文件路径不受影响)——
 /// Windows 上 notify 回来的路径大小写与盘符分隔符都可能与用户点的那一个不一致,
 /// 直接比 `PathBuf` 会漏掉外部修改事件。
 pub(super) fn same_path(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> String {
-        s.replace('\\', "/").to_lowercase()
-    }
-    norm(a) == norm(b)
+    use mt_core::path_key::windows_eq_key;
+    windows_eq_key(a) == windows_eq_key(b)
 }
 
 /// 文件名 → 语言注册表里的名字(组件库内建的 30 种 + [`crate::syntax_languages`]
