@@ -424,7 +424,7 @@ fn file_conflict_preview(conflicts: &[String]) -> (Vec<String>, usize) {
 /// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消。
 pub fn show_file_conflict_choice(
     conflicts: Vec<String>,
-    on_choice: impl Fn(crate::remote_ssh::FileConflictStrategy, &mut Window, &mut App) + 'static,
+    on_choice: impl Fn(mt_remote::FileConflictStrategy, &mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
@@ -446,7 +446,7 @@ pub fn show_file_conflict_choice(
         move |dialog, _window, _cx| {
             let button = |id: &'static str,
                           label: SharedString,
-                          strategy: crate::remote_ssh::FileConflictStrategy,
+                          strategy: mt_remote::FileConflictStrategy,
                           primary: bool| {
                 let on_choice = on_choice.clone();
                 let el = if primary {
@@ -480,19 +480,19 @@ pub fn show_file_conflict_choice(
                                 .child(button(
                                     "file-conflict-skip",
                                     t("fileTree", "conflict.skip").into(),
-                                    crate::remote_ssh::FileConflictStrategy::Skip,
+                                    mt_remote::FileConflictStrategy::Skip,
                                     false,
                                 ))
                                 .child(button(
                                     "file-conflict-keep-both",
                                     t("fileTree", "conflict.keepBoth").into(),
-                                    crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                                    mt_remote::FileConflictStrategy::KeepBoth,
                                     false,
                                 ))
                                 .child(button(
                                     "file-conflict-overwrite",
                                     t("fileTree", "conflict.overwrite").into(),
-                                    crate::remote_ssh::FileConflictStrategy::Overwrite,
+                                    mt_remote::FileConflictStrategy::Overwrite,
                                     true,
                                 )),
                         ),

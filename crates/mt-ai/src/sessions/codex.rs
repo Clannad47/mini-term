@@ -118,7 +118,7 @@ pub struct CodexSessionMeta {
 }
 
 /// 解析一行,若是 session_meta 则取出 id/timestamp/cwd。行级纯函数,
-/// SSH 远程扫描(remote_ssh.rs)用它对远程 rollout 文件做 cwd 匹配。
+/// SSH 远程扫描(`mt-remote` 的 `sessions.rs`)用它对远程 rollout 文件做 cwd 匹配。
 pub fn codex_meta_from_line(line: &str) -> Option<CodexSessionMeta> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
     if obj.get("type").and_then(|t| t.as_str()) != Some("session_meta") {

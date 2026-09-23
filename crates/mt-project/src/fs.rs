@@ -26,8 +26,8 @@ use serde::Serialize;
 /// 实现与「为什么必须原子写」的完整说明见 `mt_core::atomic_write`。
 pub use mt_core::atomic_write;
 
-/// 自然排序比较(数字段按数值比)。公开出去:远程文件树(尚未移植的
-/// `remote_ssh.rs`)将复用同一排序规则,保证本地/远程树观感一致。
+/// 自然排序比较(数字段按数值比)。公开出去:远程文件树(`mt-remote` 的
+/// `dirs.rs`)复用同一排序规则,保证本地/远程树观感一致。
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let a = a.to_lowercase();
     let b = b.to_lowercase();
@@ -139,7 +139,7 @@ fn is_path_ignored(gitignores: &[Gitignore], full_path: &Path, is_dir: bool) -> 
 /// SSH 远程项目的 `.gitignore` 是经 SFTP 读来的字节,**不落本地盘**,只能逐行
 /// `add_line` 喂进 builder —— 于是需要这一层。
 ///
-/// 落在 mt-project 而不是调用方(`mt_app::remote_ssh`):`ignore` crate 是本
+/// 落在 mt-project 而不是调用方(`mt_remote`):`ignore` crate 是本
 /// crate 的既有依赖,`Gitignore` 也是本模块的内部类型,包一层就不用把它连同
 /// 依赖一起暴露给壳层。**匹配一律用相对项目根的 POSIX 路径** —— Windows 的
 /// `Path` 语义对 POSIX 绝对路径有歧义(`/a/b` 在 Windows 上不是绝对路径),

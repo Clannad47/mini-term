@@ -1,6 +1,6 @@
 //! 中栏:文件树。对应 `src/components/FileTree.tsx` 的主干。
 //!
-//! - 列目录走 [`crate::remote_ssh::list_directory_for`] —— 它是**唯一的本地/远程
+//! - 列目录走 [`mt_remote::list_directory_for`] —— 它是**唯一的本地/远程
 //!   分流开关**:本地项目转 [`mt_project::fs::list_directory`](mt_project::fs::list_directory)
 //!   (`.gitignore` 过滤与排序都在那边,这里不重复实现),SSH 远程项目走 SFTP
 //!   readdir。两条路返回同一个 `FileEntry`,所以整棵树共用同一段加载代码,
@@ -29,7 +29,7 @@
 //! [`crate::dnd::DragFilePath`],落点与写入在 `terminal_area.rs`。**同一份载荷落回
 //! 树里就是移动**:目录行接进自身、文件行接进它的父目录、空白处接进项目根,
 //! 松手先问一句再动(判据与面板见 [`move_to`],后端见 `mt_project::fs::move_entry` /
-//! `remote_ssh::move_entry`)。
+//! `mt_remote::move_entry`)。
 //!
 //! # git 状态着色(Y 批)
 //!
@@ -303,7 +303,7 @@ impl FileTree {
     fn move_source(&self, item: &DragFilePath, cx: &App) -> MoveSource {
         let remote = self.is_remote(cx);
         let parent = if remote {
-            crate::remote_ssh::parent_posix(&item.path.to_string_lossy()).map(PathBuf::from)
+            mt_remote::parent_posix(&item.path.to_string_lossy()).map(PathBuf::from)
         } else {
             item.path.parent().map(Path::to_path_buf)
         }
@@ -548,7 +548,7 @@ impl FileTree {
                             "{}|{}|ssh:{:016x}",
                             p.id,
                             p.path,
-                            crate::remote_ssh::connection_fingerprint(conn)
+                            mt_remote::connection_fingerprint(conn)
                         ),
                         None if is_remote => format!("{}|{}|ssh:broken", p.id, p.path),
                         None => format!("{}|{}|local", p.id, p.path),
@@ -629,7 +629,7 @@ impl FileTree {
         let project = store.active_project();
         let fingerprint = project
             .and_then(|p| crate::ssh_conn::remote_connection(p, &store.config().ssh_connections))
-            .map(crate::remote_ssh::connection_fingerprint);
+            .map(mt_remote::connection_fingerprint);
         let project_id = project.map(|p| p.id.as_str()).unwrap_or_default();
         store_render_signature(
             store.active_project_id.as_deref(),
@@ -644,7 +644,7 @@ impl FileTree {
 
     /// 当前项目的远程连接(`None` = 本地项目 **或** 断链)。
     ///
-    /// 返回克隆:它要被丢进 background executor(`remote_ssh` 的入口全是阻塞函数)。
+    /// 返回克隆:它要被丢进 background executor(`mt_remote` 的入口全是阻塞函数)。
     fn remote_conn(&self, cx: &App) -> Option<mt_config::SshConnection> {
         let store = self.store.read(cx);
         let id = store.active_project_id.as_deref()?;
@@ -665,7 +665,7 @@ impl FileTree {
             match store.remote_connection_of(&project.id) {
                 Some(connection) => FileBackendIdentity::Remote {
                     connection_id: connection.id.clone(),
-                    connection_fingerprint: crate::remote_ssh::connection_fingerprint(&connection),
+                    connection_fingerprint: mt_remote::connection_fingerprint(&connection),
                 },
                 None => FileBackendIdentity::BrokenRemote,
             }
@@ -747,7 +747,7 @@ impl FileTree {
                     if let Some(ready) = watch_ready {
                         ready.wait(mt_project::watch::WATCH_READY_BUDGET);
                     }
-                    let entries = crate::remote_ssh::list_directory_for(
+                    let entries = mt_remote::list_directory_for(
                         remote.as_ref(),
                         &task_root,
                         &task_dir,
@@ -2291,7 +2291,7 @@ impl FileTree {
         let entry_target = if row.is_dir {
             row.path.clone()
         } else if remote {
-            crate::remote_ssh::parent_posix(&row.path.to_string_lossy())
+            mt_remote::parent_posix(&row.path.to_string_lossy())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.project_root(cx).unwrap_or_else(|| row.path.clone()))
         } else {

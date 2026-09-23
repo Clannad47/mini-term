@@ -1,5 +1,14 @@
 //! SSH 远程项目的服务层(audit #28 的后端半场,BB-a 批)。
 //!
+//! # 为什么是独立 crate
+//!
+//! 原先是 mt-app 的 `remote_ssh/` 模块,2026-09 整块下沉到这里,逻辑与单测逐字
+//! 未动。它从头到尾不碰 gpui,留在 mt-app 里只会让这 40 多个单测陪着 GPUI 与
+//! 三十多个 tree-sitter 语法一起链接;`cargo test -p mt-remote` 现在不编 gpui。
+//! 对壳的唯一依赖(解开已存 SSH 密码交给 autofill)改为直连底层 `mt-secret`,
+//! 与 mt-app 的 `secrets::reveal_password` 走的是同一个进程级凭据库,见
+//! [`prepare_remote_launch`]。
+//!
 //! 自 `src-tauri/src/remote_ssh.rs`(1392 行)逐字等价移植。通过共享 crate
 //! `mt-ssh` 的 russh 持久会话池 + SFTP 只读原语,为「远程项目」提供五个能力:
 //!
@@ -19,9 +28,9 @@
 //! - **本模块自持一个小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`),
 //!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
 //!   工作线程、进程内唯一;
-//! - **公开入口全是同步阻塞函数**,内部 `block_on`。调用方(BB-b 的视图层)
+//! - **公开入口全是同步阻塞函数**,内部 `block_on`。调用方(mt-app 的视图层)
 //!   **必须**把它们丢进 `cx.background_executor().spawn(...)`,与 `mt_project::git`
-//!   / `pricing::fetch_models_dev` 同一条纪律。主线程直接调 = 卡界面。
+//!   / mt-app 的 `pricing::fetch_models_dev` 同一条纪律。主线程直接调 = 卡界面。
 //!   为什么不做成 `async fn` 让 gpui 的执行器 await:那样整条链路要一个
 //!   tokio-compat 的反应堆(russh 的 IO 依赖 tokio driver),不如把 tokio 的边界
 //!   收在本模块内部一层。
@@ -432,8 +441,11 @@ pub fn prepare_remote_launch(
     // 已存密码是 `mt-secret` 信封,这里解开交给 autofill;解不开只记日志、不填 ——
     // 终端里会照常出现密码提示,用户手输即可,不该因此连 pane 都开不了(私钥登录的
     // 连接更与它无关)。日志不含密码。
+    //
+    // 直连 `mt_secret::reveal_global`:mt-app 的 `secrets::reveal_password` 就是它加
+    // 一层 `to_string`,凭据库是 `ConfigStore::load` 登记的进程级单例,两边同一把钥匙。
     let password = match conn.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(stored) => match crate::secrets::reveal_password(stored) {
+        Some(stored) => match mt_secret::reveal_global(stored) {
             Ok(plain) => Some(plain),
             Err(err) => {
                 eprintln!(

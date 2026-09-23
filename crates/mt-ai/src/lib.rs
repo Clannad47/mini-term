@@ -14,7 +14,10 @@
 //! | `src-tauri/src/ai_sessions.rs` | 2348 | [`sessions`] |
 //! | `src-tauri/src/pty.rs` 的 AI 命令识别 / 打断识别 | — | [`detect`] + [`tracker`] |
 //! | `src-tauri/src/mobile_mirror.rs::agent_has_session_log` | — | [`sessions`] |
+//! | mt-app 的 `ssh_registry.rs`(SSH 工具 skill 启停,2026-09 下沉) | 1131 | [`ssh_registry`] |
 //!
+//! `hook_registry` 与 `ssh_registry` 共动 `~/.claude/settings.json`,读改写统一走
+//! crate 私有的 `claude_settings`(原子写 + 进程内串行)。
 //! # 搬运时的红线(仍然生效)
 //!
 //! - **降级结论必须落盘**:用户打断([`hook_server::note_user_interrupt`])与停摆
@@ -50,12 +53,14 @@
 //! - 原先经 Tauri 解析的路径(`app_data_dir` 下的端口文件)改为显式参数传入。
 
 pub mod agent;
+mod claude_settings;
 pub mod detect;
 pub mod hook_registry;
 pub mod hook_server;
 pub mod monitor;
 pub mod perception;
 pub mod sessions;
+pub mod ssh_registry;
 pub mod tracker;
 mod util;
 

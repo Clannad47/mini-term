@@ -39,13 +39,11 @@
 //! 把它们挪出主线程,这一层不做线程调度,调用方要自己丢到后台执行器上跑,
 //! 否则 30s/120s 的超时会把 UI 线程按死。
 //!
-//! # 未决
+//! # 远程 SSH 项目不在这里
 //!
-//! **远程 SSH 项目**(`remote_ssh.rs` 1281 行)依赖 `mt-ssh`。收尾-1 批已把
-//! `mt-ssh` / `mt-core` 从 `src-tauri/` 物理移入 `crates/`(两者同时仍作为跨工作区
-//! path 依赖服务 `src-tauri` 与 `src-tauri/mt-sidecars`,老构建不受影响),
-//! 前置条件已就绪;远程项目本体的移植归 BB 批(#28),届时按需在本 crate
-//! 加 `mt-ssh.workspace = true`。
+//! 远程项目的服务层(SFTP 文件树 / 读写 / 传输)住在独立的 `mt-remote`(BB 批先落在
+//! mt-app 的 `remote_ssh/`,2026-09 下沉成 crate),由它依赖本 crate 与 `mt-ssh`;
+//! 本 crate 不带 russh / tokio。
 //! 远程文件树复用 [`fs::natural_cmp`],与本地树保持同一排序观感。
 
 pub mod editor;

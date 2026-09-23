@@ -13,6 +13,9 @@
 //!                                                UsageStatsPayload
 //! ```
 //!
+//! 查价表的来源(models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路)在
+//! [`models_dev`];拉网那一跳由调用方注入(mt-app 的 `pricing.rs`)。
+//!
 //! 采集与展示分离：原始 JSONL 只在同步时按文件指纹增量读一次并落账本，展示层
 //! 永远查账本（毫秒级），任何参数切换都是纯查询。
 //!
@@ -22,6 +25,7 @@
 
 pub mod aggregate;
 pub mod ledger;
+pub mod models_dev;
 pub mod pricing;
 pub mod turns;
 

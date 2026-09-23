@@ -835,7 +835,7 @@ pub fn spawn_remote_paste(
                     RemotePaste::File(path) => path,
                 };
                 let local = local.to_string_lossy().into_owned();
-                crate::remote_ssh::upload_paste(&connection, &project_path, &local, &dest_dir)
+                mt_remote::upload_paste(&connection, &project_path, &local, &dest_dir)
             })
             .await;
         in_flight_end(pty_id);

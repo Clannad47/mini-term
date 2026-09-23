@@ -8,10 +8,10 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use mt_config::SshConnection;
+use mt_remote::{RemoteDirectoryEntry, RemoteDirectoryListing};
 
 use crate::i18n::t;
 use crate::prompt::{close_guarded, dialog_title, kind, open_guarded};
-use crate::remote_ssh::{RemoteDirectoryEntry, RemoteDirectoryListing};
 use crate::ui;
 
 type SelectCallback = Rc<dyn Fn(String, &mut Window, &mut App)>;
@@ -46,7 +46,7 @@ impl PickerState {
         self._task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::remote_ssh::browse_directory(&connection, &requested) })
+                .spawn(async move { mt_remote::browse_directory(&connection, &requested) })
                 .await;
             let _ = this.update(cx, |state, cx| {
                 if state.request_id != request_id || state.connection.id != connection_id {
@@ -145,7 +145,7 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
                 state.update(cx, |state, cx| state.load(target, cx));
             })
     };
-    let up = crate::remote_ssh::parent_posix(&current).unwrap_or_else(|| "/".into());
+    let up = mt_remote::parent_posix(&current).unwrap_or_else(|| "/".into());
     let mut list = div()
         .id("remote-directory-picker-list")
         .h(px(300.0))

@@ -23,11 +23,21 @@
 //! [`enable`] / [`disable`] 都是**同步阻塞**的文件 IO(还要跨盘写 home 下的
 //! 配置),调用方丢 `cx.background_executor().spawn(...)`,与 `mt_project::git`
 //! 同一条纪律。
+//!
+//! # 为什么住在 mt-ai
+//!
+//! 原先是 mt-app 的 `ssh_registry.rs`,2026-09 下沉到这里:它不碰 gpui、不碰壳,
+//! 写的全是 agent 侧的配置(Claude / Codex 的 skill、Codex 项目信任、Claude
+//! settings.json),与 [`crate::hook_registry`] 是同一类活。两边共动
+//! `~/.claude/settings.json`,读改写统一走 `crate::claude_settings`(原子写 +
+//! 进程内串行),不再各抄一份路径与读写流程。
 
 use std::path::{Path, PathBuf};
 
 use mt_core::atomic_write;
 use serde_json::Value;
+
+use crate::claude_settings;
 
 /// skill 目录名 —— 同时充当幂等 marker(与旧 MCP server 名一致,便于对应)。
 const SKILL_DIR_NAME: &str = "mini-term-ssh";
@@ -297,11 +307,6 @@ fn codex_global_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
 }
 
-/// 获取 Claude Code 全局配置文件路径: `~/.claude/settings.json`
-fn claude_settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
-}
-
 /// 从 `<project>/.mcp.json` 幂等移除 `mini-term-ssh` server。
 ///
 /// 只删本 server 的 key;若删完后 `mcpServers` 与文件都为空,则删掉整个
@@ -430,39 +435,20 @@ fn apply_codex_project_trust(doc: &mut toml_edit::DocumentMut, project_key: &str
 ///
 /// 幂等:已在/不在数组里都不重复操作。
 fn set_claude_mcp_approval(enable: bool) -> Result<(), String> {
-    let settings_path = claude_settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
-    }
+    let settings_path =
+        claude_settings::settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
-    // 停用且文件不存在 → 无需处理
+    // 停用且文件不存在 → 无需处理(也不为此建 `~/.claude/` 空目录)
     if !enable && !settings_path.exists() {
         return Ok(());
     }
 
-    let mut settings: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .map_err(|e| format!("读取 Claude settings.json 失败: {}", e))?;
-        if content.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("解析 Claude settings.json 失败: {}", e))?
-        }
-    } else {
-        serde_json::json!({})
-    };
-    if !settings.is_object() {
-        return Err("Claude settings.json 顶层不是 JSON 对象".to_string());
-    }
-
-    apply_claude_mcp_approval(&mut settings, enable);
-
-    let json_str = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 Claude settings.json 失败: {}", e))?;
-    atomic_write(&settings_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 Claude settings.json 失败: {}", e))?;
-    Ok(())
+    // 读改写(空文件当 `{}`、顶层非对象报错不写、原子写回)与 hook 注册共用一份,
+    // 且进程内串行,见 `claude_settings` 模块注释
+    claude_settings::update(&settings_path, |settings| {
+        apply_claude_mcp_approval(settings, enable);
+        Ok(())
+    })
 }
 
 /// 在 settings JSON 里增/删 `enabledMcpjsonServers` 中的本 server 名。抽出便于单测。
@@ -836,7 +822,10 @@ mod tests {
             "existing-token"
         );
         let generated = resolve_project_token(None);
-        assert!(uuid::Uuid::parse_str(&generated).is_ok(), "got: {generated}");
+        assert!(
+            uuid::Uuid::parse_str(&generated).is_ok(),
+            "got: {generated}"
+        );
         // 空串等同于「没有令牌」,必须生成新的而不是落一个空 token
         assert!(uuid::Uuid::parse_str(&resolve_project_token(Some("   "))).is_ok());
     }
@@ -855,8 +844,7 @@ mod tests {
 
     #[test]
     fn mcp_json_remove_keeps_other_servers() {
-        let initial =
-            r#"{"mcpServers":{"mini-term-ssh":{"command":"x"},"other":{"command":"y"}}}"#;
+        let initial = r#"{"mcpServers":{"mini-term-ssh":{"command":"x"},"other":{"command":"y"}}}"#;
         let (root, should_delete) = mcp_json_after_remove(initial);
         assert!(!should_delete);
         assert!(root["mcpServers"].get("mini-term-ssh").is_none());

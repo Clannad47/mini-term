@@ -206,7 +206,7 @@ impl PathStyle {
 /// 统一替换为 `-`,而非仅替换路径分隔符。
 /// 例如 `D:\Git\bhyt-一体机` → `D--Git-bhyt----`;
 /// 对 unix cwd 同样成立:`/mnt/d/git/foo` → `-mnt-d-git-foo`。
-/// pub:SSH 远程项目的会话扫描(remote_ssh.rs → 将来的 mt-project)复用同一编码。
+/// pub:SSH 远程项目的会话扫描(`mt-remote` 的 `sessions.rs`)复用同一编码。
 pub fn encode_project_path(project_path: &str) -> String {
     project_path
         .trim_end_matches(['/', '\\'])
