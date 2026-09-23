@@ -20,7 +20,7 @@ node scripts/stage-sidecars.mjs
 # 启动开发实例（⚠️ 与装机版并跑时必须隔离数据目录）
 MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 
-# 全工作区测试（2026-09 实数：29 个目标 / 1887 例 —— 目标数 = Running + Doc-tests 行数，
+# 全工作区测试（2026-09 实数：33 个目标 / 2069 例 —— 目标数 = Running + Doc-tests 行数，
 # 例数 = 各 `test result:` 行 passed 之和；数字只是快照，随代码增长）
 cargo test --workspace
 

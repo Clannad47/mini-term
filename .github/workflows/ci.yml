@@ -244,7 +244,8 @@ jobs:
       # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析、
       # mt-project 的 Windows 路径用例等。名单 = 工作区里全部不依赖 gpui 的 crate,
       # 由脚本从 cargo metadata 现算(2026-09 时是 mt-ai mt-config mt-core mt-i18n
-      # mt-layout mt-project mt-pty mt-relay mt-secret mt-ssh mt-terminal mt-usage,
+      # mt-layout mt-project mt-pty mt-relay mt-remote mt-secret mt-ssh mt-terminal
+      # mt-theme-packs mt-usage,
       # 只剩 mt-app / mt-ui 两个拖 gpui 的不在这里跑)。PTY → VT → grid 的冒烟
       # (mt-terminal/tests/terminal_smoke.rs,起 powershell)也随 mt-terminal 在这里跑。
       - name: Cargo test (crates without gpui)
