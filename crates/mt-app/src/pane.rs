@@ -517,6 +517,39 @@ impl TerminalPane {
     /// **`observe_input` 必须在字节交给 PTY 之前调** —— 焦点冷却窗口要早于 TUI 对
     /// 焦点事件的重绘响应抵达,否则那波重绘会被当成 AI 活跃(与原 `write_pty` 同序)。
     pub fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.observe_user_write(bytes, cx);
+        if let Some(pty) = self.pty.as_ref()
+            && let Err(err) = pty.write(bytes)
+        {
+            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+        }
+    }
+
+    /// 终端右键「SSH 连接」:写入 `ssh …\r` 命令行,带密码时**写完再**注册自动填充
+    /// (`disarm_on_input = true`,时序论证见
+    /// [`mt_pty::PtySession::write_then_arm_ssh_autofill`])。输入旁路与 [`write`](Self::write) 一致。
+    ///
+    /// PTY 已经没了(pane 起失败 / 已退出)时静默不做。
+    pub fn write_ssh_command(
+        &mut self,
+        line: &[u8],
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(password) = password else {
+            self.write(line, cx);
+            return;
+        };
+        self.observe_user_write(line, cx);
+        if let Some(pty) = self.pty.as_ref()
+            && let Err(err) = pty.write_then_arm_ssh_autofill(line, password)
+        {
+            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+        }
+    }
+
+    /// 用户写入交给 PTY **之前**的旁路:AI 输入识别、`UserInput` 事件、AI 任务标记。
+    fn observe_user_write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
         // 只能在回车前抓一份当前可见行补判(见 observe_input_with_line_snapshot)。
         let snapshot = if bytes.contains(&b'\r') {
@@ -535,12 +568,6 @@ impl TerminalPane {
         // **锚点则必须延后**,理由见 [`mt_terminal::TerminalEmulator::arm_cursor_floor`]。
         if let Some(submits) = self.take_submits() {
             self.arm_marks(submits, cx);
-        }
-
-        if let Some(pty) = self.pty.as_ref()
-            && let Err(err) = pty.write(bytes)
-        {
-            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
@@ -820,9 +847,13 @@ impl TerminalPane {
     }
 
     /// 不经 AI 输入旁路的写入(终端应答 / 内部序列)。
+    ///
+    /// 走 [`mt_pty::PtySession::write_reply`] 而不是 `write`:应答不是用户按键,
+    /// 不能把 SSH 密码自动填充解掉(「SSH 连接」菜单路径里,本地 shell 与 ConPTY
+    /// 在 ssh 起来前后都可能发 DA / DSR 查询),也不经过 mt-pty 的输入观察器。
     fn write_raw(&self, bytes: &[u8]) {
         if let Some(pty) = self.pty.as_ref()
-            && let Err(err) = pty.write(bytes)
+            && let Err(err) = pty.write_reply(bytes)
         {
             eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
@@ -830,21 +861,6 @@ impl TerminalPane {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.focus, cx);
-    }
-
-    /// 注册 SSH 密码自动填充(原版的 `arm_ssh_autofill` command)。
-    ///
-    /// 两个调用点、两种 `disarm_on_input`:
-    /// - 远程项目起 pane 时(`RemoteLaunchExtras`)传 `true` —— 那条链路 ssh 是
-    ///   PTY 的子进程本身,用户一打字就说明认证已经过去了;
-    /// - 终端右键「SSH 连接」传 `false`(与原版 command 同参)—— 那是往一个
-    ///   活着的 shell 里敲 `ssh …`,写命令这个动作本身会经过输入观察器。
-    ///
-    /// PTY 已经没了(pane 起失败 / 已退出)时静默不做。
-    pub fn arm_ssh_autofill(&self, password: String, disarm_on_input: bool) {
-        if let Some(session) = self.pty.as_ref() {
-            session.arm_ssh_autofill(password, disarm_on_input);
-        }
     }
 
     /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后「复制」该是灰的)。
@@ -1363,25 +1379,32 @@ fn build_ssh_command(conn: &SshConnection, identity_path: Option<&str>) -> Strin
     parts.join(" ")
 }
 
-/// 在指定终端里连 SSH:有密码先注册自动填充,再写入 `ssh` 命令并回车。
+/// 在指定终端里连 SSH:写入 `ssh` 命令并回车,有密码则**写完再**注册自动填充。
 ///
 /// 私钥那一步(`mt_core::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
 /// OpenSSH 的 `UNPROTECTED PRIVATE KEY FILE` 拒绝)是**阻塞文件 IO**,丢后台;
 /// 失败**回退原始路径**让 ssh 自己报错(原版 `console.error` 后照走)。
+///
+/// 自动填充的注册因此也挪进了后台任务、紧跟在那次命令写入之后
+/// ([`TerminalPane::write_ssh_command`]):以 `disarm_on_input = true` 注册,用户
+/// 此后一打字即解除 —— 公钥 / agent 先认证成功时不会有 SSH 密码提示,旧做法
+/// (先注册、`false`)会让它一直待命,把密码灌进之后任何以 "password:" 结尾的输出。
 fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut App) {
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
     // 已存密码是 `mt-secret` 信封,交给 autofill 前在这里解开;解不开就提示并不填
     // (终端里照常出现密码提示,用户手输即可)。
-    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
-        match crate::secrets::reveal_password(stored) {
-            // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
-            // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
-            Ok(password) => terminal.read(cx).arm_ssh_autofill(password, false),
-            Err(err) => crate::secrets::toast_password_error(err, cx),
-        }
-    }
+    let password = match conn.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(stored) => match crate::secrets::reveal_password(stored) {
+            Ok(password) => Some(password),
+            Err(err) => {
+                crate::secrets::toast_password_error(err, cx);
+                None
+            }
+        },
+        None => None,
+    };
     let identity = conn
         .identity_file
         .clone()
@@ -1409,7 +1432,9 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
             let command = build_ssh_command(&conn, identity.as_deref());
             let _ = cx.update(|window, cx| {
                 let line = format!("{command}\r");
-                terminal.update(cx, |pane, cx| pane.write(line.as_bytes(), cx));
+                terminal.update(cx, |pane, cx| {
+                    pane.write_ssh_command(line.as_bytes(), password, cx)
+                });
                 // 写完把键盘还给终端(原版 `term.focus()`)
                 terminal.update(cx, |pane, cx| pane.focus(window, cx));
             });

@@ -13,9 +13,11 @@
 //!   的 channel 操作串行化(YAGNI 多 channel 并发)。
 //! - 默认 profile:idle 10min / lifetime 2h / keepalive 30s × 3 / cap 8 LRU /
 //!   lazy 重连 + 单次 retry + 30s gatetime cooldown。来源见 research 文件。
-//! - host-key 策略:`accept-new` 语义。首见接受并写入 `~/.ssh/known_hosts`,
-//!   变更拒绝。仅支持 plaintext known_hosts 条目;hashed 条目被识别为"未知"
-//!   并按首见处理(append 一条 plaintext,与已有 hashed 共存,无安全损失)。
+//! - host-key 策略:`accept-new` 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
+//!   首见接受并以 plaintext 追加到 `~/.ssh/known_hosts`,变更拒绝;plaintext 与
+//!   `|1|` 哈希条目都认。连接前把该 host 已登记的 key 类型排到首选算法最前,服务器
+//!   仍给出未登记的类型而该 host 已有其它类型的 key 时同样按变更拒绝。拒绝原因会
+//!   拼进连接错误(见 [`MtClient`])。
 //! - 认证顺序:identity_file 优先 → password 兜底,password 走 password 与
 //!   keyboard-interactive 两种 method(某些服务器仅接后者)。
 //!
@@ -461,23 +463,42 @@ impl SshPool {
 
     /// 真正建一条 session。涵盖 connect + 主机密钥校验(在 Handler 内) + auth。
     async fn build_session(&self, conn: &SshConnection) -> Result<CachedSession, String> {
+        // 首选 host key 算法按 known_hosts 调序(见 `preferred_host_key_algorithms`)。
+        // 这里读失败就沿用默认顺序 —— `check_server_key` 会再读一次,失败即拒绝并说明原因。
+        let preferred = read_known_hosts(&self.known_hosts_path)
+            .ok()
+            .and_then(|raw| {
+                let pattern = host_pattern(&conn.host, conn.port);
+                preferred_host_key_algorithms(&known_host_key_types(&raw, &pattern))
+            })
+            .map(|key| russh::Preferred {
+                key: std::borrow::Cow::Owned(key),
+                ..russh::Preferred::default()
+            })
+            .unwrap_or_default();
         // 用 `..Default::default()` 一次性赋值,避开 clippy::field_reassign_with_default。
         let cfg = Arc::new(client::Config {
             keepalive_interval: Some(self.config.keepalive_interval),
             keepalive_max: self.config.keepalive_max,
+            preferred,
             ..Default::default()
         });
 
+        let rejection = Arc::new(std::sync::Mutex::new(None));
         let handler = MtClient {
             host: conn.host.clone(),
             port: conn.port,
             known_hosts_path: self.known_hosts_path.clone(),
+            rejection: Arc::clone(&rejection),
         };
 
         let port = if conn.port == 0 { 22 } else { conn.port };
         let mut handle = client::connect(cfg, (conn.host.as_str(), port), handler)
             .await
-            .map_err(|e| format!("ssh connect to {}:{} failed: {e}", conn.host, port))?;
+            .map_err(|e| {
+                let rejected = rejection.lock().ok().and_then(|mut slot| slot.take());
+                connect_error(&conn.host, port, &e, rejected)
+            })?;
 
         authenticate(&mut handle, conn).await?;
 
@@ -1355,45 +1376,108 @@ pub struct MtClient {
     host: String,
     port: u16,
     known_hosts_path: PathBuf,
+    /// 主机密钥被拒绝时的可读原因。`check_server_key` 返回 `false` 后 russh 只报
+    /// 泛泛的 "Unknown server key",handler 本身也随失败的连接一起丢了 ——
+    /// `build_session` 持同一个 `Arc`,在 connect 的错误路径上取出来拼进错误
+    /// (主程序远程项目 / sidecar 都把这条错误原样展示给用户)。
+    rejection: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl MtClient {
+    /// 记下拒绝原因并打一行日志。返回 `false`,调用处直接 `Ok(self.reject(..))`。
+    fn reject(&self, reason: String) -> bool {
+        eprintln!("[mt-ssh] host key rejected: {reason}");
+        if let Ok(mut slot) = self.rejection.lock() {
+            *slot = Some(reason);
+        }
+        false
+    }
 }
 
 impl Handler for MtClient {
     type Error = russh::Error;
 
-    /// host-key 校验:accept-new 语义。
-    /// - 在 known_hosts 找到一条匹配 host + 同 algo,key 字节完全一致 → 通过。
-    /// - 找到匹配 host + 同 algo 但 key 不同 → 拒绝(返回 Ok(false))。
-    /// - 没找到匹配 host → 把当前 server key 以 plaintext 追加到 known_hosts,通过。
-    /// - I/O 出错(known_hosts 不可读 / 不可写) → 拒绝,避免悄默接受未知 host。
+    /// host-key 校验:accept-new 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
+    /// - known_hosts 里有该 host + 同算法的条目且 key 字节一致 → 通过(plaintext 与
+    ///   `|1|` 哈希条目都认)。
+    /// - 有该 host + 同算法的条目但 key 不同 → 拒绝。
+    /// - 该 host 只登记了**其它算法**的 key → 拒绝且不追加,视同换 key。连接前已把
+    ///   已登记的类型排到首选(`preferred_host_key_algorithms`),服务器还支持它时
+    ///   根本走不到这里;走到了说明服务器不再提供登记过的那把 key。
+    /// - 该 host 没有任何条目 → 把当前 key 以 plaintext 追加到 known_hosts,通过。
+    /// - known_hosts 读失败(文件不存在除外,那等于空文件)或追加失败 → 拒绝,
+    ///   绝不在没法校验时悄悄放行。
+    ///
+    /// 拒绝原因记进 `rejection`,由 `build_session` 拼进连接错误。
     async fn check_server_key(
         &mut self,
         server_pubkey: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         let host_pattern = host_pattern(&self.host, self.port);
-        let raw = std::fs::read_to_string(&self.known_hosts_path).unwrap_or_default();
+        let path = self.known_hosts_path.display();
+        let raw = match read_known_hosts(&self.known_hosts_path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                return Ok(self.reject(format!(
+                    "known_hosts 读取失败({path}: {e}),无法校验 {host_pattern} 的主机密钥,拒绝连接"
+                )));
+            }
+        };
+        let offered_algo = server_pubkey.algorithm();
+        let offered_algo = offered_algo.as_str();
         match match_known_host(&raw, &host_pattern, server_pubkey) {
             HostKeyMatch::Match => Ok(true),
-            HostKeyMatch::Mismatch => {
-                eprintln!(
-                    "[mt-ssh] host key MISMATCH for {host_pattern}; refusing to connect. \
-                    Remove the offending line from {} if the change is expected.",
-                    self.known_hosts_path.display()
-                );
-                Ok(false)
-            }
+            HostKeyMatch::Mismatch { line } => Ok(self.reject(format!(
+                "主机密钥与 known_hosts 不符:{path} 第 {line} 行登记的 {host_pattern} {offered_algo} \
+                 密钥与服务器这次给出的不同(可能遭遇中间人攻击,也可能是服务器重装换了密钥;\
+                 确认是后者的话删除该行后重试)"
+            ))),
+            HostKeyMatch::OtherAlgorithm { line, algo } => Ok(self.reject(format!(
+                "主机密钥与 known_hosts 不符:服务器给出的是 {offered_algo} 密钥,而 {path} 第 {line} 行\
+                 登记的是 {host_pattern} 的 {algo} 密钥,服务器已不再提供该类型,按密钥变更处理\
+                 (确认服务器确实换了密钥类型的话删除该主机的旧条目后重试)"
+            ))),
             HostKeyMatch::Unknown => {
                 if let Err(e) =
                     append_known_host(&self.known_hosts_path, &host_pattern, server_pubkey)
                 {
-                    eprintln!(
-                        "[mt-ssh] failed to append to {}: {e}",
-                        self.known_hosts_path.display()
-                    );
-                    return Ok(false);
+                    return Ok(self.reject(format!(
+                        "无法把 {host_pattern} 的新主机密钥写入 known_hosts({path}: {e}),拒绝连接"
+                    )));
                 }
                 Ok(true)
             }
         }
+    }
+}
+
+/// 拼连接失败的错误文本。主机密钥被 [`MtClient`] 拒绝时换成它记下的具体原因
+/// (文件路径 / 行号 / 读失败),而不是 russh 泛泛的 "Unknown server key"。
+fn connect_error(
+    host: &str,
+    port: u16,
+    err: &dyn std::fmt::Display,
+    rejected: Option<String>,
+) -> String {
+    match rejected {
+        Some(reason) => format!("ssh connect to {host}:{port} failed: {reason}"),
+        None => format!("ssh connect to {host}:{port} failed: {err}"),
+    }
+}
+
+/// 读 known_hosts 全文。
+///
+/// - 文件不存在 = 空文件(从没连过任何主机的正常情况);
+/// - 其它 IO 错误(权限、路径是目录、`~/.ssh` 是个文件……)原样返回,调用方据此
+///   **拒绝**连接 —— 以前一律当空文件,等于把「读不到」当成「没见过」,对已登记
+///   过的主机也会重新 accept-new;
+/// - 内容按 lossy 解码:个别行混进非 UTF-8 字节不该让整份文件作废。坏字节只会让
+///   所在那一行匹配不上(主机名 / base64 里出现替换字符),不会造出假匹配。
+fn read_known_hosts(path: &std::path::Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -1407,86 +1491,174 @@ fn host_pattern(host: &str, port: u16) -> String {
     }
 }
 
-/// 主机密钥比对结果。
+/// 主机密钥比对结果。行号从 1 起,供拒绝原因指给用户看。
 #[derive(Debug, PartialEq, Eq)]
 enum HostKeyMatch {
-    /// host 匹配且 key 字节相同。
+    /// host 匹配且同算法的 key 字节相同。
     Match,
-    /// host 匹配,**同 algo** 但 key 字节不同。MITM / 服务器换 key 都会落这条。
-    Mismatch,
+    /// host 匹配,**同算法**但 key 字节不同(`line` 是第一条这样的行)。
+    /// MITM / 服务器换 key 都会落这条。
+    Mismatch { line: usize },
+    /// 该 host 只登记了**其它算法**的 key(`line` / `algo` 取第一条)。服务器不再
+    /// 提供登记过的那种 key —— 同样按换 key 处理,见 `check_server_key`。
+    OtherAlgorithm { line: usize, algo: String },
     /// 没找到任何 host 匹配条目。
     Unknown,
 }
 
-/// 在 known_hosts 文本里查 `host_pattern` 对应的条目并与 `server_pubkey` 比对。
+/// known_hosts 里命中某 host 的一条记录。
+struct KnownHostEntry<'a> {
+    /// 行号,从 1 起。
+    line: usize,
+    /// key 类型字段(`ssh-ed25519` / `ssh-rsa` / `ecdsa-sha2-nistp256` ……)。
+    algo: &'a str,
+    /// base64 解码后的 key blob。
+    key: Vec<u8>,
+}
+
+/// 逐行找出 known_hosts 里命中 `host_pattern` 的条目。
 ///
 /// 解析规则:
-/// - 跳过空行与 `#` 起始的注释。
-/// - 字段以空格 / TAB 分隔:`<hostspec> <algo> <base64key> [comment]`。
-/// - hostspec 可以是逗号分隔多个 host;**仅支持 plaintext**,以 `|1|` 起始的
-///   hashed 条目被识别为"不匹配本 host",转给 accept-new 路径(可能造成与
-///   已有 hashed 条目共存,无安全损失)。
-/// - 同 host + 同 algo 但 key 不同 → 立即返回 `Mismatch`,不再扫剩余行。
+/// - 跳过空行与 `#` 起始的注释;`@cert-authority` / `@revoked` 标记行不在本实现
+///   支持范围,整行跳过。
+/// - 字段以空格 / TAB 分隔:`<hostspec> <algo> <base64key> [comment]`,缺字段或
+///   base64 解不开的行跳过。
+/// - hostspec 是逗号分隔的多个 host,任一命中即可:plaintext 按 ASCII 大小写
+///   不敏感比较;`|1|salt|hash` 哈希条目见 [`hashed_host_matches`]。通配符与 `!`
+///   否定模式不支持(同样视为不匹配)。
+fn known_host_entries<'a>(
+    raw: &'a str,
+    host_pattern: &'a str,
+) -> impl Iterator<Item = KnownHostEntry<'a>> + 'a {
+    raw.lines().enumerate().filter_map(move |(index, line)| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
+            return None;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let hostspec = fields.next()?;
+        let host_matches = hostspec.split(',').any(|entry| {
+            if entry.starts_with("|1|") {
+                hashed_host_matches(entry, host_pattern)
+            } else {
+                entry.eq_ignore_ascii_case(host_pattern)
+            }
+        });
+        if !host_matches {
+            return None;
+        }
+        let algo = fields.next()?;
+        let key = base64_decode(fields.next()?)?;
+        Some(KnownHostEntry {
+            line: index + 1,
+            algo,
+            key,
+        })
+    })
+}
+
+/// OpenSSH `HashKnownHosts` 条目:`|1|base64(salt)|base64(HMAC-SHA1(key=salt, msg=host))`,
+/// host 取与 plaintext 条目相同的 `host` / `[host]:port` 形态。
+///
+/// OpenSSH 哈希前会把主机名转成小写;为兼容按原样写入的其它工具,原样也试一次。
+/// 比对走 `ring::hmac::verify`(常量时间)。
+fn hashed_host_matches(entry: &str, host_pattern: &str) -> bool {
+    let Some((salt, hash)) = entry
+        .strip_prefix("|1|")
+        .and_then(|rest| rest.split_once('|'))
+    else {
+        return false;
+    };
+    let (Some(salt), Some(hash)) = (base64_decode(salt), base64_decode(hash)) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
+    let lowered = host_pattern.to_ascii_lowercase();
+    ring::hmac::verify(&key, lowered.as_bytes(), &hash).is_ok()
+        || (lowered != host_pattern
+            && ring::hmac::verify(&key, host_pattern.as_bytes(), &hash).is_ok())
+}
+
+/// 在 known_hosts 文本里查 `host_pattern` 对应的条目并与 `server_pubkey` 比对。
+///
+/// 同算法条目里只要有一条 key 字节一致就是 `Match`(同一 host 登记过新旧两把 key
+/// 时以能对上的为准,与 OpenSSH 一致);同算法的全都对不上才是 `Mismatch`;
+/// 没有同算法条目、但有其它算法的条目是 `OtherAlgorithm`;一条都没有是 `Unknown`。
 fn match_known_host(
     raw: &str,
     host_pattern: &str,
     server_pubkey: &russh::keys::ssh_key::PublicKey,
 ) -> HostKeyMatch {
-    let want_algo = server_pubkey.algorithm().as_str().to_string();
+    let want_algo = server_pubkey.algorithm();
+    let want_algo = want_algo.as_str();
     let want_bytes = match server_pubkey.to_bytes() {
         Ok(b) => b,
         Err(_) => return HostKeyMatch::Unknown,
     };
-    let mut saw_same_host_same_algo_diff_key = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let mut mismatch: Option<usize> = None;
+    let mut other_algo: Option<(usize, String)> = None;
+    for entry in known_host_entries(raw, host_pattern) {
+        if !entry.algo.eq_ignore_ascii_case(want_algo) {
+            other_algo.get_or_insert_with(|| (entry.line, entry.algo.to_string()));
             continue;
         }
-        let mut fields = line.split_ascii_whitespace();
-        let hostspec = match fields.next() {
-            Some(h) => h,
-            None => continue,
-        };
-        if hostspec.starts_with("|") {
-            // hashed,跳过 —— 见函数 doc comment 说明。
-            continue;
-        }
-        if !hostspec
-            .split(',')
-            .any(|h| h.eq_ignore_ascii_case(host_pattern))
-        {
-            continue;
-        }
-        let algo = match fields.next() {
-            Some(a) => a,
-            None => continue,
-        };
-        if !algo.eq_ignore_ascii_case(&want_algo) {
-            // 不同算法的同 host 条目,不算 mismatch —— 允许 host 同时存在多种 key 类型。
-            continue;
-        }
-        let b64 = match fields.next() {
-            Some(b) => b,
-            None => continue,
-        };
-        let entry_bytes = match base64_decode(b64) {
-            Some(b) => b,
-            None => continue,
-        };
-        if entry_bytes == want_bytes {
+        if entry.key == want_bytes {
             return HostKeyMatch::Match;
         }
-        saw_same_host_same_algo_diff_key = true;
+        mismatch.get_or_insert(entry.line);
     }
-    if saw_same_host_same_algo_diff_key {
-        HostKeyMatch::Mismatch
-    } else {
-        HostKeyMatch::Unknown
+    match (mismatch, other_algo) {
+        (Some(line), _) => HostKeyMatch::Mismatch { line },
+        (None, Some((line, algo))) => HostKeyMatch::OtherAlgorithm { line, algo },
+        (None, None) => HostKeyMatch::Unknown,
     }
 }
 
-/// 标准 base64 解码,接受常见的等号填充。无 padding 用例也容忍。
+/// known_hosts 里该 host 已登记的 key 类型(去重,保持文件中的先后)。
+fn known_host_key_types(raw: &str, host_pattern: &str) -> Vec<String> {
+    let mut types: Vec<String> = Vec::new();
+    for entry in known_host_entries(raw, host_pattern) {
+        if !types.iter().any(|t| t.eq_ignore_ascii_case(entry.algo)) {
+            types.push(entry.algo.to_string());
+        }
+    }
+    types
+}
+
+/// 按该 host 已登记的 key 类型调整首选 host key 算法:已登记的排前面(各自保持
+/// russh 默认的相对顺序),其余照旧跟在后面 —— 即 OpenSSH `order_hostkeyalgs` 的做法。
+///
+/// 协商取客户端列表里第一个双方都支持的算法。服务器通常同时有 ed25519 / ecdsa /
+/// rsa 几把 host key,known_hosts 只登记了 rsa 而我们默认首选 ed25519 时,会拿到
+/// 一把「没见过」的 ed25519 key。已登记类型排前面后,服务器仍支持它就自然协商到它、
+/// 与登记的 key 比对;服务器不再提供时才会拿到别的类型,由 `check_server_key`
+/// 按 [`HostKeyMatch::OtherAlgorithm`] 拒绝。
+///
+/// known_hosts 里 RSA key 的类型只有 `ssh-rsa`,对应的签名算法 rsa-sha2-512 /
+/// rsa-sha2-256 / ssh-rsa 整组前移。没有任何能对上 russh 支持算法的已登记类型时
+/// 返回 `None`,沿用默认顺序。
+fn preferred_host_key_algorithms(known_types: &[String]) -> Option<Vec<russh::keys::Algorithm>> {
+    let is_known = |algo: &russh::keys::Algorithm| {
+        let key_type = if matches!(algo, russh::keys::Algorithm::Rsa { .. }) {
+            "ssh-rsa"
+        } else {
+            algo.as_str()
+        };
+        known_types.iter().any(|t| t.eq_ignore_ascii_case(key_type))
+    };
+    let (mut ordered, rest): (Vec<_>, Vec<_>) = russh::Preferred::default()
+        .key
+        .iter()
+        .cloned()
+        .partition(is_known);
+    if ordered.is_empty() {
+        return None;
+    }
+    ordered.extend(rest);
+    Some(ordered)
+}
+
+/// 标准 base64 解码(需带 `=` 填充 —— OpenSSH 写出的 key 与哈希条目都带)。
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     use base64_engine::Engine;
     base64_engine::engine::general_purpose::STANDARD
@@ -1826,17 +1998,106 @@ mod tests {
         // 文件里登记的是 pub_b,但服务器报上来的是 pub_a → mismatch
         assert_eq!(
             match_known_host(&raw, "h.example.com", &pub_a),
-            HostKeyMatch::Mismatch
+            HostKeyMatch::Mismatch { line: 1 }
         );
     }
 
     #[test]
-    fn match_known_host_skips_hashed_entries_and_treats_as_unknown() {
+    fn match_known_host_prefers_matching_line_over_stale_one() {
+        // 同一 host 登记过新旧两把同算法 key:能对上的那条为准,不因旧行判 mismatch。
+        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
+        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
+        let algo = pubkey_algo(&pub_a);
+        let raw = format!(
+            "h.example.com {algo} {}\nh.example.com {algo} {}\n",
+            pubkey_b64(&pub_b),
+            pubkey_b64(&pub_a)
+        );
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_a),
+            HostKeyMatch::Match
+        );
+    }
+
+    #[test]
+    fn match_known_host_malformed_hashed_entry_is_not_a_match() {
+        // salt / hash 不是合法 base64 的哈希条目:匹配不上任何 host。
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
         let raw = "|1|abcsalt|abchash ssh-ed25519 AAAA\n";
         assert_eq!(
             match_known_host(raw, "h.example.com", &pub_key),
             HostKeyMatch::Unknown
+        );
+    }
+
+    /// 按 OpenSSH `HashKnownHosts` 的算法造一个哈希 hostspec。
+    fn hashed_hostspec(host: &str, salt: &[u8]) -> String {
+        use base64_engine::Engine;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
+        let tag = ring::hmac::sign(&key, host.as_bytes());
+        let b64 = &base64_engine::engine::general_purpose::STANDARD;
+        format!("|1|{}|{}", b64.encode(salt), b64.encode(tag.as_ref()))
+    }
+
+    #[test]
+    fn hashed_host_matches_openssh_generated_entry() {
+        // 已知答案:russh 自带测试里由 OpenSSH 生成的 example.com 哈希条目,
+        // 不依赖本实现自己算出来的值。
+        let entry = "|1|O33ESRMWPVkMYIwJ1Uw+n877jTo=|nuuC5vEqXlEZ/8BXQR7m619W6Ak=";
+        assert!(hashed_host_matches(entry, "example.com"));
+        // OpenSSH 按小写主机名哈希:大小写不同的输入也要命中
+        assert!(hashed_host_matches(entry, "Example.COM"));
+        assert!(!hashed_host_matches(entry, "example.org"));
+        assert!(!hashed_host_matches(entry, "[example.com]:2222"));
+    }
+
+    #[test]
+    fn match_known_host_matches_openssh_hashed_line() {
+        let raw = "|1|O33ESRMWPVkMYIwJ1Uw+n877jTo=|nuuC5vEqXlEZ/8BXQR7m619W6Ak= ssh-ed25519 \
+                   AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF\n";
+        let pub_key = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF",
+        )
+        .unwrap();
+        assert_eq!(
+            match_known_host(raw, "example.com", &pub_key),
+            HostKeyMatch::Match
+        );
+        // 同一条目换一把同算法 key → 按变更拒绝,而不是像以前那样当新主机追加
+        let other = test_pubkey_from_bytes(KEY_BYTES_A);
+        assert_eq!(
+            match_known_host(raw, "example.com", &other),
+            HostKeyMatch::Mismatch { line: 1 }
+        );
+        assert_eq!(
+            match_known_host(raw, "other.example.com", &other),
+            HostKeyMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn match_known_host_hashed_entry_with_port_and_mixed_list() {
+        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
+        let pattern = host_pattern("h.example.com", 2222);
+        let raw = format!(
+            "# 第一行注释\nplain.example.com,{} {} {}\n",
+            hashed_hostspec(&pattern, &[7u8; 20]),
+            pubkey_algo(&pub_key),
+            pubkey_b64(&pub_key)
+        );
+        assert_eq!(
+            match_known_host(&raw, &pattern, &pub_key),
+            HostKeyMatch::Match
+        );
+        // 端口不同就是另一个 host
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::Unknown
+        );
+        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
+        assert_eq!(
+            match_known_host(&raw, &pattern, &pub_b),
+            HostKeyMatch::Mismatch { line: 2 }
         );
     }
 
@@ -1855,13 +2116,281 @@ mod tests {
     }
 
     #[test]
-    fn match_known_host_different_algo_not_mismatch_but_unknown() {
-        // 同 host 但 algo 不同 → 不算 mismatch,允许同 host 多算法共存。
+    fn match_known_host_other_algorithm_only_is_reported() {
+        // 同 host 只登记了别的算法:不再当新主机放行,报出第一条的行号与算法。
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = "h.example.com ssh-rsa AAAAB3NzaC1yc2EFakeFakeFake\n";
+        let other_blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B));
+        let raw = format!(
+            "other.example.com ssh-ed25519 {other_blob}\nh.example.com ssh-rsa {other_blob}\n"
+        );
         assert_eq!(
-            match_known_host(raw, "h.example.com", &pub_key),
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::OtherAlgorithm {
+                line: 2,
+                algo: "ssh-rsa".into()
+            }
+        );
+        // 同时有同算法条目时以同算法的比对结果为准
+        let with_same_algo = format!(
+            "{raw}h.example.com {} {}\n",
+            pubkey_algo(&pub_key),
+            pubkey_b64(&pub_key)
+        );
+        assert_eq!(
+            match_known_host(&with_same_algo, "h.example.com", &pub_key),
+            HostKeyMatch::Match
+        );
+    }
+
+    #[test]
+    fn match_known_host_skips_marker_and_malformed_lines() {
+        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
+        let raw = format!(
+            "@cert-authority h.example.com {algo} {b64}\n\
+             h.example.com {algo}\n\
+             h.example.com {algo} not-base64!\n",
+            algo = pubkey_algo(&pub_key),
+            b64 = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B)),
+        );
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
             HostKeyMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn known_host_key_types_dedupes_in_file_order() {
+        let blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_A));
+        let raw = format!(
+            "h.example.com ssh-rsa {blob}\n\
+             other.example.com ecdsa-sha2-nistp256 {blob}\n\
+             h.example.com ssh-ed25519 {blob}\n\
+             H.EXAMPLE.COM SSH-RSA {blob}\n"
+        );
+        assert_eq!(
+            known_host_key_types(&raw, "h.example.com"),
+            vec!["ssh-rsa".to_string(), "ssh-ed25519".to_string()]
+        );
+        assert!(known_host_key_types(&raw, "nobody.example.com").is_empty());
+    }
+
+    #[test]
+    fn preferred_host_key_algorithms_puts_known_types_first() {
+        use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
+        let default_len = russh::Preferred::default().key.len();
+
+        // 只登记了 RSA:签名算法三兄弟整组前移,其余保持默认相对顺序
+        let order = preferred_host_key_algorithms(&["ssh-rsa".to_string()]).unwrap();
+        assert_eq!(order.len(), default_len, "只调序,不增删");
+        assert_eq!(
+            order[..4],
+            [
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512)
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256)
+                },
+                Algorithm::Rsa { hash: None },
+                Algorithm::Ed25519,
+            ]
+        );
+
+        // 登记了 nistp384 与 ed25519:两者都前移,仍按默认相对顺序(ed25519 在前)
+        let order = preferred_host_key_algorithms(&[
+            "ecdsa-sha2-nistp384".to_string(),
+            "ssh-ed25519".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            order[..3],
+            [
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256
+                },
+            ]
+        );
+
+        // 没有已登记类型 / 只有 russh 不支持的类型:沿用默认顺序
+        assert!(preferred_host_key_algorithms(&[]).is_none());
+        assert!(preferred_host_key_algorithms(&["ssh-dss".to_string()]).is_none());
+    }
+
+    // --- known_hosts 读取与 check_server_key ------------------------------
+
+    fn known_hosts_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mt-ssh-known-hosts-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_client(known_hosts_path: PathBuf) -> MtClient {
+        MtClient {
+            host: "h.example.com".into(),
+            port: 22,
+            known_hosts_path,
+            rejection: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn rejection_of(client: &MtClient) -> String {
+        client
+            .rejection
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("拒绝时应记下原因")
+    }
+
+    #[test]
+    fn read_known_hosts_missing_file_is_empty() {
+        let dir = known_hosts_test_dir("missing");
+        assert_eq!(read_known_hosts(&dir.join("known_hosts")).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_known_hosts_decodes_non_utf8_lossily() {
+        // 某一行混进非 UTF-8 字节:不能让整份文件读失败,其余条目照常可用。
+        let dir = known_hosts_test_dir("non-utf8");
+        let path = dir.join("known_hosts");
+        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
+        let mut bytes = b"# caf\xe9 \xff\xfe\n".to_vec();
+        bytes.extend_from_slice(
+            format!(
+                "h.example.com {} {}\n",
+                pubkey_algo(&pub_key),
+                pubkey_b64(&pub_key)
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let raw = read_known_hosts(&path).expect("非 UTF-8 内容不应读失败");
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::Match
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_known_hosts_other_io_error_is_an_error() {
+        // 路径是个目录:读失败但不是 NotFound —— 不能再当成空文件。
+        let dir = known_hosts_test_dir("is-dir");
+        let path = dir.join("known_hosts");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(read_known_hosts(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_rejects_unreadable_known_hosts() {
+        let dir = known_hosts_test_dir("reject-unreadable");
+        let path = dir.join("known_hosts");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut client = test_client(path.clone());
+
+        let accepted = client
+            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+            .await
+            .unwrap();
+        assert!(!accepted, "known_hosts 读不了时不得放行");
+        let reason = rejection_of(&client);
+        assert!(reason.contains("known_hosts 读取失败"), "{reason}");
+        assert!(reason.contains(&path.display().to_string()), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_mismatch_reason_names_path_and_line() {
+        let dir = known_hosts_test_dir("reject-mismatch");
+        let path = dir.join("known_hosts");
+        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
+        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
+        std::fs::write(
+            &path,
+            format!(
+                "# header\nh.example.com {} {}\n",
+                pubkey_algo(&pub_b),
+                pubkey_b64(&pub_b)
+            ),
+        )
+        .unwrap();
+        let mut client = test_client(path.clone());
+
+        assert!(!client.check_server_key(&pub_a).await.unwrap());
+        let reason = rejection_of(&client);
+        assert!(reason.contains("主机密钥与 known_hosts 不符"), "{reason}");
+        assert!(reason.contains(&path.display().to_string()), "{reason}");
+        assert!(reason.contains("第 2 行"), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_rejects_other_algorithm_without_appending() {
+        let dir = known_hosts_test_dir("reject-other-algo");
+        let path = dir.join("known_hosts");
+        let blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B));
+        let original = format!("h.example.com ssh-rsa {blob}\n");
+        std::fs::write(&path, &original).unwrap();
+        let mut client = test_client(path.clone());
+
+        assert!(
+            !client
+                .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+                .await
+                .unwrap()
+        );
+        let reason = rejection_of(&client);
+        assert!(reason.contains("ssh-rsa"), "{reason}");
+        assert!(reason.contains("第 1 行"), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "拒绝时不得把新算法的 key 追加进去"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_accepts_and_records_new_host() {
+        let dir = known_hosts_test_dir("accept-new");
+        let path = dir.join("known_hosts");
+        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
+        let mut client = test_client(path.clone());
+
+        assert!(client.check_server_key(&pub_key).await.unwrap());
+        assert!(client.rejection.lock().unwrap().is_none());
+        let raw = read_known_hosts(&path).unwrap();
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::Match
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_error_prefers_recorded_rejection() {
+        let generic = russh::Error::UnknownKey;
+        assert_eq!(
+            connect_error(
+                "h",
+                22,
+                &generic,
+                Some("主机密钥与 known_hosts 不符".into())
+            ),
+            "ssh connect to h:22 failed: 主机密钥与 known_hosts 不符"
+        );
+        assert_eq!(
+            connect_error("h", 2222, &generic, None),
+            "ssh connect to h:2222 failed: Unknown server key"
         );
     }
 

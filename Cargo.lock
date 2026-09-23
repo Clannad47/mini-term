@@ -4965,6 +4965,7 @@ dependencies = [
  "futures",
  "mt-core",
  "mt-secret",
+ "ring",
  "rsa",
  "russh",
  "russh-sftp",
