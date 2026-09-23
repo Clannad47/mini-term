@@ -79,6 +79,9 @@ const SLIDE_IN_MS: u64 = 250;
 /// `wsl-info` 那条用的占位项目 id(`App.tsx:369`)。**不参与任何跳转**,
 /// 也不会匹配到真实项目 —— 关项目时的清理因此天然放过它。
 pub const WSL_INFO_PROJECT: &str = "__wsl_info__";
+/// 配置后台写盘失败那条用的占位项目 id。与 [`WSL_INFO_PROJECT`] 同一种用法:
+/// 不跳转、不随关项目清理。
+const CONFIG_SAVE_PROJECT: &str = "__config_save__";
 
 /// 队列里的一条。字段与 `types.ts:306-319` 的 `AiCompletionNotification` 对齐
 /// (`timestamp` 没搬:原版留着它也只是排序用,而这里本来就是插入序)。
@@ -280,6 +283,21 @@ pub fn push_wsl_override(distro: &str, unix_path: &str, cx: &mut App) {
         WSL_INFO_PROJECT.to_string(),
         format!("WSL: {distro}"),
         crate::i18n::tr!("app", "wslOverride", path = unix_path),
+        cx,
+    );
+}
+
+/// 配置在后台写盘失败(盘满 / 权限 / 杀软锁库)的告知。
+///
+/// 由 `store::config_writer` 的写线程经 channel 交回主线程后推(写线程里不碰
+/// GPUI)。不属于任何项目:标题是合成的「配置保存失败」,`paste-error` 档 ——
+/// `!` 图标、点击只关闭。**去重在调用方**(同类 60s 只提示一次),这里不再压。
+pub fn push_config_save_failure(detail: &str, cx: &mut App) {
+    push_message(
+        ToastKind::PasteError,
+        CONFIG_SAVE_PROJECT.to_string(),
+        t("app", "configSaveFailed.title").to_string(),
+        crate::i18n::tr!("app", "configSaveFailed.message", detail = detail),
         cx,
     );
 }

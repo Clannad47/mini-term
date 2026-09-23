@@ -56,7 +56,7 @@
 //!
 //! ```ignore
 //! let manager = Arc::new(MobileRelayManager::new(host.clone(), events.clone()));
-//! manager.apply(&cfg.relay_url, &cfg.desktop_key);   // 启动时 / 保存设置时
+//! manager.apply(&cfg.relay_url, &desktop_key);       // 启动时 / 保存设置时;密钥是宿主解封后的明文
 //! manager.update_sessions(projects);                  // store 变化时喂入全量
 //! ```
 //!
@@ -69,11 +69,11 @@ mod util;
 
 pub use host::{AiLauncher, HookSessionId, NoopRelayHost, RelayEvents, RelayHost, RelayProject};
 pub use mirror::{
-    agent_has_session_log, history_slice, MirrorAgent, MirrorParser, MIRROR_PAGE_SIZE,
+    MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, agent_has_session_log, history_slice,
 };
 pub use relay::{
-    can_start_session, check_launcher_command, MobileRelayManager, MobileRelayStatusPayload,
-    RenamePanePayload, StartSessionPayload, SyncPane, SyncProject,
+    MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, StartSessionPayload, SyncPane,
+    SyncProject, can_start_session, check_launcher_command, relay_url_needs_tls_warning,
 };
 
 /// 发起会话失败的**闭集**原因(协议类型)。

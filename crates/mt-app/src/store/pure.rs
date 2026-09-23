@@ -1681,4 +1681,91 @@ mod tests {
             "pwsh · ~/repo/mini-term"
         );
     }
+
+    /// 启动提示框的正文:没降级不弹;哪一路坏了就带上哪一路的详情,
+    /// 两路都坏两段都在(配置那段在前)。
+    #[test]
+    fn 只读状态的提示正文按降级路数拼() {
+        use crate::store::ReadOnlyState;
+
+        let healthy = ReadOnlyState::default();
+        assert!(!healthy.is_degraded());
+        assert!(healthy.dialog_message().is_none(), "没降级不该弹框");
+
+        let config_only = ReadOnlyState {
+            config_error: Some("cfg-detail".into()),
+            layout_error: None,
+        };
+        assert!(config_only.is_degraded());
+        let msg = config_only.dialog_message().unwrap();
+        assert!(msg.contains("cfg-detail"), "{msg}");
+
+        let layout_only = ReadOnlyState {
+            config_error: None,
+            layout_error: Some("layout-detail".into()),
+        };
+        let msg = layout_only.dialog_message().unwrap();
+        assert!(
+            msg.contains("layout-detail") && !msg.contains("cfg-detail"),
+            "{msg}"
+        );
+
+        let both = ReadOnlyState {
+            config_error: Some("cfg-detail".into()),
+            layout_error: Some("layout-detail".into()),
+        };
+        let msg = both.dialog_message().unwrap();
+        let (cfg_at, layout_at) = (msg.find("cfg-detail"), msg.find("layout-detail"));
+        assert!(cfg_at.is_some() && layout_at.is_some(), "{msg}");
+        assert!(cfg_at < layout_at, "配置那段在前: {msg}");
+    }
+
+    /// 配置加载失败(手上是空默认配置)时布局库**只读不删**:拿空项目表去对账,
+    /// 会把全部项目行当无主行删光,配置恢复后分屏树全丢。正常加载时照旧对账。
+    #[test]
+    fn 配置加载失败时不清布局库的项目行() {
+        use mt_config::{SavedPane, SavedProjectLayout, SavedSplitNode, SavedTab};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mt-app-layout-readonly-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let layouts = mt_layout::LayoutStore::open_at(&dir).unwrap();
+        let saved = SavedProjectLayout {
+            tabs: vec![SavedTab {
+                custom_title: None,
+                split_layout: SavedSplitNode::Leaf {
+                    pane: None,
+                    panes: vec![SavedPane {
+                        shell_name: "cmd".into(),
+                        cwd: None,
+                        ai_session: None,
+                    }],
+                },
+            }],
+            active_tab_index: 0,
+        };
+        layouts.save_project_layout("p-real", &saved, 0).unwrap();
+
+        let mut read_only = mt_config::AppConfig::default();
+        assert!(read_only.projects.is_empty(), "前提:默认配置一个项目都没有");
+        crate::store::apply_layout_db(&layouts, &mut read_only, false);
+        assert!(
+            layouts.load_project_layouts().contains_key("p-real"),
+            "只读模式下不能删用户的布局"
+        );
+
+        let mut loaded = mt_config::AppConfig::default();
+        crate::store::apply_layout_db(&layouts, &mut loaded, true);
+        assert!(
+            !layouts.load_project_layouts().contains_key("p-real"),
+            "正常加载时不在项目表里的行照旧当无主行清掉"
+        );
+
+        drop(layouts);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

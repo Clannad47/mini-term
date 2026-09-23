@@ -320,6 +320,10 @@ pub struct MobileRelayConfig {
     pub relay_url: String,
     /// 桌面端接入密钥:必须与中转的 `MT_RELAY_DESKTOP_KEY` 一致,握手时携带。
     /// 空字符串 = 未填,中转一律拒绝(fail-closed,见 ADR 0002)。
+    ///
+    /// 非空时在库、备份、存档里**一律是 [`mt_secret`] 信封**(与 SSH 密码同一套,
+    /// 见 [`ConfigStore`] 的「密码封存」段):泄露出去的明文能向中转申请配对码、
+    /// 顶掉用户的手机并往 PTY 写命令。明文只在 mt-app 边界解开后交给 mt-relay。
     #[serde(default)]
     pub desktop_key: String,
     /// AI 启动器列表:移动端能发起哪些 agent 由此决定。
@@ -1032,8 +1036,8 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// 不会碰它。
 ///
 /// 存量用户的完整 `config.json` 在首次迁移时被另存为 `config.json.pre-sqlite`,
-/// 除 `sshConnections[].password` 会随主库一起封存外不删不改 —— 那是回退到旧版本
-/// 的唯一凭据。
+/// 除 `sshConnections[].password` 与 `mobileRelay.desktopKey` 会随主库一起封存外
+/// 不删不改 —— 那是回退到旧版本的唯一凭据。
 ///
 /// # 密码封存
 ///
@@ -1042,6 +1046,11 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// 认证那一刻。本结构负责两件事:[`load`](Self::load) 时把存量明文一次性封存
 /// (并清扫库文件里的碎片),[`save`](Self::save) 时兜底封存漏网的明文。密钥文件
 /// 与库同目录,dev 实例的隔离目录自然各有各的钥匙。
+///
+/// 中转桌面密钥 `mobileRelay.desktopKey` 走**同一套**(同一把钥匙、同一个迁移
+/// 时机、同一次清扫):它不进投影,所以只涉及库、备份、存档三处;空串 = 未填,
+/// 不封存。解封在 mt-app 边界(`secrets::reveal_relay_key`),交给 mt-relay 的
+/// 仍是明文。
 ///
 /// 令牌是一个乐观并发计数:[`load`](Self::load) 每成功一次就轮换,
 /// [`save`](Self::save) 必须携带当前令牌才允许写盘。不变量:**写盘的每一份配置,
@@ -1229,7 +1238,8 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// 加载时的密码封存(见 [`mt_secret`] 的模块注释)。
+    /// 加载时的密码封存(见 [`mt_secret`] 的模块注释)。SSH 密码与中转桌面密钥
+    /// 在同一处、同一次回写里封存。
     ///
     /// 凭据库开不起来只记日志、密码保持原样 —— 那是「本机生成不了密钥」这种环境
     /// 故障,不该让配置加载失败;[`Self::save`] 每次写盘还会再试。封存过东西就
@@ -1241,17 +1251,20 @@ impl ConfigStore {
         let vault = match self.vault() {
             Ok(vault) => vault,
             Err(err) => {
-                eprintln!("[config] {err:#};已存 SSH 密码本次保持原样(未封存)");
+                eprintln!("[config] {err:#};已存 SSH 密码与中转密钥本次保持原样(未封存)");
                 return;
             }
         };
-        let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault);
+        let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault)
+            + usize::from(seal_plaintext_relay_key(config, &vault));
         if sealed > 0 {
             match db
                 .save(config)
                 .and_then(|()| db.scrub_after_secret_rewrite())
             {
-                Ok(()) => eprintln!("[config] 已把 {sealed} 条 SSH 密码封存进 config.db"),
+                Ok(()) => {
+                    eprintln!("[config] 已把 {sealed} 条凭据(SSH 密码 / 中转密钥)封存进 config.db")
+                }
                 Err(err) => {
                     eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
                 }
@@ -1261,8 +1274,9 @@ impl ConfigStore {
         mt_secret::install(vault);
     }
 
-    /// 存量存档 `config.json.pre-sqlite` 里的 `sshConnections[].password` 同样封存。
-    /// 存档的其余内容不动(它是回退旧版本的凭据),只改这一个字段;没有明文就不写。
+    /// 存量存档 `config.json.pre-sqlite` 里的 `sshConnections[].password` 与
+    /// `mobileRelay.desktopKey` 同样封存。存档的其余内容不动(它是回退旧版本的
+    /// 凭据),只改这两个字段;没有明文就不写。
     fn seal_legacy_archive(&self, vault: &Vault) {
         let path = self.legacy_archive_path();
         let raw = match fs::read_to_string(&path) {
@@ -1280,7 +1294,8 @@ impl ConfigStore {
                 return;
             }
         };
-        let sealed = seal_passwords_in_json(&mut root, vault);
+        let sealed = seal_passwords_in_json(&mut root, vault)
+            + usize::from(seal_relay_key_in_json(&mut root, vault));
         if sealed == 0 {
             return;
         }
@@ -1293,17 +1308,17 @@ impl ConfigStore {
         };
         match atomic_write(&path, json.as_bytes()) {
             Ok(()) => eprintln!(
-                "[config] 已把存档 {} 里的 {sealed} 条 SSH 密码封存",
+                "[config] 已把存档 {} 里的 {sealed} 条凭据(SSH 密码 / 中转密钥)封存",
                 path.display()
             ),
             Err(err) => eprintln!("[config] 存档密码封存写盘失败: {err}"),
         }
     }
 
-    /// 落盘前的兜底:还有明文密码就克隆一份封存后再写,没有就原样借用。
+    /// 落盘前的兜底:还有明文密码(或中转密钥)就克隆一份封存后再写,没有就原样借用。
     /// 凭据库开不起来只记日志、原样写(与加载时同一条降级)。
     fn sealed_for_disk<'a>(&self, config: &'a AppConfig) -> Cow<'a, AppConfig> {
-        if !has_plaintext_password(&config.ssh_connections) {
+        if !has_plaintext_password(&config.ssh_connections) && !has_plaintext_relay_key(config) {
             return Cow::Borrowed(config);
         }
         let vault = match self.vault() {
@@ -1314,8 +1329,9 @@ impl ConfigStore {
             }
         };
         let mut owned = config.clone();
-        let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault);
-        eprintln!("[config] 写盘前兜底封存了 {sealed} 条 SSH 密码");
+        let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault)
+            + usize::from(seal_plaintext_relay_key(&mut owned, &vault));
+        eprintln!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥)");
         Cow::Owned(owned)
     }
 
@@ -1342,8 +1358,9 @@ impl ConfigStore {
     }
 }
 
-/// 这个值是「还没封存的明文密码」吗(非空且不带信封前缀)。
-fn is_plaintext_password(value: &str) -> bool {
+/// 这个值是「还没封存的明文凭据」吗(非空且不带信封前缀)。SSH 密码与中转桌面
+/// 密钥共用这条判据:空串 = 没填,不封存。
+fn is_plaintext_secret(value: &str) -> bool {
     !value.is_empty() && !mt_secret::is_sealed(value)
 }
 
@@ -1351,7 +1368,37 @@ fn is_plaintext_password(value: &str) -> bool {
 fn has_plaintext_password(connections: &[SshConnection]) -> bool {
     connections
         .iter()
-        .any(|c| c.password.as_deref().is_some_and(is_plaintext_password))
+        .any(|c| c.password.as_deref().is_some_and(is_plaintext_secret))
+}
+
+/// 中转桌面密钥还是明文吗。
+fn has_plaintext_relay_key(config: &AppConfig) -> bool {
+    config
+        .mobile_relay
+        .as_ref()
+        .is_some_and(|relay| is_plaintext_secret(&relay.desktop_key))
+}
+
+/// 把 `mobileRelay.desktopKey` 的明文换成信封。返回改了没有;封存失败只记日志、
+/// 原样保留(下次再试)。日志不含密钥。
+fn seal_plaintext_relay_key(config: &mut AppConfig, vault: &Vault) -> bool {
+    let Some(relay) = config
+        .mobile_relay
+        .as_mut()
+        .filter(|relay| is_plaintext_secret(&relay.desktop_key))
+    else {
+        return false;
+    };
+    match vault.seal(&relay.desktop_key) {
+        Ok(envelope) => {
+            relay.desktop_key = envelope;
+            true
+        }
+        Err(err) => {
+            eprintln!("[config] 中转桌面密钥封存失败,保持原样: {err}");
+            false
+        }
+    }
 }
 
 /// 把 `sshConnections[].password` 里的明文换成信封。返回改了几条;单条封存失败
@@ -1362,7 +1409,7 @@ fn seal_plaintext_passwords(connections: &mut [SshConnection], vault: &Vault) ->
         let Some(plain) = conn
             .password
             .as_deref()
-            .filter(|p| is_plaintext_password(p))
+            .filter(|p| is_plaintext_secret(p))
             .map(str::to_string)
         else {
             continue;
@@ -1391,7 +1438,7 @@ fn seal_passwords_in_json(root: &mut serde_json::Value, vault: &Vault) -> usize 
         let Some(plain) = conn
             .get("password")
             .and_then(serde_json::Value::as_str)
-            .filter(|p| is_plaintext_password(p))
+            .filter(|p| is_plaintext_secret(p))
             .map(str::to_string)
         else {
             continue;
@@ -1402,6 +1449,31 @@ fn seal_passwords_in_json(root: &mut serde_json::Value, vault: &Vault) -> usize 
         }
     }
     sealed
+}
+
+/// 存档里的 `mobileRelay.desktopKey` 同样封存。返回改了没有;字段缺失 / 形状
+/// 不对就当没有。
+fn seal_relay_key_in_json(root: &mut serde_json::Value, vault: &Vault) -> bool {
+    let Some(key) = root
+        .get_mut("mobileRelay")
+        .and_then(|relay| relay.get_mut("desktopKey"))
+    else {
+        return false;
+    };
+    let Some(plain) = key
+        .as_str()
+        .filter(|k| is_plaintext_secret(k))
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    match vault.seal(&plain) {
+        Ok(envelope) => {
+            *key = serde_json::Value::String(envelope);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// 同目录临时文件 + rename 的原子写。
@@ -2722,6 +2794,128 @@ mod tests {
             store.read().ssh_connections[0].password.as_deref(),
             Some(stored.as_str()),
             "已是信封的原样写,不换 nonce"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn relay_with_key(key: &str) -> MobileRelayConfig {
+        MobileRelayConfig {
+            relay_url: "wss://relay.example.com".into(),
+            desktop_key: key.into(),
+            ..MobileRelayConfig::default()
+        }
+    }
+
+    /// 中转桌面密钥与 SSH 密码**同一时机、同一方式**迁移:旧版本落下的明文在加载时
+    /// 封存,库、备份、存档连字节都不留(投影本来就不带它,顺带钉住);
+    /// 存档其余内容原样,二次加载不重复封存。
+    #[test]
+    fn 存量明文中转密钥加载时封存且各处不留明文() {
+        let root = unique_test_root("seal-relay-on-load");
+        let path = root.join("config.json");
+        const PLAIN: &str = "r3lay-Desktop-K3y";
+        // 直接用库层写一份明文(绕过 ConfigStore::save 的兜底封存,模拟旧版本落下的库)
+        {
+            let db = crate::db::ConfigDb::open_at(&root).unwrap();
+            let config = AppConfig {
+                mobile_relay: Some(relay_with_key(PLAIN)),
+                ..AppConfig::default()
+            };
+            db.save(&config).unwrap();
+        }
+        let archive = root.join("config.json.pre-sqlite");
+        let legacy = serde_json::json!({
+            "uiFontSize": 15.5,
+            "mobileRelay": {"relayUrl": "wss://relay.example.com", "desktopKey": PLAIN}
+        });
+        fs::write(&archive, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let store = ConfigStore::at(&path);
+        let loaded = store.load().unwrap();
+        let relay = loaded.config.mobile_relay.clone().expect("中转配置还在");
+        assert!(
+            mt_secret::is_sealed(&relay.desktop_key),
+            "内存里已是信封: {}",
+            relay.desktop_key
+        );
+        assert_eq!(
+            store.vault().unwrap().reveal(&relay.desktop_key).unwrap(),
+            PLAIN
+        );
+        assert_eq!(relay.relay_url, "wss://relay.example.com", "地址不动");
+
+        for file in [
+            "config.db",
+            "config.db.bak",
+            "config.json",
+            "config.json.pre-sqlite",
+        ] {
+            let bytes = fs::read(root.join(file)).unwrap();
+            assert!(
+                !contains_bytes(&bytes, PLAIN.as_bytes()),
+                "{file} 里不该再有明文"
+            );
+        }
+        if let Ok(wal) = fs::read(root.join("config.db-wal")) {
+            assert!(
+                !contains_bytes(&wal, PLAIN.as_bytes()),
+                "WAL 旧帧里不该有明文"
+            );
+        }
+        let archived: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&archive).unwrap()).unwrap();
+        assert_eq!(archived["uiFontSize"], 15.5);
+        assert_eq!(
+            archived["mobileRelay"]["relayUrl"],
+            "wss://relay.example.com"
+        );
+        assert!(mt_secret::is_sealed(
+            archived["mobileRelay"]["desktopKey"].as_str().unwrap()
+        ));
+
+        let again = store.load().unwrap();
+        assert_eq!(
+            again.config.mobile_relay.unwrap().desktop_key,
+            relay.desktop_key,
+            "二次加载信封不变(不重复封存)"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `save` 兜底:交来明文中转密钥也封成信封再落盘;空串 = 未填,原样存空。
+    #[test]
+    fn 写盘兜底把明文中转密钥封成信封且空串不封() {
+        let root = unique_test_root("seal-relay-on-save");
+        let store = ConfigStore::at(root.join("config.json"));
+        let token = store.load().unwrap().token;
+        const PLAIN: &str = "r3lay-Desktop-K3y";
+        let config = AppConfig {
+            mobile_relay: Some(relay_with_key(PLAIN)),
+            ..AppConfig::default()
+        };
+        store.save(token, &config).unwrap();
+
+        let stored = store.read().mobile_relay.unwrap().desktop_key;
+        assert!(mt_secret::is_sealed(&stored), "库里只能是信封: {stored}");
+        assert_eq!(store.vault().unwrap().reveal(&stored).unwrap(), PLAIN);
+        for file in ["config.db", "config.db-wal"] {
+            if let Ok(bytes) = fs::read(root.join(file)) {
+                assert!(
+                    !contains_bytes(&bytes, PLAIN.as_bytes()),
+                    "{file} 里不该出现明文"
+                );
+            }
+        }
+
+        let cleared = AppConfig {
+            mobile_relay: Some(relay_with_key("")),
+            ..AppConfig::default()
+        };
+        store.save(token, &cleared).unwrap();
+        assert_eq!(
+            store.read().mobile_relay.unwrap().desktop_key,
+            "",
+            "空串是「未填」,不该变成一个信封"
         );
         fs::remove_dir_all(&root).ok();
     }

@@ -1545,18 +1545,12 @@ fn open_remove_confirm(
                     }
                     form_for_ok.update(cx, |f, cx| {
                         f.removing = true;
+                        f.error = None;
                         cx.notify();
                     });
-                    remove_worktree(
-                        &state,
-                        &group,
-                        &wt,
-                        project_id,
-                        form_for_ok.read(cx).force,
-                        window,
-                        cx,
-                    );
-                    // 结果回来之前不关框(失败要能看见错误)
+                    remove_worktree(&state, &form_for_ok, &group, &wt, project_id, window, cx);
+                    // 结果回来之前不关框:成功由 `remove_worktree` 关,失败把原因写回
+                    // 表单、框留着给用户看(可勾「强制删除」再试)
                     false
                 })
         },
@@ -1566,6 +1560,8 @@ fn open_remove_confirm(
 struct RemoveForm {
     force: bool,
     removing: bool,
+    /// 上一次删除失败的原因(git 的 stderr 原文)。画在「强制删除」下面,
+    /// 再点「删除」时清掉。
     error: Option<String>,
 }
 
@@ -1575,12 +1571,14 @@ impl Render for RemoveForm {
     }
 }
 
+/// 删 worktree(确认框「删除」的落点)。`form` 是确认框的状态实体:成功关框,
+/// 失败把原因写回 `form.error`、复位 `removing`,框留着。
 fn remove_worktree(
     state: &Entity<WorktreeModal>,
+    form: &Entity<RemoveForm>,
     group: &RepoGroup,
     wt: &WorktreeInfo,
     project_id: Option<String>,
-    force: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1588,6 +1586,11 @@ fn remove_worktree(
         .as_deref()
         .is_some_and(|id| crate::workbench_area::project_has_dirty_documents(id, cx))
     {
+        // 调用方已置 `removing`,不复位的话按钮永远卡在「删除中」
+        form.update(cx, |f, cx| {
+            f.removing = false;
+            cx.notify();
+        });
         show_alert(
             t("fileViewer", "unsavedTitle"),
             t("fileViewer", "projectRemovalBlocked"),
@@ -1596,13 +1599,17 @@ fn remove_worktree(
         );
         return;
     }
+    let force = form.read(cx).force;
     let store = state.read(cx).store.clone();
-    // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败
+    // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败。
+    //    ⚠️ 这一步必须在 remove **之前**:删失败时终端也已关掉(项目还在,pane 呈
+    //    断开态、可重开),代价换来的是 Windows 上能删得掉,别为「失败不关终端」调序
     if let Some(id) = &project_id {
         store.update(cx, |store, cx| store.dispose_project_terminals(id, cx));
     }
     let (main_path, wt_path) = (group.main_path.clone(), wt.path.clone());
     let state = state.clone();
+    let form = form.clone();
     window
         .spawn(cx, async move |cx| {
             let result = cx
@@ -1630,13 +1637,36 @@ fn remove_worktree(
                     }
                     Err(err) => {
                         eprintln!("[git] 删除 worktree 失败: {err:#}");
-                        // 失败:框留着显示错误(项目还在,终端呈断开态可重开)
-                        crate::prompt::close_guarded(kind::GIT_WORKTREE_REMOVE, window, cx);
+                        // 失败:**不关框**,原因写回表单就地显示(git 的 stderr 原文,
+                        // 如「contains modified or untracked files, use --force」),
+                        // 按钮复位,用户可勾「强制删除」再点一次。项目还在,终端已在
+                        // ① 关掉,pane 呈断开态可重开。
+                        let message = remove_error_text(&err);
+                        form.update(cx, |f, cx| {
+                            f.removing = false;
+                            f.error = Some(message.clone());
+                            cx.notify();
+                        });
+                        // 等待期间用户按 Esc 把确认框关了:框没了原因也不能丢,
+                        // 退到提示框(叠在 worktree 弹窗之上,toast 会被遮罩挡住)
+                        if !crate::prompt::is_open(kind::GIT_WORKTREE_REMOVE) {
+                            show_alert(t("worktree", "removeConfirmTitle"), message, window, cx);
+                        }
                     }
                 }
             });
         })
         .detach();
+}
+
+/// 删除失败的可展示原因。`run_git_command` 把 git 的 stderr 原样装进错误,
+/// 末尾带换行,这里收掉首尾空白;万一是空的(git 没吭声就非零退出)也别画一行空白。
+fn remove_error_text(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    match text.trim() {
+        "" => "git worktree remove failed".to_string(),
+        trimmed => trimmed.to_string(),
+    }
 }
 
 /// 清理失效条目。**失败静默**(下次打开重试即可)。
@@ -1721,6 +1751,19 @@ mod tests {
             commit_hash: "x".into(),
             upstream: None,
         }
+    }
+
+    /// 删除失败的原因要能直接画出来:git stderr 的尾换行收掉,空的不画空白行。
+    #[test]
+    fn 删除失败原因去掉首尾空白且不为空() {
+        let err = anyhow::anyhow!(
+            "fatal: 'D:/repo-wt' contains modified or untracked files, use --force to delete it\n"
+        );
+        assert_eq!(
+            remove_error_text(&err),
+            "fatal: 'D:/repo-wt' contains modified or untracked files, use --force to delete it"
+        );
+        assert!(!remove_error_text(&anyhow::anyhow!("\n")).is_empty());
     }
 
     /// `normalizePath`:分隔符统一、去尾斜杠、转小写。三条都不能少 ——
