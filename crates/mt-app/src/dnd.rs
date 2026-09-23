@@ -256,19 +256,17 @@ impl ExternalDropKind {
 ///
 /// **入参 `dirs` 必须已经过 `filter_directories` 过滤**(`Path::is_dir` 是同步
 /// stat,在网络盘上能卡住主线程,不能在 `on_drag_move` 里逐帧调)。
-/// 路径比对走 [`crate::git_worktree::normalize_path`],与
+/// 路径比对走 [`mt_core::path_key::windows_eq_key`],与
 /// `AppStore::find_project_by_path` 同一把尺 —— 提示说「已存在」而落地时又新加
 /// 一个,是最难查的那种不一致。
 pub fn classify_external(dirs: &[PathBuf], existing_paths: &[String]) -> ExternalDropKind {
+    use mt_core::path_key::windows_eq_key;
     if dirs.is_empty() {
         return ExternalDropKind::Forbidden;
     }
-    let existing: Vec<String> = existing_paths
-        .iter()
-        .map(|p| crate::git_worktree::normalize_path(p))
-        .collect();
+    let existing: Vec<String> = existing_paths.iter().map(|p| windows_eq_key(p)).collect();
     let all_dup = dirs.iter().all(|dir| {
-        let key = crate::git_worktree::normalize_path(&dir.to_string_lossy());
+        let key = windows_eq_key(&dir.to_string_lossy());
         existing.iter().any(|e| e == &key)
     });
     if all_dup {

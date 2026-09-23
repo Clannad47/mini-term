@@ -139,8 +139,8 @@ pub const ALT_V: &str = "\x1bv";
 /// - agent 是 Claude 系:codex / grok / omp 没有对应的键,照旧粘路径。⚠️ 同一家有
 ///   **两种写法**:hook 上报的是 `claude-code`(sidecar `detect_agent`),输入检测
 ///   认出的是 `claude` —— 只认全等 `"claude"` 会让开了 hook 的用户(绝大多数)
-///   永远走不进来,真机就是这么栽的。口径照抄 `mt_ai::sessions::agent_has_session_log`:
-///   小写后 `contains("claude")`;
+///   永远走不进来,真机就是这么栽的。识别走 `mt_ai::AgentKind::parse`(别名与
+///   宽松匹配都在那),能力位查 `AgentSpec::pastes_clipboard_image`;
 /// - 不是 SSH pane:远端的 Claude 读的是**远端**剪贴板,仍走 SFTP 上传那条路。
 ///
 /// **不看「智能 Ctrl+C/V」开关**:开关关着时 Ctrl+V 压根到不了粘贴钩子
@@ -152,8 +152,10 @@ pub fn agent_takes_clipboard_image(
     agent: Option<&str>,
     target: PasteTarget,
 ) -> bool {
-    let is_claude = agent.is_some_and(|a| a.to_ascii_lowercase().contains("claude"));
-    is_ai_alive(status) && is_claude && target != PasteTarget::Ssh
+    let pastes_image = agent
+        .and_then(mt_ai::AgentKind::parse)
+        .is_some_and(|k| k.spec().pastes_clipboard_image);
+    is_ai_alive(status) && pastes_image && target != PasteTarget::Ssh
 }
 
 /// 剪贴板里有没有图 —— **只探测不落盘**。
@@ -663,7 +665,7 @@ pub mod win {
 /// `/etc/wsl.conf` 里改过 `[automount] root=` 时不成立 —— 表现是「文件不存在」,
 /// 不会误写。
 pub fn windows_path_to_wsl(path: &str) -> Option<String> {
-    let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let stripped = mt_core::path_key::strip_verbatim_prefix(path);
     let mut chars = stripped.chars();
     let drive = chars.next()?;
     if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
@@ -950,6 +952,11 @@ mod tests {
     #[test]
     fn 非盘符路径不转换() {
         assert_eq!(windows_path_to_wsl(r"\\wsl$\Ubuntu\home\me\a.txt"), None);
+        // verbatim UNC 剥成 `\\…` 后同样不是盘符路径
+        assert_eq!(
+            windows_path_to_wsl(r"\\?\UNC\wsl$\Ubuntu\home\me\a.txt"),
+            None
+        );
         assert_eq!(windows_path_to_wsl("/home/me/a.txt"), None);
         assert_eq!(windows_path_to_wsl("relative/a.txt"), None);
         assert_eq!(windows_path_to_wsl("C:"), None, "缺分隔符");

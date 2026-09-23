@@ -202,13 +202,7 @@ impl SettingsView {
         let agents: Vec<HookAgent> = self
             .agents()
             .iter()
-            .filter_map(|a| match a.as_str() {
-                "claude" => Some(HookAgent::Claude),
-                "codex" => Some(HookAgent::Codex),
-                "grok" => Some(HookAgent::Grok),
-                "omp" => Some(HookAgent::Omp),
-                _ => None,
-            })
+            .filter_map(|a| HookAgent::from_key(a))
             .collect();
         // 空选择由按钮 disabled 挡住;真走到这里也不能放行 ——
         // 后端对空列表会回落成「三家全上」(hook_registry::resolve_targets)
@@ -549,12 +543,8 @@ impl SettingsView {
             .flex()
             .border_b_1()
             .border_color(ui::border_subtle());
-        for (key, label) in [
-            ("claude", "Claude Code"),
-            ("codex", "Codex"),
-            ("grok", "Grok"),
-            ("omp", "oh-my-pi"),
-        ] {
+        // 四个 tab 即 hook 注入的四家,key / 展示名查 agent 表(与注入结果行同一份)
+        for (key, label) in HookAgent::ALL.iter().map(|a| (a.key(), a.label())) {
             let active = self.snippet_tab == key;
             tabs = tabs.child(
                 div()
@@ -589,8 +579,10 @@ impl SettingsView {
             .text_size(ui::font_px(10.0))
             .text_color(ui::text_muted());
         let section_of = |value: &serde_json::Value, name: &str| value.get(name).cloned();
-        if self.snippet_tab == "claude" {
-            if let Some(claude) = section_of(data, "claude") {
+        // Claude 的片段是单文件(settings.json),其余三家是多文件列表
+        let claude_key = HookAgent::Claude.key();
+        if self.snippet_tab == claude_key {
+            if let Some(claude) = section_of(data, claude_key) {
                 content = content
                     .child(snippet_file_name(
                         claude.get("file").and_then(|v| v.as_str()).unwrap_or(""),

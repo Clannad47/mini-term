@@ -126,14 +126,16 @@ impl AppStore {
 
     /// 按路径找项目(`store.ts::findProjectByPath`)。
     ///
-    /// 比对走 [`normalize_path`](crate::git_worktree::normalize_path)(分隔符统一 +
+    /// 比对走 [`windows_eq_key`](mt_core::path_key::windows_eq_key)(分隔符统一 +
     /// 去尾斜杠 + 转小写),与 worktree「是否已是项目」的判据同一份。
     /// SSH 远程项目排除在外 —— worktree 的路径是本机路径。
     pub fn find_project_by_path(&self, path: &str) -> Option<&ProjectConfig> {
-        let target = crate::git_worktree::normalize_path(path);
-        self.config.projects.iter().find(|p| {
-            p.ssh_connection_id.is_none() && crate::git_worktree::normalize_path(&p.path) == target
-        })
+        use mt_core::path_key::windows_eq_key;
+        let target = windows_eq_key(path);
+        self.config
+            .projects
+            .iter()
+            .find(|p| p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == target)
     }
 
     /// 添加项目并**返回它的 id**;`parent` 非空时挂成子项目。

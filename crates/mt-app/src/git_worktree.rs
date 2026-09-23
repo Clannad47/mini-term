@@ -35,6 +35,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputState};
+use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
 
 use crate::i18n::{t, tr};
@@ -45,15 +46,9 @@ use crate::ui;
 
 // ─── 纯逻辑小件 ───────────────────────────────────────────────
 
-/// `src/utils/projectActions.ts:9-11`。worktree「是否已是项目」的比对全靠它,
-/// **必须逐字移植**。
-pub fn normalize_path(p: &str) -> String {
-    let unified: String = p
-        .chars()
-        .map(|c| if c == '\\' { '/' } else { c })
-        .collect();
-    unified.trim_end_matches('/').to_lowercase()
-}
+// worktree「是否已是项目」与归并的路径比对(`src/utils/projectActions.ts:9-11` 的
+// `normalizePath`:分隔符统一、去尾斜杠、转小写)已收进
+// `mt_core::path_key::windows_eq_key`,口径逐字相同。
 
 /// 分支名 → 目录名片段(`GitWorktreeModal.tsx:45-47`)。
 pub fn sanitize_branch_for_dir(branch: &str) -> String {
@@ -150,7 +145,7 @@ fn intersect_ordered(groups: &[Vec<String>]) -> Vec<String> {
 /// 归并后的一组(`GitWorktreeModal.tsx:31-42`)。
 #[derive(Clone)]
 struct RepoGroup {
-    /// `normalize_path(主仓库路径)`。
+    /// `windows_eq_key(主仓库路径)`。
     key: String,
     /// 主仓库目录名(worktree 目录建议名的前缀)。
     name: String,
@@ -171,7 +166,7 @@ fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<
                     .find(|w| w.is_main)
                     .map(|w| w.path.clone())
                     .unwrap_or_else(|| path.clone());
-                let key = normalize_path(&main_path);
+                let key = windows_eq_key(&main_path);
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
@@ -184,7 +179,7 @@ fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<
                 });
             }
             Err(err) => {
-                let key = normalize_path(&path);
+                let key = windows_eq_key(&path);
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
@@ -722,7 +717,9 @@ fn render_worktree_row(
         .read(cx)
         .projects()
         .iter()
-        .find(|p| p.ssh_connection_id.is_none() && normalize_path(&p.path) == normalize_path(&wt.path))
+        .find(|p| {
+            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
+        })
         .map(|p| p.id.clone());
     let is_project = existing_project.is_some();
 
@@ -1414,7 +1411,9 @@ fn open_remove_confirm(
         .read(cx)
         .projects()
         .iter()
-        .find(|p| p.ssh_connection_id.is_none() && normalize_path(&p.path) == normalize_path(&wt.path))
+        .find(|p| {
+            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
+        })
         .map(|p| (p.id.clone(), p.name.clone()));
     if linked_project
         .as_ref()
@@ -1766,14 +1765,26 @@ mod tests {
         assert!(!remove_error_text(&anyhow::anyhow!("\n")).is_empty());
     }
 
-    /// `normalizePath`:分隔符统一、去尾斜杠、转小写。三条都不能少 ——
-    /// worktree「是否已是项目」的比对全靠它。
+    /// 归并键:分隔符统一、去尾斜杠、转小写(`windows_eq_key`)。三条都不能少 ——
+    /// libgit2 给的主工作区路径(`D:/Git/Repo/`)与用户填的(`d:\git\repo`)要合成一组。
     #[test]
-    fn 路径归一化() {
-        assert_eq!(normalize_path(r"D:\Git\Repo\"), "d:/git/repo");
-        assert_eq!(normalize_path("/home/U/Proj/"), "/home/u/proj");
-        assert_eq!(normalize_path(r"D:\Git\Repo"), normalize_path("D:/Git/repo"));
-        assert_eq!(normalize_path(""), "");
+    fn 归并键容忍分隔符大小写与尾斜杠() {
+        let list = vec![wt("Repo", "D:/Git/Repo/", true, Some("main"))];
+        let groups = merge_groups(vec![
+            (r"D:\Git\Repo".into(), Ok(list)),
+            (
+                r"d:\git\repo\".into(),
+                Err("另一条路径扫到的同一个仓库".into()),
+            ),
+        ]);
+        assert_eq!(groups.len(), 1, "同一仓库的不同写法只留一组");
+        assert_eq!(groups[0].main_path, "D:/Git/Repo/");
+        // 不同仓库不许被合并
+        let groups = merge_groups(vec![
+            (r"D:\Git\Repo".into(), Err("x".into())),
+            (r"D:\Git\Repo2".into(), Err("y".into())),
+        ]);
+        assert_eq!(groups.len(), 2);
     }
 
     /// 分支名 → 目录名片段。

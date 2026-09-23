@@ -47,6 +47,7 @@ use gpui::{
     px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use mt_core::path_key::windows_eq_key;
 use mt_ui::icons::usage_glyphs::{
     ICON_BOLT, ICON_CHAT, ICON_PULSE, ICON_REFRESH, ICON_STACK, ICON_WALLET,
 };
@@ -430,12 +431,12 @@ impl UsagePanel {
     /// 每次 render 现算 —— 不能在读盘时一次性判定。
     fn effective_project(&self, cx: &App) -> Option<String> {
         let path = self.project_scope.as_deref()?;
-        let norm = norm_project_path(path);
+        let norm = windows_eq_key(path);
         self.store
             .read(cx)
             .projects()
             .iter()
-            .any(|p| norm_project_path(&p.path) == norm)
+            .any(|p| windows_eq_key(&p.path) == norm)
             .then(|| path.to_string())
     }
 
@@ -792,13 +793,13 @@ impl UsagePanel {
 
     fn open_preview(&mut self, session: &TopSessionStat, cx: &mut Context<Self>) {
         // `UsageTopSessionStat → AiSession` 的字段对应照抄
-        // `UsageStatsModal.tsx:385-393`:agent 只分 codex / grok,其余按 claude
-        let session_type = match session.agent.as_str() {
-            "codex" => "codex",
-            "grok" => "grok",
-            _ => "claude",
-        }
-        .to_string();
+        // `UsageStatsModal.tsx:385-393`:只认接了历史正文读取的几家(codex / grok),
+        // 其余按 claude
+        let session_type = mt_ai::AgentKind::parse(&session.agent)
+            .filter(|k| k.spec().history)
+            .unwrap_or(mt_ai::AgentKind::Claude)
+            .key()
+            .to_string();
         let title = if session.title.is_empty() {
             t("usageStats", "untitled").to_string()
         } else {
@@ -1326,12 +1327,12 @@ impl UsagePanel {
         let project_label = effective
             .as_deref()
             .and_then(|path| {
-                let norm = norm_project_path(path);
+                let norm = windows_eq_key(path);
                 self.store
                     .read(cx)
                     .projects()
                     .iter()
-                    .find(|p| norm_project_path(&p.path) == norm)
+                    .find(|p| windows_eq_key(&p.path) == norm)
                     .map(|p| p.name.clone())
             })
             .unwrap_or_else(|| t("usageStats", "scope.allProjects").to_string());
@@ -1492,7 +1493,7 @@ impl UsagePanel {
         // 当前选中项在**打开菜单这一刻**定下(与 projects 快照同一口径)。
         // 项目一多就得靠这个勾才认得出选的是哪个 —— 菜单基件没有勾选态,
         // 惯例是「`✓ ` / 全角空格」前缀(见 `menu.rs` 模块注释)
-        let selected = self.effective_project(cx).map(|p| norm_project_path(&p));
+        let selected = self.effective_project(cx).map(|p| windows_eq_key(&p));
         // 菜单要贴在框底:量下这一帧的 bounds 供**下一次点开**用(与趋势图量
         // 绘图区宽度同一套路,同样刻意不 notify)
         let measure_entity = cx.entity();
@@ -1529,7 +1530,7 @@ impl UsagePanel {
                     )];
                     for (_id, name, path) in &projects {
                         let entity = entity.clone();
-                        let on = selected.as_deref() == Some(norm_project_path(path).as_str());
+                        let on = selected.as_deref() == Some(windows_eq_key(path).as_str());
                         let label = format!("{}{name}", check_mark(on));
                         let path = path.clone();
                         entries.push(menu::item(label, move |_window, cx: &mut App| {
@@ -1697,7 +1698,7 @@ impl UsagePanel {
             .read(cx)
             .projects()
             .iter()
-            .map(|p| (norm_project_path(&p.path), p.path.clone()))
+            .map(|p| (windows_eq_key(&p.path), p.path.clone()))
             .collect();
 
         let mut project_rows = div().flex().flex_col();
@@ -1715,7 +1716,7 @@ impl UsagePanel {
             for (i, p) in stats.by_project.iter().enumerate() {
                 // 只有匹配到**已登记项目**的行才可点(跑过 AI 但没加进 mini-term
                 // 的目录仅展示、无 hover 态、无指针)
-                let norm = norm_project_path(&p.path);
+                let norm = windows_eq_key(&p.path);
                 let target = registered
                     .iter()
                     .find(|(n, _)| *n == norm)

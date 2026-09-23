@@ -4,6 +4,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use mt_core::path_key::{
+    slash_form, strip_verbatim_prefix, trim_trailing_separators, windows_eq_key,
+};
+
 use super::{
     AiQuestion, AiQuestionAnswer, AiQuestionItem, AiQuestionOption, AiSessionMessage,
     answer_labels, extract_text_content,
@@ -49,17 +53,10 @@ fn session_meta(path: &Path) -> Option<OmpSessionMeta> {
     None
 }
 
-fn clean_windows_verbatim(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
-}
-
-fn normalize_windows_path(path: &str) -> String {
-    super::normalize_path(clean_windows_verbatim(path))
-}
-
 /// OMP 的 legacy absolute 目录编码。只去掉一个前导分隔符,UNC 路径必须保留第二个。
 fn encoded_absolute_dir(path: &str) -> String {
-    let path = clean_windows_verbatim(path).trim_end_matches(['/', '\\']);
+    let path = strip_verbatim_prefix(path);
+    let path = trim_trailing_separators(&path);
     let path = path
         .strip_prefix('/')
         .or_else(|| path.strip_prefix('\\'))
@@ -67,28 +64,21 @@ fn encoded_absolute_dir(path: &str) -> String {
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
 }
 
-/// 返回 path 相对于 base 的原始大小写后缀。
+/// 返回 path 相对于 base 的原始大小写后缀(分隔符统一成 `/`,编码时与 `\` 同样变 `-`)。
 fn relative_to(base: &str, path: &str) -> Option<String> {
-    let base_original = clean_windows_verbatim(base)
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_string();
-    let path_original = clean_windows_verbatim(path)
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_string();
-    let base_normalized = normalize_windows_path(&base_original);
-    let path_normalized = normalize_windows_path(&path_original);
-    if path_normalized == base_normalized {
+    let base_original = slash_form(&strip_verbatim_prefix(base));
+    let path_original = slash_form(&strip_verbatim_prefix(path));
+    let base_key = windows_eq_key(&base_original);
+    let path_key = windows_eq_key(&path_original);
+    if path_key == base_key {
         return Some(String::new());
     }
-    let rest = path_normalized.strip_prefix(&base_normalized)?;
-    if !rest.starts_with('\\') {
+    let rest = path_key.strip_prefix(&base_key)?;
+    // 键是正斜杠形态(见 `windows_eq_key`)
+    if !rest.starts_with('/') {
         return None;
     }
-    path_original
-        .get(base_normalized.len() + 1..)
-        .map(str::to_string)
+    path_original.get(base_key.len() + 1..).map(str::to_string)
 }
 
 fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
@@ -104,7 +94,8 @@ fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
 
 /// 计算 OMP 默认目录名,同时保留 legacy absolute 名称作为只读发现兜底。
 fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<String> {
-    let project_path = clean_windows_verbatim(project_path);
+    let project_path = strip_verbatim_prefix(project_path);
+    let project_path = project_path.as_ref();
     let default_name = if let Some(relative) = relative_to(home, project_path) {
         encoded_relative_dir("-", &relative)
     } else if let Some(relative) = relative_to(temp_root, project_path) {
@@ -171,7 +162,9 @@ fn project_session_dirs(project_path: &str) -> Vec<PathBuf> {
 }
 
 fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
-    normalize_windows_path(&meta.cwd) == normalize_windows_path(project_path)
+    // 两边都可能是 canonicalize 的 verbatim 形态:先剥 `\\?\` 再取 Windows 比较键
+    let key = |path: &str| windows_eq_key(&strip_verbatim_prefix(path));
+    key(&meta.cwd) == key(project_path)
 }
 
 fn find_omp_session_file_in(
@@ -512,6 +505,25 @@ mod tests {
         assert_eq!(
             encoded_absolute_dir(r"\\server\share\proj"),
             "---server-share-proj--"
+        );
+        // canonicalize 产出的 verbatim 形态与原路径编出同一个目录名
+        // (`\\?\UNC\` 以前被剥成 `UNC\…`,编出一个永远不存在的 `--UNC-…` 候选)
+        assert_eq!(
+            session_dir_names(
+                r"C:\Users\u",
+                r"C:\Users\u\Temp",
+                r"\\?\C:\Users\u\Git\proj"
+            )[0],
+            "-Git-proj"
+        );
+        assert_eq!(
+            encoded_absolute_dir(r"\\?\UNC\server\share\proj"),
+            encoded_absolute_dir(r"\\server\share\proj")
+        );
+        // 大小写 / 分隔符 / 尾随分隔符差异不影响相对段的判定,相对段保留原大小写
+        assert_eq!(
+            session_dir_names(r"c:/users/U/", r"C:\Users\u\Temp", r"C:\Users\u\Git\Proj\")[0],
+            "-Git-Proj"
         );
     }
 

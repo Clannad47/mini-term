@@ -437,13 +437,6 @@ pub fn bar_ratios_or(primary: &[f64], fallback: &[f64]) -> Vec<f32> {
     }
 }
 
-/// cwd ↔ 登记项目路径的匹配归一(`UsageStatsModal.tsx:295`,注释说明「对齐后端
-/// normalize」):正斜杠转反斜杠 → 小写 → 去尾部反斜杠。
-pub fn norm_project_path(p: &str) -> String {
-    let s = p.replace('/', "\\").to_lowercase();
-    s.trim_end_matches('\\').to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,14 +687,5 @@ mod tests {
 
         // 完全没数据时不补(原版 `daily.length === 0` 直接返回空)
         assert!(fill_buckets(&[], UsageRange::Days7, "", "", now).is_empty());
-    }
-
-    /// 项目路径归一(大小写 / 分隔符 / 尾斜杠容错,对齐后端 normalize)。
-    #[test]
-    fn 项目路径归一() {
-        assert_eq!(norm_project_path("D:/Git/X/"), "d:\\git\\x");
-        assert_eq!(norm_project_path("D:\\Git\\X"), "d:\\git\\x");
-        assert_eq!(norm_project_path("D:\\Git\\X\\\\"), "d:\\git\\x");
-        assert_eq!(norm_project_path(""), "");
     }
 }

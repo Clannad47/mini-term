@@ -12,7 +12,6 @@ use mt_ui::TerminalStyle;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::notify::PaneRef;
-use crate::session_panel::build_resume_command;
 use crate::tree::{AiSessionRef, PaneState, PaneStatus, SplitNode};
 
 use super::ProjectState;
@@ -371,7 +370,8 @@ pub fn terminal_style_from(size: f64, family: Option<&str>, ligatures: bool) -> 
 /// - `resume_pending`:布局恢复置位、写一次即清,防重复写;
 /// - `remote`:远程 pane 的 PTY 是 ssh 启动器,启动初期可能停在口令交互上,
 ///   预写的命令会被当口令消费;
-/// - id 非法:见 [`build_resume_command`] 的白名单。
+/// - agent 不支持续接(opencode / pi / 认不出)或 id 非法:命令与白名单都在
+///   [`mt_ai::agent::resume_command`](与 AI 历史面板共用一套)。
 ///
 /// **`enabled == false` 时调用方不该清 `resume_pending`** —— 标记的语义是
 /// 「这个 pane 还没续过」,不是「这次启动没续」;清了开关中途打开也续不上。
@@ -385,7 +385,7 @@ pub fn resolve_auto_resume_command(
         return None;
     }
     let session = session?;
-    build_resume_command(session.agent.as_deref().unwrap_or(""), &session.session_id)
+    mt_ai::agent::resume_command(session.agent.as_deref(), &session.session_id)
 }
 
 /// 续接时 PTY 该以哪个目录启动(`PaneGroup.tsx` 的 `resolveResumeCwd`)。
@@ -404,7 +404,7 @@ pub(super) fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
 }
 
 /// [`resolve_resume_cwd`] 的可注入版本:`lookup` 是「按会话 id 翻 jsonl」那一步。
-/// 单测换成计数桩,证明 codex / omp 根本不去翻盘。
+/// 单测换成计数桩,证明非 claude 系根本不去翻盘。
 fn resolve_resume_cwd_with(
     session: &AiSessionRef,
     lookup: impl FnOnce(String) -> Option<String>,
@@ -412,9 +412,12 @@ fn resolve_resume_cwd_with(
     if let Some(cwd) = session.cwd.as_deref() {
         return Path::new(cwd).is_dir().then(|| cwd.to_string());
     }
-    // codex 不按目录分桶;omp 按目录分桶但没有记录解析可反查 —— 两者都不去
-    // `~/.claude/projects` 里翻(那里只会有 claude 的桶)
-    if matches!(session.agent.as_deref(), Some("codex") | Some("omp")) {
+    // 只有 claude 系(含缺省 agent)能按 id 反查:codex 不按目录分桶;omp / grok
+    // 按目录分桶但没有反查手段 —— 都不去 `~/.claude/projects` 里翻(那里只会有
+    // claude 的桶)。口径见 `mt_ai::CwdBucket`
+    if !mt_ai::AgentKind::from_session_agent(session.agent.as_deref())
+        .is_some_and(|k| k.looks_up_session_cwd())
+    {
         return None;
     }
     lookup(session.session_id.clone())
@@ -427,7 +430,7 @@ fn resolve_resume_cwd_with(
 /// 终端靠它),会话 cwd 只在 pane 没指定时兜底;两个都没有 → `None`,调用方落项目根。
 /// 会话 cwd 即便没被用来起 PTY 也照样返回 —— 它要随身份写回,下次重启免查。
 ///
-/// `resolve` 即 [`resolve_resume_cwd`](带 `is_dir` 预检、codex / omp 不反查),
+/// `resolve` 即 [`resolve_resume_cwd`](带 `is_dir` 预检、只有 claude 系反查),
 /// 可注入只为单测。**同步磁盘 IO**:只许在后台线程上调(见 `start_pty_with`
 /// 交给 pane 的启动预案)。
 pub(super) fn decide_resume_cwd(
@@ -487,7 +490,7 @@ pub struct PendingFork {
 /// 2. **id 为空** —— 身份还没成形;
 /// 3. **id 等于父** —— claude 的 `--resume` 幂等上报同一个 id(没真分出去)。
 ///
-/// 归一化口径与 [`crate::session_branch::branch_caps_for_agent`] 同:两边都先小写。
+/// 归一化口径与 [`crate::session_branch::branch_menu_segment`] 登记时同:两边都先小写。
 /// 同 agent 的**全新**会话被误记仍有残余风险 —— 磁盘边合并时优先、且该 pane
 /// 首次身份即消费,窗口压到最小(原版同一条注释)。
 pub fn resolve_fork_edge(
@@ -1125,7 +1128,8 @@ mod tests {
         assert_eq!(find_pane_of_pty(&states, 99), None);
     }
 
-    /// 命令按 agent 分派;未知 / 缺省 agent 兜底 claude(与旧版一致)。
+    /// 命令按 agent 分派;缺省 agent 按 claude(会话身份的约定),hook 上报的
+    /// `claude-code` 同样按 claude。
     #[test]
     fn 自动续接命令按_agent_分派() {
         let s = session(Some("codex"), "rollout_9");
@@ -1138,11 +1142,32 @@ mod tests {
             resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
             Some("grok --resume 0199-x")
         );
-        let s = session(None, "abc-123");
+        let s = session(Some("omp"), "1f9d2a6b9c0d1234");
         assert_eq!(
             resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
-            Some("claude --resume abc-123")
+            Some("omp --resume 1f9d2a6b9c0d1234")
         );
+        for agent in [None, Some(""), Some("claude-code")] {
+            let s = session(agent, "abc-123");
+            assert_eq!(
+                resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+                Some("claude --resume abc-123"),
+                "{agent:?}"
+            );
+        }
+    }
+
+    /// 认不出的 agent 不再兜底成 claude:旧口径会在启动时往 pane 里敲一条
+    /// `claude --resume <别家的 id>`。
+    #[test]
+    fn 自动续接认不出的_agent_不续() {
+        for agent in ["opencode", "pi", "gemini"] {
+            let s = session(Some(agent), "abc-123");
+            assert!(
+                resolve_auto_resume_command(true, true, Some(&s), false).is_none(),
+                "{agent}"
+            );
+        }
     }
 
     /// 四条否决条件逐条生效。
@@ -1215,8 +1240,8 @@ mod tests {
         );
     }
 
-    /// 反查只在 claude 系且会话记录里没有 cwd 时才发生:codex / omp 根本不碰盘,
-    /// 记录里带着(且在盘上)的 cwd 直接用。
+    /// 反查只在 claude 系且会话记录里没有 cwd 时才发生:codex / omp / grok 根本
+    /// 不碰盘,记录里带着(且在盘上)的 cwd 直接用。
     #[test]
     fn 续接启动目录_codex_omp_不反查() {
         use std::cell::Cell;
@@ -1225,7 +1250,7 @@ mod tests {
             calls.set(calls.get() + 1);
             Some("D:/from-jsonl".to_string())
         };
-        for agent in ["codex", "omp"] {
+        for agent in ["codex", "omp", "grok", "opencode", "gemini"] {
             let s = session(Some(agent), "rollout_9");
             assert_eq!(
                 decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),
@@ -1233,17 +1258,17 @@ mod tests {
                 "{agent} 不该反查"
             );
         }
-        assert_eq!(calls.get(), 0, "codex / omp 一次都不许翻盘");
+        assert_eq!(calls.get(), 0, "非 claude 系一次都不许翻盘");
 
-        // claude(含缺省 agent)没有 cwd → 反查一次
-        for agent in [Some("claude"), None] {
+        // claude(含缺省 agent 与 hook 上报的 claude-code)没有 cwd → 反查一次
+        for agent in [Some("claude"), None, Some("claude-code")] {
             let s = session(agent, "abc-123");
             assert_eq!(
                 decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)).0,
                 Some("D:/from-jsonl".into())
             );
         }
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), 3);
 
         // 记录里带着在盘上的 cwd:直接用,不反查
         let tmp = std::env::temp_dir().to_string_lossy().to_string();
@@ -1253,7 +1278,7 @@ mod tests {
             decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),
             (Some(tmp.clone()), Some(tmp))
         );
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), 3);
     }
 
     /// 写回只认同一个会话,值没变不算改动。
