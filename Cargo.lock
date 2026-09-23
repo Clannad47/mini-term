@@ -4777,12 +4777,10 @@ dependencies = [
 name = "mt-ai"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "chrono",
  "dirs 6.0.0",
  "mt-core",
  "parking_lot",
- "regex",
  "serde",
  "serde_json",
  "tiny_http",
@@ -4902,7 +4900,6 @@ dependencies = [
  "pathdiff",
  "regex",
  "serde",
- "serde_json",
  "windows-registry 0.2.0",
 ]
 
@@ -4920,7 +4917,6 @@ dependencies = [
 name = "mt-relay"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "dirs 6.0.0",
  "futures-util",
  "mt-ai",
@@ -4932,7 +4928,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "uuid",
 ]
 
 [[package]]
@@ -4977,7 +4972,6 @@ name = "mt-terminal"
 version = "1.13.7"
 dependencies = [
  "alacritty_terminal",
- "anyhow",
  "mt-pty",
  "parking_lot",
  "unicode-segmentation",
@@ -4995,7 +4989,6 @@ dependencies = [
  "mt-config",
  "mt-i18n",
  "mt-terminal",
- "parking_lot",
  "serde",
  "serde_json",
 ]
@@ -5004,7 +4997,6 @@ dependencies = [
 name = "mt-usage"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "chrono",
  "chrono-tz",
  "dirs 6.0.0",

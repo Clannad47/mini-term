@@ -30,13 +30,14 @@ license = "MIT"
 # ---------------------------------------------------------------------------
 # 全部取自 crates.io，不用 git 依赖 —— 可复现、可锁版本。
 #
-# ⚠️ 不要换成 `gpui-ce`:gpui-component 依赖的是 Zed 官方 `gpui ^0.2.2`，
-#    混用会在依赖树里出现两个不同的 `gpui` crate，类型无法互通。
+# ⚠️ 不要换成 `gpui-ce`:gpui-component 0.6 依赖的是 `gpui-pre`(下面那份 Zed 快照,
+#    与本仓 `gpui` 别名指向的是同一个包),混用会在依赖树里出现两个不同的 gpui
+#    crate，类型无法互通。
 #    (gpui-ce 的卖点是 wgpu 单一后端，代价是没有任何组件库可用，且
 #     crates.io 版本停在 0.3.3 / 2025-12-27。)
 #
-# ⚠️ Linux 构建需要额外打开 gpui 的 `x11` / `wayland` feature，
-#    Windows / macOS 默认 feature 即可。
+# ⚠️ Linux 构建需要额外打开 gpui_platform 的 `x11` / `wayland` feature
+#    (见 mt-app 的 target 依赖段),Windows / macOS 默认 feature 即可。
 # spike/gpui-pre:底座换成 huacnlee 上传的 Zed 快照 gpui-pre(zed@d89e9c2,2026-09-14)。
 # 0.3.x 把窗口/文字后端拆去了 gpui_platform,应用入口改为 gpui_platform::application()。
 gpui = { package = "gpui-pre", version = "0.3.5" }

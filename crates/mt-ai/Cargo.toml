@@ -8,9 +8,7 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 chrono.workspace = true
-regex.workspace = true
 dirs.workspace = true
 # 收尾-1 批去重:atomic_write / parse_wsl_unc / strip_ansi_codes 三个纯函数
 # 原本在 crate::util、crate::detect 里各存一份逐字副本(mt-core 当时还在

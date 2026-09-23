@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # 原先由 dtolnay/rust-toolchain 顺手设上的;改成 rustup 按文件装之后在这里显式给
+  # (CARGO_INCREMENTAL=0 由 rust-cache 设,不必重复)
+  CARGO_TERM_COLOR: always
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,9 +33,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v5
+      # persist-credentials: false:不把 token 写进 .git/config(cargo check/test 期间
+      # 依赖的 build.rs 都读得到那个文件)。下面的 git 操作全是本地的,不再 fetch
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve changed-file base
         id: diff-base
@@ -85,17 +93,23 @@ jobs:
             libx11-dev libxcb1-dev libasound2-dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # 工具链(含 rustfmt / clippy 两个组件)按仓库根的 rust-toolchain.toml 装,与本地同版本,
+      # 不再用 dtolnay/rust-toolchain@stable —— 本地 clippy 比 CI 旧、发版后才报红的根因就在这。
+      # 无参 `rustup toolchain install` = 装当前生效的工具链(rustup ≥ 1.28)
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+          cargo clippy -V
+          rustfmt -V
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           workspaces: |
@@ -155,13 +169,19 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      # 同上:按 rust-toolchain.toml 装,不另写版本
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
           workspaces: |
@@ -175,6 +195,7 @@ jobs:
         run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
 
       # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析。
-      # 这几个 crate 都不依赖 gpui,测试二进制几分钟内能编出来。
+      # 这几个 crate 都不依赖 gpui,测试二进制几分钟内能编出来。PTY → VT → grid 的
+      # 冒烟(mt-terminal/tests/terminal_smoke.rs,起 powershell)也随 mt-terminal 在这里跑。
       - name: Cargo test (Windows-specific crates)
         run: cargo test -p mt-pty -p mt-secret -p mt-core -p mt-terminal
