@@ -18,6 +18,10 @@
 ; 平铺 $INSTDIR,与便携解压、target\<profile>\ 开发布局同构(「与 exe 同目录」
 ; 定位铁律)。用户数据在 AppData 下,卸载不碰。
 ;
+; 真卸载时顺带摘掉 mini-term 写进四家 AI 工具(Claude / Codex / Grok / oh-my-pi)配置里的
+; hook 注册(`mini-term.exe --unregister-hooks`),升级时不摘 —— 新安装器调旧卸载器带
+; /UPGRADE 区分,详见 UNINSTALL_OLD 宏与 Section "Uninstall" 的注释。
+;
 ; 桌面快捷方式是组件页上的可选项(SecDesktop):全新安装默认勾上;升级时沿用
 ; 用户上一次的选择 —— .onInit 里看旧桌面快捷方式在不在(那时旧版还没卸),不在
 ; 就默认不勾。静默安装(/S)走的就是这个默认值。开始菜单快捷方式始终建,它是
@@ -128,6 +132,14 @@ LangString MSG_CLOSING_RUNNING ${LANG_SIMPCHINESE} "正在关闭 $KillDirs 下�
 LangString MSG_CLOSE_UNAVAILABLE ${LANG_ENGLISH} "Could not check for running programs (PowerShell returned: $1). If a file is reported in use, close ${PRODUCT_NAME} and retry."
 LangString MSG_CLOSE_UNAVAILABLE ${LANG_SIMPCHINESE} "没能检查运行中的程序(PowerShell 返回:$1)。如提示文件被占用,请先关闭 ${PRODUCT_NAME} 再重试。"
 
+; 卸载时摘 AI 工具 hook 注册的进度行(见 Section "Uninstall")。
+LangString MSG_UNREG_HOOKS ${LANG_ENGLISH} "Removing ${PRODUCT_NAME} hook entries from AI tool settings (Claude Code / Codex / Grok / oh-my-pi) ..."
+LangString MSG_UNREG_HOOKS ${LANG_SIMPCHINESE} "正在从 AI 工具配置(Claude Code / Codex / Grok / oh-my-pi)中移除 ${PRODUCT_NAME} 的 hook 注册..."
+LangString MSG_UNREG_HOOKS_FAIL ${LANG_ENGLISH} "Some hook entries could not be removed (result: $1). You can remove the miniterm-hook entries from those settings files by hand."
+LangString MSG_UNREG_HOOKS_FAIL ${LANG_SIMPCHINESE} "部分 hook 注册未能移除(结果:$1),可手动删掉对应配置文件里含 miniterm-hook 的条目。"
+LangString MSG_UNREG_HOOKS_KEEP ${LANG_ENGLISH} "Upgrading: AI tool hook entries are kept."
+LangString MSG_UNREG_HOOKS_KEEP ${LANG_SIMPCHINESE} "升级安装:保留 AI 工具的 hook 注册。"
+
 ; ── 关闭安装目录下运行中的实例 ───────────────────────────────────────
 ;
 ; 升级 / 卸载要替换或删除 exe:主程序锁着 mini-term.exe;mt-ssh-cli 的 daemon、
@@ -222,11 +234,19 @@ FunctionEnd
 ; 同样是 NSIS 出身,`_?=` 与 /S 都认)。
 ; 卸载器会清掉快捷方式与 Uninstall 注册表键:开始菜单那条与注册表键由 SecMain
 ; 后半段原样重建,桌面那条看 SecDesktop 勾没勾。
+;
+; /UPGRADE 告诉旧卸载器「这是升级,不是卸载」:真卸载会摘掉 AI 工具里的 hook 注册
+; (见 Section "Uninstall"),升级时摘了,新版装好后 AI 状态感知就断了 —— 启动期自愈
+; 只在「已注册过」时补,摘光之后它也救不回来。
+; - 旧卸载器不认识 /UPGRADE:NSIS 卸载器只解析 /S、/NCRC、/D=、_?=,其余参数原样
+;   留在命令行里无人理会;而且带 hook 清理之前的卸载器(GPUI 版到 1.13.7、Tauri 版)
+;   本来就没有摘 hook 这一步,不会误摘。
+; - `_?=` 必须是最后一个参数(它把后面整段当目录,允许带空格)。
 !macro UNINSTALL_OLD
   ${If} $OldUninstaller != ""
     DetailPrint "$(MSG_UNINST_RUN)"
     ClearErrors
-    ExecWait '"$OldUninstaller" /S _?=$OldInstallDir' $UninstStatus
+    ExecWait '"$OldUninstaller" /S /UPGRADE _?=$OldInstallDir' $UninstStatus
     ${If} ${Errors}
       StrCpy $UninstStatus "-1"
     ${EndIf}
@@ -333,9 +353,33 @@ Function .onInit
 FunctionEnd
 
 Section "Uninstall"
-  ; 升级时由新安装器以 /S 调起:那边已经清过场,这里多半什么都探不到
+  ; 升级时由新安装器以 /S /UPGRADE 调起:那边已经清过场,这里多半什么都探不到
   StrCpy $KillDirs "$INSTDIR"
   Call un.CloseRunning
+
+  ; 摘掉 mini-term 写进 AI 工具配置的 hook 注册。必须排在删 exe 之前(靠主程序自己
+  ; 摘:摘除口径 —— 只认带 miniterm-hook 标识的条目、没有就一个字节不写 —— 与设置页
+  ; 「卸载」同一份代码,见 crates/mt-app/src/cli.rs)。
+  ; - 升级(/UPGRADE)不摘,理由见 UNINSTALL_OLD。
+  ; - 静默卸载(用户自己 /S、包管理器)照样摘:那是真卸载,留着的条目会让 AI 每个事件
+  ;   都去跑一个不存在的 exe;安装器发起的静默调用一律带 /UPGRADE,不会走到这里。
+  ; - nsExec 起的子进程 stdout 接到详情列表(每家一行 ASCII);30 秒超时强杀兜底,
+  ;   摘失败只提示、不中断卸载。
+  ${un.GetParameters} $0
+  ClearErrors
+  ${un.GetOptions} $0 "/UPGRADE" $1
+  ${If} ${Errors}
+    ${If} ${FileExists} "$INSTDIR\mini-term.exe"
+      DetailPrint "$(MSG_UNREG_HOOKS)"
+      nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\mini-term.exe" --unregister-hooks'
+      Pop $1
+      ${If} $1 != "0"
+        DetailPrint "$(MSG_UNREG_HOOKS_FAIL)"
+      ${EndIf}
+    ${EndIf}
+  ${Else}
+    DetailPrint "$(MSG_UNREG_HOOKS_KEEP)"
+  ${EndIf}
 
   Delete "$INSTDIR\mini-term.exe"
   Delete "$INSTDIR\miniterm-hook.exe"
