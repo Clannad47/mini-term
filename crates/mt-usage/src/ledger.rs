@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,12 +31,27 @@ use super::{
 /// 账本 schema 版本：结构变更时 +1。open 时版本不匹配即删表重建（账本可从
 /// JSONL 再生，空 sync_state 自动触发 backfill，无需逐版本迁移脚本）。
 /// v3：新增 tool_events 表（工具/Shell/MCP 排行，设计 §2.2）。
-const SCHEMA_VERSION: i64 = 3;
+/// v4：turns / tool_events 新增 `eff_ts_ms` 并建索引，时间窗过滤改走索引（见 SCHEMA
+/// 注释）。v3 → v4 是唯一的就地迁移（加列 + 一次回填，见 `migrate_v3_to_v4`）：删表
+/// 重建要把全部 JSONL 重解析一遍，只为加一列不值得。
+const SCHEMA_VERSION: i64 = 4;
 
 /// 账本 schema（设计 §1）。成本不落库：定价会更新，查询时按前端传入的定价表现算。
 /// turns 主键为 (session_id, request_id)：每会话各存自己的份，fork/subagent 复制的
 /// 历史允许跨会话重复落库，跨文件 message_id 去重在聚合层做（与旧内存路径同规则，
 /// 归属确定、不随同步顺序漂移）。
+///
+/// `eff_ts_ms` 是窗口判定用的「有效时刻」= COALESCE(ts_ms, 所属会话 mtime_ms)，写入时
+/// 算好。以前查询现算 `COALESCE(t.ts_ms, s.mtime_ms)`，表达式跨两张表，`ts_ms` 上的
+/// 索引用不上，每次切时间范围都是整表 JOIN 再排序。写入时算是一致的：会话行与它的
+/// 全部 turns / 工具事件只在 `sync_job` 里、同一事务内整删重插，会话 mtime 一变，
+/// 这两张表里它的行必然跟着重写。
+///
+/// 索引是 `(session_id, eff_ts_ms)` 而不是单列 `eff_ts_ms`：查询要按 session_id,
+/// rowid 出行（组装 ParsedSession、fork 归属都靠这个顺序）。单列索引下窗口一宽就是
+/// 逐行回表 + 整体排序，实测 10 万行「全部」比改前还慢一倍；复合索引配合外层按会话
+/// 顺序走 sessions（见 `TURNS_IN_WINDOW_SQL`），内层每个会话只 seek 窗口内那一段，
+/// 窄窗口快一个数量级，宽窗口也不比改前慢。
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   session_id  TEXT PRIMARY KEY,
@@ -59,9 +74,10 @@ CREATE TABLE IF NOT EXISTS turns (
   cache_read     INTEGER NOT NULL DEFAULT 0,
   cache_write    INTEGER NOT NULL DEFAULT 0,
   cache_write_1h INTEGER NOT NULL DEFAULT 0,
+  eff_ts_ms      INTEGER,
   PRIMARY KEY (session_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts_ms);
+CREATE INDEX IF NOT EXISTS idx_turns_sid_eff ON turns(session_id, eff_ts_ms);
 CREATE TABLE IF NOT EXISTS tool_events (
   session_id TEXT NOT NULL,
   seq        INTEGER NOT NULL,
@@ -69,9 +85,10 @@ CREATE TABLE IF NOT EXISTS tool_events (
   name       TEXT NOT NULL,
   ts_ms      INTEGER,
   dedup_key  TEXT,
+  eff_ts_ms  INTEGER,
   PRIMARY KEY (session_id, seq)
 );
-CREATE INDEX IF NOT EXISTS idx_tool_events_ts ON tool_events(ts_ms);
+CREATE INDEX IF NOT EXISTS idx_tool_events_sid_eff ON tool_events(session_id, eff_ts_ms);
 CREATE TABLE IF NOT EXISTS sync_state (
   file_path TEXT PRIMARY KEY,
   mtime_ms  INTEGER NOT NULL,
@@ -79,11 +96,93 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 ";
 
+/// 窗口内的计费 turn（?1 = since，?2 = until，闭区间；?3 = agent 或 NULL）。
+///
+/// 计划（`query_plans_use_eff_ts_indexes` 钉住）：外层按 session_id 顺序扫 sessions，
+/// agent 过滤在外层整会话剪掉；内层走 `idx_turns_sid_eff` 按 (session_id=?, eff_ts_ms
+/// 区间) seek，只读窗口内的行；排序只剩会话内按 rowid 的小排序。`CROSS JOIN` 是为了
+/// 钉死连接顺序（SQLite 里它的左表恒为外层）：没有 ANALYZE 统计，规划器自己会挑
+/// 「外层扫 turns」。`ORDER BY s.session_id` 与 `t.session_id` 等价（JOIN 条件相等），
+/// 写成外层列才能让外层的扫描顺序直接满足它。
+const TURNS_IN_WINDOW_SQL: &str = "
+SELECT t.session_id, t.ts_ms, t.model,
+       t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
+       s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id
+FROM sessions s CROSS JOIN turns t ON t.session_id = s.session_id
+WHERE t.eff_ts_ms >= ?1 AND t.eff_ts_ms <= ?2
+  AND (?3 IS NULL OR s.agent = ?3)
+ORDER BY s.session_id, t.rowid";
+
+/// 窗口内的工具事件，参数与计划同 [`TURNS_IN_WINDOW_SQL`]。
+const TOOL_EVENTS_IN_WINDOW_SQL: &str = "
+SELECT te.session_id, te.kind, te.name, te.ts_ms, te.dedup_key,
+       s.agent, s.cwd, s.title, s.provider, s.mtime_ms
+FROM sessions s CROSS JOIN tool_events te ON te.session_id = s.session_id
+WHERE te.eff_ts_ms >= ?1 AND te.eff_ts_ms <= ?2
+  AND (?3 IS NULL OR s.agent = ?3)
+ORDER BY s.session_id, te.seq";
+
 /// 全局同步互斥：同一时刻只有一个同步在跑。运行期间的新触发经 SYNC_PENDING
 /// 合并进现役轮收尾补跑（见 run_coalesced），不会被丢弃。
-/// Connection 每次命令内打开（WAL 下读写连接互不阻塞，查询永远秒回不等同步）。
+/// 同步每轮自己开一条写连接；查询走 QUERY_CONN 复用的读连接（WAL 下读写连接互不
+/// 阻塞，查询永远秒回不等同步）。
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 查询连接复用槽。
+///
+/// 查询跑在 GPUI 的后台线程池上：落在哪条线程不固定，面板切时间范围时还可能两次查询
+/// 同时在跑；rusqlite 的 `Connection` 是 Send 不是 Sync。所以不用 thread_local（每条
+/// 池线程各攒一条，别的线程也关不掉它），而是一个「取走 / 还回」的单槽：
+/// - 取：锁内 `take()` 出来立即放锁，查询全程不持锁；槽空（首次，或另一次查询正拿着）
+///   就现开一条——并发查询不排队，最坏退化成改前的每次开库；
+/// - 还：查询成功、且期间账本没被删库重建过（`LEDGER_EPOCH` 未变）才放回，槽里已有
+///   别的就丢掉这条。
+///
+/// 锁只护着一次 `Option` 的换手，不存在锁竞争。
+static QUERY_CONN: Mutex<Option<CachedLedger>> = Mutex::new(None);
+
+/// 账本被删库重建的代次。重建前 +1，取出 / 还回时代次对不上的连接一律丢弃：Unix 上
+/// 旧连接会一直读已 unlink 的旧文件；Windows 上它握着的句柄会让删文件失败。
+static LEDGER_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+struct CachedLedger {
+    db_path: PathBuf,
+    epoch: u64,
+    ledger: Ledger,
+}
+
+fn query_slot() -> std::sync::MutexGuard<'static, Option<CachedLedger>> {
+    // 槽内只有一次换手，中毒不代表状态损坏
+    QUERY_CONN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 取一条查询连接：槽里有同一账本、同一代次的就复用，否则现开。
+fn checkout_query_ledger(db_path: &Path) -> Result<CachedLedger, String> {
+    // 代次要在开库**之前**读：开库期间若被别处重建，这条新连接还回时会被丢弃，
+    // 而不是把可能指向旧文件的连接留在槽里
+    let epoch = LEDGER_EPOCH.load(Ordering::SeqCst);
+    let cached = query_slot().take();
+    if let Some(c) = cached.filter(|c| c.db_path == db_path && c.epoch == epoch) {
+        return Ok(c);
+    }
+    Ok(CachedLedger {
+        db_path: db_path.to_path_buf(),
+        epoch,
+        ledger: Ledger::open(db_path)?,
+    })
+}
+
+/// 查询成功后还回连接（代次对不上、或槽已被别的连接占了，就直接关掉这条）。
+fn checkin_query_ledger(conn: CachedLedger) {
+    if conn.epoch != LEDGER_EPOCH.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut slot = query_slot();
+    if slot.is_none() {
+        *slot = Some(conn);
+    }
+}
 
 /// 同步触发的合并语义：任何触发先置 pending 再取锁。
 /// - `blocking = false`（定时 / 打开面板的后台触发）：抢不到锁立即返回 false，
@@ -157,6 +256,10 @@ impl Ledger {
         match Self::open_raw(db_path) {
             Ok(conn) => Ok(Self { conn }),
             Err(first_err) if is_corruption(&first_err) => {
+                // 先作废查询连接缓存：闲在槽里的那条握着文件句柄（Windows 上会让下面的
+                // 删除失败），正被别的查询拿着的那条还回时按代次对不上丢弃
+                LEDGER_EPOCH.fetch_add(1, Ordering::SeqCst);
+                drop(query_slot().take());
                 for suffix in ["", "-wal", "-shm"] {
                     let mut p = db_path.as_os_str().to_owned();
                     p.push(suffix);
@@ -197,22 +300,53 @@ impl Ledger {
             }
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        // 版本不匹配（含旧库）→ 删表重建，空 sync_state 触发 backfill。
-        // IMMEDIATE 事务先取写锁再复读版本：并发打开（查询命令 vs 后台同步）
-        // 只有一个连接执行重建，后到者拿到锁后读到新版本直接跳过——否则会把
-        // 对方刚建好、甚至已开始回填的新表再 DROP 一遍
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // 版本已是当前版本（绝大多数打开）：直接用，不开写事务、不跑 DDL。以前每次
+        // 打开都 BEGIN IMMEDIATE 再跑一遍 CREATE IF NOT EXISTS——同步正在写库时，
+        // 连只读的查询也得排队等写锁（最长 busy_timeout 5s）
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != SCHEMA_VERSION {
+            Self::migrate(&mut conn)?;
+        }
+        Ok(conn)
+    }
+
+    /// 版本不匹配（新库 / 旧库 / 别的版本写过的库）时持写锁迁移：
+    /// - v3：就地加列回填（`migrate_v3_to_v4`），sync_state 保留，不触发 backfill；
+    ///   万一失败（表结构不是预期的 v3）退回删表重建；
+    /// - 其余：删表重建，空 sync_state 触发 backfill。
+    ///
+    /// IMMEDIATE 事务先取写锁再复读版本：并发打开（查询命令 vs 后台同步）
+    /// 只有一个连接执行迁移，后到者拿到锁后读到新版本直接跳过——否则会把
+    /// 对方刚建好、甚至已开始回填的新表再 DROP 一遍
+    fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+        let mut tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let migrated_in_place = version == 3 && {
+            // 放在 savepoint 里：失败只回滚这一段，外层事务照常走删表重建
+            let sp = tx.savepoint()?;
+            match migrate_v3_to_v4(&sp) {
+                Ok(()) => {
+                    sp.commit()?;
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[usage_stats] 账本 v3→v4 就地迁移失败，改为重建: {e}");
+                    false
+                }
+            }
+        };
+        if !migrated_in_place {
             tx.execute_batch(
                 "DROP TABLE IF EXISTS turns; DROP TABLE IF EXISTS sessions;
                  DROP TABLE IF EXISTS tool_events; DROP TABLE IF EXISTS sync_state;",
             )?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         }
         tx.execute_batch(SCHEMA)?;
-        tx.commit()?;
-        Ok(conn)
+        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        tx.commit()
     }
 
     /// sync_state 为空 = 账本新建（或损坏重建）→ 本轮同步是 backfill，要发进度。
@@ -271,13 +405,15 @@ impl Ledger {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO turns(session_id, request_id, message_id, ts_ms, model,
-                                   input, output, reasoning, cache_read, cache_write, cache_write_1h)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                   input, output, reasoning, cache_read, cache_write, cache_write_1h,
+                                   eff_ts_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(session_id, request_id) DO UPDATE SET
                    message_id = excluded.message_id, ts_ms = excluded.ts_ms,
                    model = excluded.model, input = excluded.input, output = excluded.output,
                    reasoning = excluded.reasoning, cache_read = excluded.cache_read,
-                   cache_write = excluded.cache_write, cache_write_1h = excluded.cache_write_1h",
+                   cache_write = excluded.cache_write, cache_write_1h = excluded.cache_write_1h,
+                   eff_ts_ms = excluded.eff_ts_ms",
             )?;
             for (i, t) in s.turns.iter().enumerate() {
                 // turn 身份规则（设计 §1.1）：会话内 Claude 按 message id、无 id /
@@ -303,6 +439,8 @@ impl Ledger {
                     t.usage.cache_read as i64,
                     t.usage.cache_write as i64,
                     t.usage.cache_write_1h as i64,
+                    // 有效时刻：缺时间戳回退会话 mtime（会话行在本事务开头刚写入）
+                    t.timestamp_ms.unwrap_or(s.mtime_ms),
                 ])?;
             }
         }
@@ -316,8 +454,8 @@ impl Ledger {
         tx.execute("DELETE FROM tool_events WHERE session_id = ?1", params![s.session_id])?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO tool_events(session_id, seq, kind, name, ts_ms, dedup_key)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO tool_events(session_id, seq, kind, name, ts_ms, dedup_key, eff_ts_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (i, u) in s.tool_uses.iter().enumerate() {
                 stmt.execute(params![
@@ -327,6 +465,7 @@ impl Ledger {
                     u.name,
                     u.timestamp_ms,
                     u.dedup_key,
+                    u.timestamp_ms.unwrap_or(s.mtime_ms),
                 ])?;
             }
         }
@@ -336,7 +475,9 @@ impl Ledger {
 
     /// 按窗口/agent 查 turns+sessions，组回 ParsedSession（喂现有 Aggregator，
     /// UsageStatsPayload 形状不变）。窗口判定与聚合层同口径：turn 缺时间戳回退
-    /// session.mtime_ms。项目 scope 过滤在命令层（需要 normalize，SQL 不好做）。
+    /// session.mtime_ms——写入时已算进 `eff_ts_ms`，窗口过滤走 (session_id, eff_ts_ms)
+    /// 索引，只读窗口内的行（计划见 [`TURNS_IN_WINDOW_SQL`]）。
+    /// 项目 scope 过滤在命令层（需要 normalize，SQL 不好做）。
     fn query_sessions(
         &self,
         agents: AgentFilter,
@@ -349,16 +490,7 @@ impl Ledger {
             AgentFilter::Codex => Some("codex"),
             AgentFilter::Grok => Some("grok"),
         };
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT t.session_id, t.ts_ms, t.model,
-                    t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
-                    s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id
-             FROM turns t JOIN sessions s ON s.session_id = t.session_id
-             WHERE COALESCE(t.ts_ms, s.mtime_ms) >= ?1
-               AND COALESCE(t.ts_ms, s.mtime_ms) <= ?2
-               AND (?3 IS NULL OR s.agent = ?3)
-             ORDER BY t.session_id, t.rowid",
-        )?;
+        let mut stmt = self.conn.prepare_cached(TURNS_IN_WINDOW_SQL)?;
         let mut sessions: Vec<ParsedSession> = Vec::new();
         let mut rows = stmt.query(params![since_ms, until_ms.unwrap_or(i64::MAX), agent_str])?;
         while let Some(row) = rows.next()? {
@@ -404,15 +536,7 @@ impl Ledger {
             .enumerate()
             .map(|(i, s)| (s.session_id.clone(), i))
             .collect();
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT te.session_id, te.kind, te.name, te.ts_ms, te.dedup_key,
-                    s.agent, s.cwd, s.title, s.provider, s.mtime_ms
-             FROM tool_events te JOIN sessions s ON s.session_id = te.session_id
-             WHERE COALESCE(te.ts_ms, s.mtime_ms) >= ?1
-               AND COALESCE(te.ts_ms, s.mtime_ms) <= ?2
-               AND (?3 IS NULL OR s.agent = ?3)
-             ORDER BY te.session_id, te.seq",
-        )?;
+        let mut stmt = self.conn.prepare_cached(TOOL_EVENTS_IN_WINDOW_SQL)?;
         let mut rows = stmt.query(params![since_ms, until_ms.unwrap_or(i64::MAX), agent_str])?;
         while let Some(row) = rows.next()? {
             let session_id: String = row.get(0)?;
@@ -449,6 +573,23 @@ impl Ledger {
         }
         Ok(sessions)
     }
+}
+
+/// v3 → v4 就地迁移：turns / tool_events 各加一列 `eff_ts_ms` 并一次回填存量行（索引
+/// 随后由 SCHEMA 的 CREATE INDEX IF NOT EXISTS 建出）。回填口径与写入路径同一个：
+/// COALESCE(ts_ms, 所属会话 mtime_ms)；没有会话行的孤儿行回填成什么都无所谓——查询
+/// 仍 JOIN sessions，与旧查询一样把它们挡在外面。旧的 ts_ms 索引只服务于旧查询，一并删掉。
+fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE turns ADD COLUMN eff_ts_ms INTEGER;
+         UPDATE turns SET eff_ts_ms = COALESCE(ts_ms,
+           (SELECT s.mtime_ms FROM sessions s WHERE s.session_id = turns.session_id));
+         ALTER TABLE tool_events ADD COLUMN eff_ts_ms INTEGER;
+         UPDATE tool_events SET eff_ts_ms = COALESCE(ts_ms,
+           (SELECT s.mtime_ms FROM sessions s WHERE s.session_id = tool_events.session_id));
+         DROP INDEX IF EXISTS idx_turns_ts;
+         DROP INDEX IF EXISTS idx_tool_events_ts;",
+    )
 }
 
 /// 判定 rusqlite 错误是否为数据库文件本体损坏（可安全删除重建的唯一情形）。
@@ -496,7 +637,7 @@ pub fn ledger_db_path(app_data_dir: &Path) -> Result<PathBuf, String> {
 /// 原本是 `async` 命令（Tauri v2 的同步命令跑在主线程，而打开连接可能等
 /// busy_timeout，落主线程会把窗口冻住）。单进程下没有 IPC 命令这一层，函数
 /// 本身是毫秒级的纯查询，改回同步；**调用方仍不应在 UI 线程上直接调它**——
-/// busy_timeout 最长 5s 的等待依旧存在。
+/// 连接平时复用（`QUERY_CONN`），但首次开库、撞版迁移仍可能等 busy_timeout 最长 5s。
 pub fn usage_ledger_query(
     app_data_dir: &Path,
     agents: AgentFilter,
@@ -508,10 +649,15 @@ pub fn usage_ledger_query(
     hourly: bool,
     pricing: HashMap<String, ModelPrice>,
 ) -> Result<UsageStatsPayload, String> {
-    let ledger = Ledger::open(&ledger_db_path(app_data_dir)?)?;
-    let sessions = ledger
-        .query_sessions(agents, since_ms, until_ms)
-        .map_err(|e| format!("账本查询失败: {e}"))?;
+    let cached = checkout_query_ledger(&ledger_db_path(app_data_dir)?)?;
+    let sessions = match cached.ledger.query_sessions(agents, since_ms, until_ms) {
+        Ok(sessions) => {
+            checkin_query_ledger(cached);
+            sessions
+        }
+        // 出错的连接不还回：下次现开，损坏之类由 Ledger::open 的重建路径接手
+        Err(e) => return Err(format!("账本查询失败: {e}")),
+    };
 
     let home = dirs::home_dir().ok_or("无法获取 home 目录")?;
     let resolver = ProviderResolver::new(&home);
@@ -993,6 +1139,8 @@ mod tests {
 
     #[test]
     fn corrupted_db_is_rebuilt() {
+        // 重建会作废全局的查询连接槽,与复用测试串行
+        let _serial = CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = temp_root("corrupt");
         let db = root.join("usage.db");
         fs::write(&db, "definitely not a sqlite file").unwrap();
@@ -1073,6 +1221,798 @@ mod tests {
         let ran = run_coalesced(&lock, &pending, false, || ran_round = true);
         assert!(ran, "panic 中毒后的锁必须可恢复，触发不得静默失效");
         assert!(ran_round, "恢复后本轮 round 必须实际执行");
+    }
+
+    // ── 时间窗过滤对照:查询条件改走索引前后,结果必须逐条一致 ──
+
+    /// 毫秒时刻 → RFC3339(带毫秒),造边界数据用。
+    fn rfc3339(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    /// 缺 timestamp 字段的 assistant 行:窗口判定回退会话 mtime。
+    fn claude_line_no_ts(id: &str, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","cwd":"/p/alpha","message":{{"id":"{id}","model":"claude-opus-4-8","usage":{{"input_tokens":10,"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    fn claude_bash_line_no_ts(toolu: &str, cmd: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","cwd":"/p/alpha","message":{{"id":"mt-{toolu}","model":"claude-opus-4-8","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"tool_use","id":"{toolu}","name":"Bash","input":{{"command":"{cmd}"}}}}]}}}}"#
+        )
+    }
+
+    /// 写文件后把 mtime 钉到给定毫秒(会话 mtime 即回退时刻)。
+    fn write_with_mtime(path: &Path, lines: &[String], mtime_ms: i64) {
+        fs::write(path, lines.join("\n") + "\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(mtime_ms as u64))
+            .unwrap();
+    }
+
+    /// 查询结果的可比较签名:会话顺序 + 每会话 turn / 工具事件的字段与顺序。
+    type TurnSig = (Option<i64>, Option<String>, u64, u64, Option<String>);
+    type ToolSig = (&'static str, String, Option<i64>, Option<String>);
+    type SessionSig = (String, &'static str, i64, Vec<TurnSig>, Vec<ToolSig>);
+
+    fn signature(sessions: &[ParsedSession]) -> Vec<SessionSig> {
+        sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.agent,
+                    s.mtime_ms,
+                    s.turns
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.timestamp_ms,
+                                t.model.clone(),
+                                t.usage.input,
+                                t.usage.output,
+                                t.message_id.clone(),
+                            )
+                        })
+                        .collect(),
+                    s.tool_uses
+                        .iter()
+                        .map(|u| (u.kind, u.name.clone(), u.timestamp_ms, u.dedup_key.clone()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// 参照实现:直接读三张表的原始行,在 Rust 里按「缺时间戳回退会话 mtime」过滤,
+    /// 再按 query_sessions 的组装规则拼回(先 turns 按 session_id,rowid;再工具事件
+    /// 按 session_id,seq,只有工具事件的会话追加在末尾)。不经过任何 WHERE 子句,
+    /// 用来把查询语义钉死——改查询条件前后都必须与它逐条一致。
+    fn reference_query(
+        ledger: &Ledger,
+        agent: Option<&str>,
+        since: i64,
+        until: Option<i64>,
+    ) -> Vec<SessionSig> {
+        let until = until.unwrap_or(i64::MAX);
+        let conn = &ledger.conn;
+        let mut meta: HashMap<String, (String, i64)> = HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT session_id, agent, mtime_ms FROM sessions")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            meta.insert(r.get(0).unwrap(), (r.get(1).unwrap(), r.get(2).unwrap()));
+        }
+        drop(rows);
+        let keep = |sid: &str, ts: Option<i64>| -> Option<(&'static str, i64)> {
+            let (ag, mtime) = meta.get(sid)?; // JOIN 语义:孤儿行不出现
+            if agent.is_some_and(|a| a != ag) {
+                return None;
+            }
+            let eff = ts.unwrap_or(*mtime);
+            (since..=until)
+                .contains(&eff)
+                .then(|| (crate::agent_from_db(ag), *mtime))
+        };
+
+        let mut out: Vec<SessionSig> = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, ts_ms, model, input, output, message_id FROM turns
+                 ORDER BY session_id, rowid",
+            )
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let sid: String = r.get(0).unwrap();
+            let ts: Option<i64> = r.get(1).unwrap();
+            let Some((ag, mtime)) = keep(&sid, ts) else {
+                continue;
+            };
+            if out.last().map(|s| s.0.as_str()) != Some(sid.as_str()) {
+                out.push((sid.clone(), ag, mtime, Vec::new(), Vec::new()));
+            }
+            out.last_mut().unwrap().3.push((
+                ts,
+                r.get(2).unwrap(),
+                r.get::<_, i64>(3).unwrap() as u64,
+                r.get::<_, i64>(4).unwrap() as u64,
+                r.get(5).unwrap(),
+            ));
+        }
+        drop(rows);
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, kind, name, ts_ms, dedup_key FROM tool_events
+                 ORDER BY session_id, seq",
+            )
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let sid: String = r.get(0).unwrap();
+            let ts: Option<i64> = r.get(3).unwrap();
+            let Some((ag, mtime)) = keep(&sid, ts) else {
+                continue;
+            };
+            let i = match out.iter().position(|s| s.0 == sid) {
+                Some(i) => i,
+                None => {
+                    out.push((sid.clone(), ag, mtime, Vec::new(), Vec::new()));
+                    out.len() - 1
+                }
+            };
+            let kind: String = r.get(1).unwrap();
+            let kind = match kind.as_str() {
+                "shell" => "shell",
+                "mcp" => "mcp",
+                _ => "tool",
+            };
+            out[i]
+                .4
+                .push((kind, r.get(2).unwrap(), ts, r.get(4).unwrap()));
+        }
+        out
+    }
+
+    /// 混合数据:有时间戳的 / 缺时间戳靠会话 mtime 的 / 恰落在窗口两侧边界上的 /
+    /// 边界外 1ms 的 / 只有工具事件的会话 / 另一个 agent 的会话。
+    fn mixed_window_fixture(tag: &str) -> (PathBuf, Ledger, i64, i64) {
+        let root = temp_root(tag);
+        // 窗口 [t0, t1];codex_lines 的两条 token_count 恰好落在 t0 与 t1 上
+        let t0 = turns::parse_rfc3339_ms("2026-08-01T10:00:00Z").unwrap();
+        let t1 = t0 + 3_600_000;
+        let a = root.join("s-a.jsonl");
+        write_with_mtime(
+            &a,
+            &[
+                claude_line("a1", &rfc3339(t0), 11),
+                claude_line("a2", &rfc3339(t0 - 1), 12),
+                claude_line("a3", &rfc3339(t1), 13),
+                claude_line("a4", &rfc3339(t1 + 1), 14),
+                claude_line_no_ts("a5", 15),
+                claude_bash_line("toolu_a1", &rfc3339(t0 - 1), "git status"),
+                claude_bash_line_no_ts("toolu_a2", "ls"),
+            ],
+            t0 + 1_800_000,
+        );
+        // 全部缺时间戳,会话 mtime 恰在左边界
+        let b = root.join("s-b.jsonl");
+        write_with_mtime(
+            &b,
+            &[claude_line_no_ts("b1", 21), claude_line_no_ts("b2", 22)],
+            t0,
+        );
+        // 会话 mtime 在右边界外 1ms,但有一条带时间戳的在窗口内
+        let c = root.join("s-c.jsonl");
+        write_with_mtime(
+            &c,
+            &[
+                claude_line_no_ts("c1", 31),
+                claude_line("c2", &rfc3339(t0 + 600_000), 32),
+            ],
+            t1 + 1,
+        );
+        // 只有工具事件(无计费 turn)、缺时间戳,mtime 恰在右边界
+        let d = root.join("s-d.jsonl");
+        write_with_mtime(&d, &[claude_bash_line_no_ts("toolu_d1", "cargo test")], t1);
+        let codex = root.join("rollout-e.jsonl");
+        fs::write(&codex, codex_lines("sess-e")).unwrap();
+
+        let names = HashMap::new();
+        let mut ledger = Ledger::open(&root.join("usage.db")).unwrap();
+        for main in [a, b, c, d] {
+            assert!(
+                ledger
+                    .sync_job(
+                        &SessionJob::Claude {
+                            main,
+                            subagents: vec![]
+                        },
+                        &names
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            ledger
+                .sync_job(&SessionJob::Codex { path: codex }, &names)
+                .unwrap()
+        );
+        (root, ledger, t0, t1)
+    }
+
+    fn fixture_windows(t0: i64, t1: i64) -> Vec<(i64, Option<i64>)> {
+        vec![
+            (0, None),
+            (t0, Some(t1)),
+            (t0 + 1, Some(t1 - 1)),
+            (t0 - 1, Some(t0)),
+            (t1, Some(t1)),
+            (t1 + 1, None),
+            (t0, None),
+            (0, Some(t0 - 1)),
+        ]
+    }
+
+    #[test]
+    fn window_filter_matches_reference_semantics() {
+        let (root, ledger, t0, t1) = mixed_window_fixture("window");
+        let agents = [
+            (AgentFilter::All, None),
+            (AgentFilter::Claude, Some("claude")),
+            (AgentFilter::Codex, Some("codex")),
+        ];
+        for (since, until) in fixture_windows(t0, t1) {
+            for (filter, agent) in agents {
+                let got = signature(&ledger.query_sessions(filter, since, until).unwrap());
+                let want = reference_query(&ledger, agent, since, until);
+                assert_eq!(got, want, "窗口 [{since}, {until:?}] agent={agent:?}");
+            }
+        }
+
+        // 参照实现不能是空转:闭区间 [t0, t1] 下逐项核对边界取舍
+        let got = signature(
+            &ledger
+                .query_sessions(AgentFilter::All, t0, Some(t1))
+                .unwrap(),
+        );
+        let ids = |sid: &str| -> Vec<String> {
+            got.iter()
+                .find(|s| s.0 == sid)
+                .map(|s| s.3.iter().filter_map(|t| t.4.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            ids("s-a"),
+            ["a1", "a3", "a5"],
+            "左右边界含、边界外 1ms 不含、缺时间戳回退 mtime"
+        );
+        assert_eq!(ids("s-b"), ["b1", "b2"], "会话 mtime 恰在左边界");
+        assert_eq!(ids("s-c"), ["c2"], "会话 mtime 在窗外时只剩带时间戳的那条");
+        let d = got
+            .iter()
+            .find(|s| s.0 == "s-d")
+            .expect("只有工具事件的会话也要查回");
+        assert!(d.3.is_empty() && d.4.len() == 2);
+        let e = got
+            .iter()
+            .find(|s| s.0 == "sess-e")
+            .expect("codex 两条 token_count 恰在两侧边界");
+        assert_eq!(e.3.len(), 2);
+        let a = got.iter().find(|s| s.0 == "s-a").unwrap();
+        assert_eq!(
+            a.4.iter().map(|u| u.3.clone().unwrap()).collect::<Vec<_>>(),
+            ["toolu_a2", "toolu_a2#s"],
+            "边界外 1ms 的工具事件不含,缺时间戳的回退 mtime 入窗"
+        );
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 改前的两条窗口查询原文(条件现算 COALESCE,用不上索引),对照用。
+    const LEGACY_TURNS_SQL: &str = "
+        SELECT t.session_id, t.ts_ms, t.model,
+               t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
+               s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id
+        FROM turns t JOIN sessions s ON s.session_id = t.session_id
+        WHERE COALESCE(t.ts_ms, s.mtime_ms) >= ?1
+          AND COALESCE(t.ts_ms, s.mtime_ms) <= ?2
+          AND (?3 IS NULL OR s.agent = ?3)
+        ORDER BY t.session_id, t.rowid";
+    const LEGACY_TOOL_EVENTS_SQL: &str = "
+        SELECT te.session_id, te.kind, te.name, te.ts_ms, te.dedup_key,
+               s.agent, s.cwd, s.title, s.provider, s.mtime_ms
+        FROM tool_events te JOIN sessions s ON s.session_id = te.session_id
+        WHERE COALESCE(te.ts_ms, s.mtime_ms) >= ?1
+          AND COALESCE(te.ts_ms, s.mtime_ms) <= ?2
+          AND (?3 IS NULL OR s.agent = ?3)
+        ORDER BY te.session_id, te.seq";
+
+    /// v3 账本的原样 schema(改前的 SCHEMA),造存量库用。
+    const V3_SCHEMA: &str = "
+        CREATE TABLE sessions (
+          session_id TEXT PRIMARY KEY, agent TEXT NOT NULL, cwd TEXT, title TEXT,
+          provider TEXT, file_path TEXT NOT NULL, mtime_ms INTEGER NOT NULL);
+        CREATE TABLE turns (
+          session_id TEXT NOT NULL, request_id TEXT NOT NULL, message_id TEXT, ts_ms INTEGER,
+          model TEXT, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
+          reasoning INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0,
+          cache_write INTEGER NOT NULL DEFAULT 0, cache_write_1h INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (session_id, request_id));
+        CREATE INDEX idx_turns_ts ON turns(ts_ms);
+        CREATE TABLE tool_events (
+          session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+          ts_ms INTEGER, dedup_key TEXT, PRIMARY KEY (session_id, seq));
+        CREATE INDEX idx_tool_events_ts ON tool_events(ts_ms);
+        CREATE TABLE sync_state (
+          file_path TEXT PRIMARY KEY, mtime_ms INTEGER NOT NULL, size INTEGER NOT NULL);
+        PRAGMA user_version = 3;";
+
+    type RawRows = Vec<Vec<rusqlite::types::Value>>;
+
+    fn raw_rows(
+        conn: &Connection,
+        sql: &str,
+        since: i64,
+        until: Option<i64>,
+        agent: Option<&str>,
+    ) -> RawRows {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        let mut rows = stmt
+            .query(params![since, until.unwrap_or(i64::MAX), agent])
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            out.push(
+                (0..n)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i).unwrap())
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    /// 全部窗口 × agent 组合下,两条查询各自的原始行。
+    fn all_window_rows(
+        conn: &Connection,
+        turns_sql: &str,
+        tools_sql: &str,
+        t0: i64,
+        t1: i64,
+    ) -> Vec<(RawRows, RawRows)> {
+        let mut out = Vec::new();
+        for (since, until) in fixture_windows(t0, t1) {
+            for agent in [None, Some("claude"), Some("codex")] {
+                out.push((
+                    raw_rows(conn, turns_sql, since, until, agent),
+                    raw_rows(conn, tools_sql, since, until, agent),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn window_filter_matches_legacy_sql_row_by_row() {
+        let (root, ledger, t0, t1) = mixed_window_fixture("legacy");
+        let legacy = all_window_rows(
+            &ledger.conn,
+            LEGACY_TURNS_SQL,
+            LEGACY_TOOL_EVENTS_SQL,
+            t0,
+            t1,
+        );
+        let current = all_window_rows(
+            &ledger.conn,
+            TURNS_IN_WINDOW_SQL,
+            TOOL_EVENTS_IN_WINDOW_SQL,
+            t0,
+            t1,
+        );
+        assert!(
+            legacy.iter().any(|(t, e)| !t.is_empty() && !e.is_empty()),
+            "对照数据不能是空集"
+        );
+        assert_eq!(
+            current, legacy,
+            "改走 eff_ts_ms 后,每个窗口的每一行都必须与改前一致"
+        );
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 存量 v3 账本就地迁移:加列 + 一次回填,sync_state 保留(不触发全量重解析),
+    /// 迁移后的新查询与迁移前旧库上的旧查询逐行一致。
+    #[test]
+    fn v3_ledger_migrates_in_place_with_backfill() {
+        let (src_root, src, t0, t1) = mixed_window_fixture("v3src");
+        drop(src);
+        let root = temp_root("v3");
+        let db = root.join("usage.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(V3_SCHEMA).unwrap();
+            conn.execute(
+                "ATTACH DATABASE ?1 AS src",
+                [src_root.join("usage.db").to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO sessions SELECT * FROM src.sessions;
+                 INSERT INTO turns SELECT session_id, request_id, message_id, ts_ms, model, input,
+                   output, reasoning, cache_read, cache_write, cache_write_1h
+                   FROM src.turns ORDER BY rowid;
+                 INSERT INTO tool_events SELECT session_id, seq, kind, name, ts_ms, dedup_key
+                   FROM src.tool_events ORDER BY rowid;
+                 INSERT INTO sync_state SELECT * FROM src.sync_state;
+                 DETACH DATABASE src;
+                 -- 孤儿行(会话行缺失):旧查询 JOIN 掉,迁移后也不得冒出来
+                 INSERT INTO turns(session_id, request_id, ts_ms, input) VALUES
+                   ('ghost', 'g1', NULL, 5), ('ghost', 'g2', 0, 5);",
+            )
+            .unwrap();
+        }
+        // 改前:旧查询跑在旧库上
+        let before = {
+            let conn = Connection::open(&db).unwrap();
+            all_window_rows(&conn, LEGACY_TURNS_SQL, LEGACY_TOOL_EVENTS_SQL, t0, t1)
+        };
+
+        let ledger = Ledger::open(&db).unwrap();
+        let version: i64 = ledger
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            !ledger.sync_state_empty().unwrap(),
+            "就地迁移保留 sync_state,不触发全量 backfill"
+        );
+        for table in ["turns", "tool_events"] {
+            let off: i64 = ledger
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} x JOIN sessions s USING(session_id)
+                         WHERE x.eff_ts_ms IS NOT COALESCE(x.ts_ms, s.mtime_ms)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                off, 0,
+                "{table}.eff_ts_ms 回填口径必须是 COALESCE(ts_ms, 会话 mtime)"
+            );
+        }
+        let indexes: Vec<String> = ledger
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            indexes,
+            ["idx_tool_events_sid_eff", "idx_turns_sid_eff"],
+            "旧 ts_ms 索引删掉、新索引建上"
+        );
+
+        let after = all_window_rows(
+            &ledger.conn,
+            TURNS_IN_WINDOW_SQL,
+            TOOL_EVENTS_IN_WINDOW_SQL,
+            t0,
+            t1,
+        );
+        assert_eq!(after, before, "迁移后的查询结果必须与迁移前逐行一致");
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&src_root).ok();
+    }
+
+    /// 标着 v3 但表结构不对(就地迁移会失败):退回删表重建,不能把账本卡死在打不开。
+    #[test]
+    fn broken_v3_ledger_falls_back_to_rebuild() {
+        let root = temp_root("badv3");
+        let db = root.join("usage.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sync_state (file_path TEXT PRIMARY KEY, mtime_ms INTEGER NOT NULL, size INTEGER NOT NULL);
+                 INSERT INTO sync_state VALUES('x', 1, 1);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let ledger = Ledger::open(&db).expect("就地迁移失败必须退回重建");
+        assert!(
+            ledger.sync_state_empty().unwrap(),
+            "重建后空 sync_state 触发 backfill"
+        );
+        let version: i64 = ledger
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 版本已匹配时开库不开写事务:同步正拿着写锁时,查询照样秒开秒查,不等 busy_timeout。
+    #[test]
+    fn open_at_current_version_does_not_take_write_lock() {
+        let root = temp_root("nolock");
+        let db = root.join("usage.db");
+        drop(Ledger::open(&db).unwrap());
+        // 另一条连接(模拟正在写库的同步)拿着写锁不放
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO sync_state VALUES('w', 1, 1);")
+            .unwrap();
+        let started = Instant::now();
+        let ledger = Ledger::open(&db).expect("版本匹配时开库不该去抢写锁");
+        assert!(
+            ledger
+                .query_sessions(AgentFilter::All, 0, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "不该排队等写锁: {:?}",
+            started.elapsed()
+        );
+        writer.execute_batch("ROLLBACK;").unwrap();
+        drop(ledger);
+        drop(writer);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params![0i64, i64::MAX, Option::<String>::None], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// 窗口查询必须按 (session_id, eff_ts_ms) 索引 seek 时间区间,且不做整体排序
+    /// (没有 ANALYZE 统计,计划与表的大小无关,小库上钉住即可)。
+    #[test]
+    fn query_plans_use_eff_ts_indexes() {
+        let (root, ledger, _, _) = mixed_window_fixture("plan");
+        let turns = query_plan(&ledger.conn, TURNS_IN_WINDOW_SQL);
+        let tools = query_plan(&ledger.conn, TOOL_EVENTS_IN_WINDOW_SQL);
+        let legacy = query_plan(&ledger.conn, LEGACY_TURNS_SQL);
+        eprintln!("[plan] turns       : {turns:?}");
+        eprintln!("[plan] tool_events : {tools:?}");
+        eprintln!("[plan] 改前 turns  : {legacy:?}");
+        let seek = |plan: &[String], index: &str| {
+            plan.iter().any(|d| {
+                d.contains(&format!(
+                    "USING INDEX {index} (session_id=? AND eff_ts_ms>? AND eff_ts_ms<?)"
+                ))
+            })
+        };
+        assert!(seek(&turns, "idx_turns_sid_eff"), "{turns:?}");
+        assert!(seek(&tools, "idx_tool_events_sid_eff"), "{tools:?}");
+        for plan in [&turns, &tools] {
+            assert!(
+                plan[0].starts_with("SCAN s"),
+                "外层按会话顺序扫 sessions: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d == "USE TEMP B-TREE FOR ORDER BY"),
+                "不得整体排序: {plan:?}"
+            );
+        }
+        assert!(
+            !legacy.iter().any(|d| d.contains("eff_ts_ms>?")),
+            "对照:旧条件用不上时间区间 seek"
+        );
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 查询连接槽与删库重建的代次是进程级全局状态:碰它们的测试串行跑。
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn query_connection_is_reused_until_ledger_rebuilt() {
+        let _serial = CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = temp_root("reuse");
+        let db = ledger_db_path(&root).unwrap();
+        let query = || {
+            usage_ledger_query(
+                &root,
+                AgentFilter::All,
+                0,
+                None,
+                None,
+                0,
+                None,
+                false,
+                HashMap::new(),
+            )
+            .unwrap();
+        };
+        // 临时表只活在建它的那条连接上:有它 = 还是同一条连接
+        let mark = || {
+            let slot = query_slot();
+            let cached = slot.as_ref().expect("查询成功后连接应还回槽里");
+            cached
+                .ledger
+                .conn
+                .execute_batch("CREATE TEMP TABLE reuse_marker(x)")
+                .unwrap();
+        };
+        let marked = || -> Option<bool> {
+            let slot = query_slot();
+            let cached = slot.as_ref().filter(|c| c.db_path == db)?;
+            let n: i64 = cached
+                .ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'reuse_marker'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            Some(n == 1)
+        };
+
+        query();
+        mark();
+        query();
+        assert_eq!(marked(), Some(true), "第二次查询复用同一条连接");
+
+        // 并发查询:槽里的连接正被拿着时现开一条,不排队;还回时槽已有就丢掉
+        let taken = checkout_query_ledger(&db).unwrap();
+        assert!(query_slot().is_none());
+        query();
+        assert_eq!(marked(), Some(false), "槽空时现开一条");
+        checkin_query_ledger(taken);
+        assert_eq!(marked(), Some(false), "槽已被占,还回的那条直接关掉");
+
+        // 删库重建(代次 +1)之后,槽里的旧连接不再复用
+        mark();
+        LEDGER_EPOCH.fetch_add(1, Ordering::SeqCst);
+        query();
+        assert_eq!(marked(), Some(false), "代次变了必须换新连接");
+
+        drop(query_slot().take());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 度量:10 万条 turns 下开库与按时间窗查询的耗时(改前改后对比用)。
+    /// `cargo test -p mt-usage --lib -- --ignored ledger_query_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn ledger_query_bench() {
+        let root = temp_root("bench");
+        let db = root.join("usage.db");
+        // 2000 个会话 × 50 条 turn,时间铺满 100 天(每天 20 个会话);
+        // 每个会话第一条缺时间戳,走会话 mtime 回退
+        let day = 86_400_000i64;
+        let base = turns::parse_rfc3339_ms("2026-05-01T00:00:00Z").unwrap();
+        let names = HashMap::new();
+        let mut ledger = Ledger::open(&db).unwrap();
+        let started = Instant::now();
+        for s in 0..2000i64 {
+            let start = base + (s / 20) * day + (s % 20) * 3_600_000;
+            let mut lines = vec![claude_line_no_ts(&format!("s{s}-m0"), 7)];
+            for k in 1..50i64 {
+                lines.push(claude_line(
+                    &format!("s{s}-m{k}"),
+                    &rfc3339(start + k * 60_000),
+                    5 + k as u64,
+                ));
+            }
+            let path = root.join(format!("sess-{s:04}.jsonl"));
+            write_with_mtime(&path, &lines, start + 50 * 60_000);
+            ledger
+                .sync_job(
+                    &SessionJob::Claude {
+                        main: path,
+                        subagents: vec![],
+                    },
+                    &names,
+                )
+                .unwrap();
+        }
+        assert_eq!(turn_count(&ledger), 100_000);
+        eprintln!("[bench] 造数据 {:?}", started.elapsed());
+        drop(ledger);
+
+        fn time(label: &str, n: u32, f: &mut dyn FnMut()) {
+            f(); // 预热
+            let t = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            eprintln!("[bench] {label}: {:?}/次", t.elapsed() / n);
+        }
+        let last = base + 100 * day;
+        time("Ledger::open", 50, &mut || drop(Ledger::open(&db).unwrap()));
+        // 同一轮里的改前对照(机器上别的构建在跑,跨轮数字噪声大):改前的开库每次都
+        // BEGIN IMMEDIATE + 整份 DDL;改前的窗口 SQL 条件现算 COALESCE
+        time("  └ 对照:改前开库路径", 50, &mut || {
+            let mut conn = Connection::open(&db).unwrap();
+            conn.busy_timeout(Duration::from_millis(5000)).unwrap();
+            conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
+                .unwrap();
+            conn.execute_batch("PRAGMA synchronous=NORMAL;").unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap();
+            tx.execute_batch(SCHEMA).unwrap();
+            tx.commit().unwrap();
+        });
+        let ledger = Ledger::open(&db).unwrap();
+        for (label, since) in [
+            ("近 1 天", last - day),
+            ("近 7 天", last - 7 * day),
+            ("近 30 天", last - 30 * day),
+            ("全部", 0),
+        ] {
+            time(&format!("窗口 SQL {label}"), 20, &mut || {
+                raw_rows(&ledger.conn, TURNS_IN_WINDOW_SQL, since, None, None);
+            });
+            time(&format!("  └ 对照:改前 SQL {label}"), 20, &mut || {
+                raw_rows(&ledger.conn, LEGACY_TURNS_SQL, since, None, None);
+            });
+        }
+        for (label, since) in [
+            ("近 1 天", last - day),
+            ("近 7 天", last - 7 * day),
+            ("近 30 天", last - 30 * day),
+            ("全部", 0),
+        ] {
+            let mut n_turns = 0;
+            time(&format!("query_sessions {label}"), 20, &mut || {
+                n_turns = ledger
+                    .query_sessions(AgentFilter::All, since, None)
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.turns.len())
+                    .sum::<usize>();
+            });
+            eprintln!("[bench]   └ 命中 {n_turns} 条 turn");
+        }
+        for (label, since) in [("近 7 天", last - 7 * day), ("全部", 0)] {
+            time(&format!("usage_ledger_query {label}"), 20, &mut || {
+                usage_ledger_query(
+                    &root,
+                    AgentFilter::All,
+                    since,
+                    None,
+                    None,
+                    0,
+                    None,
+                    false,
+                    HashMap::new(),
+                )
+                .unwrap();
+            });
+        }
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

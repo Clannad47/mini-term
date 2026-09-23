@@ -51,8 +51,9 @@ use crate::store::AppStore;
 use crate::ui;
 
 /// 结果上限。与原版 `SearchModal.tsx` 里那两个字面量 1000 同一个数
-/// (超出后只显示前 1000 条并挂一条提示)。
-const MAX_RESULTS: usize = 1000;
+/// (超出后只显示前 1000 条并挂一条提示)。直接取后端的同名常量:后端收满这个数
+/// 就提前收工,两边必须是同一个数。
+const MAX_RESULTS: usize = mt_project::search::MAX_RESULTS;
 
 /// Keep the row alive for the same interval GPUI uses to form `click_count=2`.
 /// Windows exposes a user-configurable threshold; add a small scheduling margin
@@ -96,8 +97,10 @@ pub struct SearchModal {
     use_regex: bool,
     status: Status,
     results: Vec<SearchResultItem>,
-    /// 后端报的**完整**命中数(可能大于 `results.len()`,那正是「已截断」的判据)。
+    /// 后端报的命中数。后端收满 [`MAX_RESULTS`] 条即提前收工,此时它就是上限、
+    /// `truncated` 为真(后面可能还有,状态条显示成「1000+」)。
     total_count: u32,
+    truncated: bool,
     handle: Option<SearchHandle>,
     /// 结果泵。换一次搜索就整个替换 —— 旧任务被丢弃,旧 worker 的结果自然到不了。
     _pump: Option<Task<()>>,
@@ -228,6 +231,7 @@ impl SearchModal {
             status: Status::Idle,
             results: Vec::new(),
             total_count: 0,
+            truncated: false,
             handle: None,
             _pump: None,
             _close_task: None,
@@ -277,6 +281,7 @@ impl SearchModal {
         self._pump = None;
         self.results.clear();
         self.total_count = 0;
+        self.truncated = false;
         self.status = Status::Idle;
         self.search_project = None;
     }
@@ -375,9 +380,14 @@ impl SearchModal {
     fn apply(&mut self, event: SearchEvent) {
         match event {
             SearchEvent::Results(items) => append_capped(&mut self.results, items, MAX_RESULTS),
-            SearchEvent::Complete { total_count, .. } => {
+            SearchEvent::Complete {
+                total_count,
+                truncated,
+                ..
+            } => {
                 self.status = Status::Done;
                 self.total_count = total_count;
+                self.truncated = truncated;
             }
         }
     }
@@ -574,7 +584,21 @@ impl RowMetrics {
 }
 
 /// 底部状态条那一句。四个分支逐条对照原版。
-fn status_text(status: Status, mode: SearchMode, shown: usize, total: u32) -> String {
+///
+/// 与原版的偏差:后端收满上限就提前收工,不再数完整命中数,`truncated` 时总数只是
+/// 下限,显示成「1000+」。
+fn status_text(
+    status: Status,
+    mode: SearchMode,
+    shown: usize,
+    total: u32,
+    truncated: bool,
+) -> String {
+    let total = if truncated {
+        format!("{total}+")
+    } else {
+        total.to_string()
+    };
     match status {
         Status::Searching => tr!("search", "searchingFound", count = shown),
         Status::Done => match mode {
@@ -1057,6 +1081,7 @@ impl Render for SearchModal {
                         self.mode,
                         self.results.len(),
                         self.total_count,
+                        self.truncated,
                     )),
             )
     }
@@ -1215,15 +1240,19 @@ mod tests {
         use mt_i18n::{Locale, set_locale};
         set_locale(Locale::Zh);
 
-        let searching = status_text(Status::Searching, SearchMode::FileName, 42, 0);
+        let searching = status_text(Status::Searching, SearchMode::FileName, 42, 0, false);
         assert!(searching.contains("42"), "{searching}");
 
-        let files = status_text(Status::Done, SearchMode::FileName, 7, 900);
+        let files = status_text(Status::Done, SearchMode::FileName, 7, 900, false);
         assert!(files.contains("900"), "结束态报总数而不是已显示数:{files}");
-        let matches = status_text(Status::Done, SearchMode::FileContent, 7, 900);
+        assert!(!files.contains('+'), "{files}");
+        let matches = status_text(Status::Done, SearchMode::FileContent, 7, 900, false);
         assert_ne!(files, matches, "文件名 / 内容两种模式文案不同");
+        // 后端收满上限提前收工:总数只是下限
+        let capped = status_text(Status::Done, SearchMode::FileContent, 1000, 1000, true);
+        assert!(capped.contains("1000+"), "{capped}");
 
-        let idle = status_text(Status::Idle, SearchMode::FileName, 0, 0);
+        let idle = status_text(Status::Idle, SearchMode::FileName, 0, 0, false);
         assert!(idle.contains(mod_label()), "{idle}");
         assert!(!idle.contains('{'), "占位符没换干净:{idle}");
     }
