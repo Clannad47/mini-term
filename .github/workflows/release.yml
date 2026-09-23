@@ -199,9 +199,16 @@ jobs:
           rustup target add "$MATRIX_TARGET"
           rustc -vV
 
+      # 只读:缓存由 cache-warm.yml 在 main 上预热(tag 运行能恢复 main 作用域的缓存,
+      # tag 之间互相看不见 —— 此前每个 tag 各存一份、从没命中过,还把 10 GB 额度顶满)。
+      # ⚠️ shared-key / workspaces 与 cache-warm.yml 的 release 作业逐字一致,上面装
+      # 工具链的步骤与本 workflow 的 env 也要与那边对齐,否则键对不上。
+      # 手动补建(workflow_dispatch)构建的是旧 tag 的代码,依赖多半对不上,同样不存
       - name: Rust cache
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: release
+          save-if: false
           workspaces: |
             . -> target
             sidecars -> target

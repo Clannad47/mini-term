@@ -1,0 +1,260 @@
+name: Cache warm
+
+# 在 main 上预热 Rust / npm 缓存,给 ci.yml(PR 与 v* tag)和 release.yml(v* tag)恢复用。
+#
+# 为什么要单独一个 workflow:GitHub Actions 的缓存按 ref 隔离,一次运行只能恢复
+# **本 ref** 与**默认分支(main)**上建的缓存。ci.yml / release.yml 只在 tag、PR、手动
+# 时跑(main 推送不跑 CI 是刻意的,见 ci.yml 头部注释),此前缓存全建在各个
+# refs/tags/vX 上 —— tag 之间互相看不见,v1.13.6 与 v1.13.7 键完全相同也照样没命中、
+# 又存了一遍;每轮约 6.6 GB,两轮就顶满仓库 10 GB 额度、互相驱逐。现在:
+# - 只有本 workflow 在 main 上**存**缓存;ci.yml / release.yml 一律 `save-if: false` 只读;
+# - 键由 rust-cache 拼成:prefix-key(默认 v0-rust)+ shared-key + runner OS/arch
+#   + 环境哈希(已装的**全部**工具链的 rustc -vV,加上 CARGO* / CC* / CFLAGS* / CXX* /
+#   CMAKE* / RUST* 环境变量)+ 依赖哈希(rust-toolchain.toml + 各 workspace 成员的
+#   Cargo.toml 规整后 + Cargo.lock 里的注册表包)。所以本文件每个作业的 **workflow 级
+#   env、装工具链的步骤、shared-key、workspaces** 都要与对应的消费方逐字一致,编译命令
+#   也要一致(profile / target / feature 统一范围不同,命中了产物也用不上):
+#
+#   作业          消费方                                 shared-key  workspaces
+#   ci-linux      ci.yml `Rust workspace`                ci          . / sidecars / relay-server
+#   ci-windows    ci.yml `Windows check`                 ci          . / sidecars
+#   release (×4)  release.yml `build-gpui` 四个平台      release     . / sidecars
+#
+#   根 Cargo.toml 与 relay-server/Cargo.toml 是虚拟清单,不参与哈希;成员的 version 被
+#   规整成 0.0.0,Cargo.lock 里的工作区包(没有 source)也被剔掉 —— 发版改版本号不会让
+#   键变。依赖变了键才变;tag 先于这里重建跑到时,rust-cache 退回同前缀(同工具链与
+#   环境)下最新的一份做部分恢复,大部分依赖照样不用重编。
+#   ⚠️ 反过来,只改根 Cargo.toml 的 [profile.*] / [workspace.dependencies] 的 feature、
+#   或改了下面的编译命令时键**不变**,缓存内容不会自动跟上(精确命中就不再保存):
+#   这种时候给三个 workflow 里全部六处 rust-cache 一起加上同一个 prefix-key
+#   (如 v1-rust,默认是 v0-rust)强制换代。
+#
+# 预热范围:release 四个平台全做 —— publish 要等最慢的那个,macos-15-intel 冷编约 40
+# 分钟,正是发版的瓶颈,只做其它平台发版一分钟都快不了。ci 两个作业也做(PR 的必过
+# 检查与 tag 上的 CI)。稳态约 8 GB:release 每平台约 1.1 GB,ci Linux 约 2.2 GB,
+# ci Windows 约 1.6 GB,npm 几十 MB。依赖一变会短暂多出一代,GitHub 超额时按最近访问
+# 时间先淘汰旧的那一代。
+#
+# 触发:
+# - push 到 main 且进键的文件 / 本文件有变。Cargo.lock 每次发版改版本号都会变,所以
+#   发版提交也会触发一次 —— 键没变就是精确命中,各作业只做一次恢复(顺带保活)、跳过
+#   编译,几分钟结束;
+# - 每周一次:保活(7 天没被访问的缓存会被 GitHub 清掉),兼顺带重建 —— runner 镜像
+#   自带的 stable 工具链一升级,环境哈希就变(rust-cache 把 `rustup toolchain list`
+#   里每一个工具链的版本都算进去),消费方会全量不命中直到这里重跑;
+# - workflow_dispatch:手动补一次。只在 main 上有意义(别的分支上建的缓存 tag / PR
+#   都看不见),所以各作业都限定 main。
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'sidecars/Cargo.lock'
+      - 'sidecars/Cargo.toml'
+      - 'relay-server/Cargo.lock'
+      - 'relay-server/*/Cargo.toml'
+      - 'mobile/package-lock.json'
+      - '.github/workflows/cache-warm.yml'
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ⚠️ 与 ci.yml / release.yml 的 workflow 级 env 保持一致(CARGO_ 前缀进环境哈希)
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: cache-warm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 对应 ci.yml 的 `Rust workspace`:check / clippy / test 用到的依赖产物。
+  # clippy 不单独预热 —— 它只对工作区成员换用 clippy-driver,依赖的 check 产物与
+  # `cargo check` 共用,而工作区成员本来就不进缓存
+  ci-linux:
+    name: Warm CI (Linux)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # 与 ci.yml 同一份清单
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libasound2-dev
+
+      - name: Setup Node.js
+        id: node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+
+      - name: Rust cache
+        id: rust-cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          workspaces: |
+            . -> target
+            sidecars -> target
+            relay-server -> target
+
+      # 精确命中 = 这一代已经在了,编了也不会再存,跳过
+      - name: Cargo check
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo check --workspace --all-targets
+          cargo check --manifest-path sidecars/Cargo.toml --all-targets
+
+      - name: Build tests
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo test --workspace --no-run
+          cargo test --manifest-path sidecars/Cargo.toml --no-run
+          cargo test --manifest-path relay-server/Cargo.toml --no-run
+
+      # 只为让 setup-node 的收尾步骤把 ~/.npm 存成 main 作用域的缓存
+      - name: Mobile npm install
+        if: steps.node.outputs.cache-hit != 'true'
+        working-directory: mobile
+        run: npm ci
+
+  # 对应 ci.yml 的 `Windows check`
+  ci-windows:
+    name: Warm CI (Windows)
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+
+      - name: Rust cache
+        id: rust-cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          workspaces: |
+            . -> target
+            sidecars -> target
+
+      - name: Cargo check
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo check --workspace --all-targets
+          cargo check --manifest-path sidecars/Cargo.toml --all-targets
+
+      # `-p` 名单必须与 ci.yml 完全相同(同一个脚本给),否则 feature 统一的结果不同
+      - name: Build tests
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          pkgs="$(node .github/scripts/non_gpui_packages.mjs)"
+          cargo test $pkgs --no-run
+          cargo test --manifest-path sidecars/Cargo.toml --no-run
+
+  # 平台表取自 release_matrix.mjs(与 release.yml 同一份,push 口径 = 全量四条)
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          EVENT_NAME: push
+        run: node .github/scripts/release_matrix.mjs
+
+  # 对应 release.yml 的 `build-gpui`:步骤顺序与编译命令逐条照抄(sidecar 走同一个
+  # stage 脚本,主程序同一条 cargo build),只是不打包、不上传
+  release:
+    name: Warm release (${{ matrix.key }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libasound2-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$MATRIX_TARGET"
+          rustc -vV
+
+      - name: Rust cache
+        id: rust-cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release
+          workspaces: |
+            . -> target
+            sidecars -> target
+
+      - name: Build & stage sidecars
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
+
+      - name: Build GPUI app
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo build --release --package mt-app
