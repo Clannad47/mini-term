@@ -6,7 +6,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 **mini-term** — GPUI 原生桌面终端管理器，支持多项目、多标签、分屏布局，并能感知 AI 进程（Claude/Codex/Grok 等）状态；带移动端中转镜像与 SSH 远程项目能力。
 
-- **UI/渲染**: [gpui](https://crates.io/crates/gpui) 0.2.x（Zed 官方，crates.io 版）+ gpui-component（Resizable/Modal/Input/Tree 等）
+- **UI/渲染**: [gpui-pre](https://crates.io/crates/gpui-pre) 0.3.5（Zed 快照，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-pre-platform`）+ gpui-component 0.6.2（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
 - **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」）+ macOS dmg + Linux deb/tar.gz
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
@@ -20,7 +20,8 @@ node scripts/stage-sidecars.mjs
 # 启动开发实例（⚠️ 与装机版并跑时必须隔离数据目录）
 MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 
-# 全工作区测试（27 个目标 1500+ 例）
+# 全工作区测试（2026-09 实数：29 个目标 / 1887 例 —— 目标数 = Running + Doc-tests 行数，
+# 例数 = 各 `test result:` 行 passed 之和；数字只是快照，随代码增长）
 cargo test --workspace
 
 # 量化每帧 CPU / 帧时间 p50·p99 / 一帧合并了几次 invalidation（dev-only 度量工具，
@@ -42,8 +43,10 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 bun run tools/omp-ext-check.ts
 ```
 
+- 工具链由根目录 `rust-toolchain.toml` 钉死（channel + clippy/rustfmt），CI 按同一文件安装，本地 clippy 与 CI 同版本。新机器 / 新 checkout 先跑一次无参 `rustup toolchain install`（新版 rustup 已弃用「缺工具链时自动安装」）；升级工具链只改该文件的 `channel` 一处。
 - ⚠️ **禁跑 `cargo fmt`**：本仓 HEAD 非 rustfmt-clean，全仓 fmt 会重排几十个文件淹没 diff。
-- ⚠️ GPUI dev 实例运行中时 `cargo test -p mt-app` 会卡在「无法替换 target/debug/mini-term.exe」——先关实例，或 `cargo test --no-run --message-format=json` 取出测试二进制直接执行。
+- ⚠️ GPUI dev 实例运行中时，`cargo build -p mt-app` / `cargo run -p mt-app` 会卡在「无法替换 target/debug/mini-term.exe」——先关实例，或给这次构建另设 `CARGO_TARGET_DIR`。`cargo test`（含 `-p mt-app` 与 `--workspace`）不受影响：mt-app 没有集成测试，只编单测 harness（`target/debug/deps/mini_term-<hash>.exe`），不产出也不替换 `mini-term.exe`。
+- ⚠️ **别给 mt-app 加 `tests/` 目录**：包里只要有集成测试，`cargo test` 就会先把该包的 bin 编出来（给测试提供 `CARGO_BIN_EXE_*`），上面那条文件锁就又回来了。不需要 GPUI 的端到端测试放进对应的下层 crate（PTY → VT → grid 冒烟在 `crates/mt-terminal/tests/terminal_smoke.rs`）。
 
 ## 架构说明
 
@@ -71,7 +74,7 @@ bun run tools/omp-ext-check.ts
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
 | `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；密码信封在 `pool::authenticate` 解开 |
-| `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 ring/base64/serde/zeroize |
+| `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价 |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
 
@@ -117,7 +120,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙
 - **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
 - **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
-- `mt-secret` 的依赖表只许有 ring / base64 / serde / zeroize（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
+- `mt-secret` 的依赖表只许有 mt-core / ring / base64 / serde / serde_json / zeroize，Windows 另加 DPAPI 用的 windows-sys（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
 
 ### 布局持久化（`layout.db`，非 `config.json`）
 

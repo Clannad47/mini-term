@@ -8,9 +8,7 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 tokio.workspace = true
-uuid.workspace = true
 # 会话记录解析(Claude/Codex/Grok 三家的行级解析器、项目目录定位、grok chunk
 # 状态机)与「该 agent 有没有可解析的会话记录」判定,对话镜像整块建在其上。
 mt-ai.workspace = true

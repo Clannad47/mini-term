@@ -203,7 +203,7 @@ impl TerminalEmulator {
         self.term.lock().set_options(config);
     }
 
-    /// 把刚从 PTY 读到的字节推进状态机。直接接 [`mt_pty::PtySession::spawn`]
+    /// 把刚从 PTY 读到的字节推进状态机。直接接 mt-pty 里 `PtySession::spawn`
     /// 的 `on_output` 回调。
     ///
     /// 追踪光标水位时**改成逐字节推进**(见 [`Self::arm_cursor_floor`]):要找的
