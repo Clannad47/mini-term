@@ -1,7 +1,9 @@
 [package]
 name = "mt-sidecars"
-# 0.4.9:会话池改在认证那一刻解开 mt-secret 密码信封(旧 daemon 会把信封当密码送出去)。
-version = "0.4.9"
+# 0.4.10:传输护栏从只拦 config.json 扩到整个数据目录(config.db / 备份 / WAL /
+# credential.key 等,上传下载都拦);会话池的 known_hosts 校验认哈希条目、读失败即拒绝、
+# 已登记其它算法时不再当新主机追加(旧 daemon 仍按旧规则放行)。
+version = "0.4.10"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 

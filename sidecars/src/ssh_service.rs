@@ -1,8 +1,8 @@
 //! ssh_service —— SSH 工具的共享业务编排层。
 //!
 //! 自 `mt-ssh-mcp.rs` 整体迁入（ssh-cli-skill spec §3）：连接查找、池 acquire、
-//! transport 错 evict+单次 retry、auth 失败 30s cooldown、审计日志、config.json
-//! 传输硬护栏，全部收敛在这里单点执行。MCP handler 与 CLI/daemon 都是薄传输层。
+//! transport 错 evict+单次 retry、auth 失败 30s cooldown、审计日志、mini-term
+//! 数据目录传输硬护栏，全部收敛在这里单点执行。MCP handler 与 CLI/daemon 都是薄传输层。
 //!
 //! exec 的输出走 `on_output(StreamKind, &[u8])` 流式回调：daemon 侧写 IPC 帧
 //! 实时转发，MCP 侧收集进缓冲再 cap_output 打包 JSON —— 两端行为各自保持不变。
@@ -575,83 +575,112 @@ fn append_transfer_audit_log(
 // 传输护栏
 // ---------------------------------------------------------------------------
 
-/// 安全硬护栏:判断一个本地路径是否是 mini-term 自身的 `config.json`。
+/// 安全硬护栏:本地路径是否落在 mini-term 自己的数据目录(含子目录)里。
 ///
-/// `config.json` 是本工具自己的凭据库(含全部 SSH 连接的明文密码),agent 一句
-/// upload 即可外泄,等于 SSH 工具自我拆穿。其它普通本地文件按 PRD Decision
-/// **不做沙箱限制**(仅审计),这是唯一一条硬拒绝。
+/// 数据目录里没有一样东西该经 SSH 工具流出去,更不该被远端文件覆盖:`config.db`
+/// 及其 `.bak` / `-wal` / `-shm`(全部配置,SSH 密码是 mt-secret 信封)、
+/// `config.json` 投影与 `.pre-sqlite` 存档(同样带信封)、`credential.key`(解信封
+/// 的主密钥,Unix 上就是裸密钥)、`layout.db` / `usage.db` / hook 端口文件 / 审计
+/// 日志……agent 一句 upload 能把「信封 + 钥匙」一起带走,一句 download 能覆盖配置
+/// 或密钥。所以不再逐个文件点名,**整棵目录树、上传下载两个方向一律拒绝**。其它
+/// 本地文件按 PRD Decision 不做沙箱限制(仅审计),这是唯一一条硬拒绝。
 ///
-/// 规范化策略(文件可能不存在 → canonicalize 会失败,需兜底):
-/// 1. 拿到 `config_json_path()`;定位失败则放行(无从比对,不误伤普通文件)。
-/// 2. 优先用 `canonicalize` 把两边都规范成绝对真实路径再比(消解 `..` / 符号链接 /
-///    大小写等差异)。`local_path` 通常存在(上传)或其父目录存在(下载)。
-/// 3. 任一侧 canonicalize 失败:回退到「按 components 规范化 + 末段文件名」的保守比对
-///    —— 只要规范化后的绝对路径相等即判命中,避免因文件尚不存在而绕过护栏。
-///
-/// 抽成接受 `&str` 的纯函数便于单测(对真实 `config_json_path()` 做相对独立的可测设计:
-/// 用 `is_blocked_local_path_against` 注入 target,单测不依赖运行环境的 config 路径)。
+/// 数据目录的定位见 [`protected_data_dirs`];一个都定位不到则放行(无从比对,
+/// 不误伤普通文件)。
 pub fn is_blocked_local_path(local_path: &str) -> bool {
-    let Some(target) = mt_core::config_json_path() else {
-        // 定位不到 config.json —— 无从比对,放行(不误伤普通文件)。
-        return false;
-    };
-    is_blocked_local_path_against(local_path, &target)
+    is_blocked_local_path_against(local_path, &protected_data_dirs())
 }
 
-/// `is_blocked_local_path` 的可测核心:把 `local_path` 与给定 `target`(config.json
-/// 的预期路径)规范化后比较。抽出 `target` 入参,单测无需依赖运行环境的真实 config 路径。
-fn is_blocked_local_path_against(local_path: &str, target: &std::path::Path) -> bool {
-    use std::path::{Component, Path, PathBuf};
+/// 需要护住的 mini-term 数据目录。
+///
+/// - 装机版数据目录:`mt_core::config_json_path()` 的所在目录 —— sidecar 读 SSH
+///   投影、懒加载 `credential.key`、写审计日志用的都是这同一个锚点(主程序
+///   `mt_config::app_data_dir` 拼出的也是它);
+/// - 环境里带着 `MT_APP_DATA_DIR` 时它指的目录一并护住:那是主程序
+///   `mt_config::active_data_dir` 的覆盖口径(非空即生效,dev 实例的隔离数据目录,
+///   里面同样有自己的 `config.db` 与 `credential.key`)。sidecar 自己不从那里读
+///   任何东西,这里只多拦、不改变读取口径。
+fn protected_data_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = mt_core::config_json_path()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .into_iter()
+        .collect();
+    if let Some(dev_dir) = std::env::var_os("MT_APP_DATA_DIR").filter(|v| !v.is_empty()) {
+        dirs.push(std::path::PathBuf::from(dev_dir));
+    }
+    dirs
+}
 
-    // 纯路径规范化(不碰文件系统):折叠 `.` 与 `..`,统一为可比较的形态。
-    // 不解析符号链接 —— 那需要文件存在;这里作为 canonicalize 失败时的保守兜底。
-    fn lexical_normalize(p: &Path) -> PathBuf {
-        let mut out = PathBuf::new();
-        for comp in p.components() {
-            match comp {
-                Component::ParentDir => {
-                    // 仅当上一段是普通目录名时才弹出,避免越过根。
-                    if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                        out.pop();
-                    } else {
-                        out.push(comp.as_os_str());
-                    }
-                }
-                Component::CurDir => {}
-                other => out.push(other.as_os_str()),
-            }
+/// `is_blocked_local_path` 的可测核心:`local_path` 规范化后是否落在任一 `roots`
+/// 之内(含 root 本身)。
+///
+/// 两边都走 [`resolve_lenient`](存在的部分 canonicalize,不存在的尾段按字面折叠
+/// —— 下载的目标文件往往还不存在,不能因此绕过护栏),再按路径**分量**判定前缀:
+/// `com.mini-term.app-backup` 这类同名前缀的兄弟目录不会误伤。Windows 与默认
+/// 大小写不敏感的 macOS 上统一小写后比较。
+fn is_blocked_local_path_against(local_path: &str, roots: &[std::path::PathBuf]) -> bool {
+    let local = comparable_path(&resolve_lenient(std::path::Path::new(local_path)));
+    roots
+        .iter()
+        .any(|root| local.starts_with(comparable_path(&resolve_lenient(root))))
+}
+
+/// 把路径尽量解析成真实的绝对路径。
+///
+/// 相对路径先接到当前目录上;然后从整条路径起逐段缩短,找最长的、能 canonicalize
+/// 的前缀 —— 它消解了 `..`、符号链接 / junction 与 8.3 短名;还不存在的尾段按字面
+/// 接上(`.` 丢弃、`..` 弹一级)。一段都解析不了(盘符都不存在)时退回纯字面折叠。
+fn resolve_lenient(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let components: Vec<Component> = absolute.components().collect();
+    for split in (1..=components.len()).rev() {
+        let prefix: PathBuf = components[..split].iter().collect();
+        if let Ok(mut resolved) = std::fs::canonicalize(&prefix) {
+            push_lexically(&mut resolved, &components[split..]);
+            return resolved;
         }
-        out
     }
+    let mut resolved = PathBuf::new();
+    push_lexically(&mut resolved, &components);
+    resolved
+}
 
-    let local = Path::new(local_path);
+/// 按字面把路径分量接到 `base` 上:`.` 丢弃,`..` 弹掉上一段普通目录名(到根就停,
+/// 与操作系统对 `/..` 的处理一致)。
+fn push_lexically(base: &mut std::path::PathBuf, components: &[std::path::Component]) {
+    use std::path::Component;
 
-    // 优先 canonicalize 两边(消解符号链接/大小写/相对路径)。
-    let canon_local = std::fs::canonicalize(local).ok();
-    let canon_target = std::fs::canonicalize(target).ok();
-    if let (Some(a), Some(b)) = (&canon_local, &canon_target) {
-        return a == b;
+    for component in components {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(base.components().next_back(), Some(Component::Normal(_))) {
+                    base.pop();
+                } else if !base.has_root() {
+                    // 解析不出当前目录时残留的相对路径:保留前导 `..`
+                    base.push(component.as_os_str());
+                }
+            }
+            other => base.push(other.as_os_str()),
+        }
     }
+}
 
-    // 任一侧 canonicalize 失败(文件不存在等)→ 退到 lexical 规范化比对。
-    // Windows 路径大小写不敏感,统一小写后比;其它平台大小写敏感,原样比。
-    let norm_local = lexical_normalize(local);
-    let norm_target = lexical_normalize(target);
-    #[cfg(target_os = "windows")]
-    {
-        let a = norm_local
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('/', "\\");
-        let b = norm_target
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('/', "\\");
-        a == b
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        norm_local == norm_target
+/// 比较用的路径形态:Windows 与 macOS 的默认文件系统大小写不敏感,统一小写;
+/// 其它平台原样。
+fn comparable_path(path: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        std::path::PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -1030,12 +1059,14 @@ pub async fn transfer(
     remote_path: &str,
     timeout_secs: Option<u64>,
 ) -> Result<u64, ServiceError> {
-    // 0. 安全硬护栏:绝不传输 mini-term 自身的 config.json(含全部明文密码)。
-    //    upload 与 download 都拦 —— 上传外泄、下载覆盖凭据库均不可接受。
+    // 0. 安全硬护栏:本地路径落在 mini-term 自己的数据目录里一律拒绝(配置库及其
+    //    备份 / WAL、带密码信封的投影与存档、解信封的 credential.key 都在那里)。
+    //    upload 与 download 都拦 —— 上传外泄、下载覆盖配置或密钥均不可接受。
     if is_blocked_local_path(local_path) {
         return Err(ServiceError::InvalidParams(
-            "refusing to transfer mini-term's own config.json: it contains all saved SSH \
-            credentials and must never be uploaded or overwritten via this tool."
+            "refusing to transfer files inside mini-term's own data directory: it holds the \
+            config database (with its backups), the saved SSH credentials and the key that \
+            decrypts them, which must never be uploaded or overwritten via this tool."
                 .to_string(),
         ));
     }
@@ -1176,6 +1207,7 @@ pub async fn transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn conn(id: &str, password: Option<&str>) -> mt_core::SshConnection {
         mt_core::SshConnection {
@@ -1528,81 +1560,141 @@ mod tests {
 
     // --- 传输护栏 is_blocked_local_path ---------------------------------
 
-    #[test]
-    fn is_blocked_local_path_blocks_exact_config_json() {
-        // 用一个真实存在的临时文件当 config.json target,canonicalize 两边都成功,
-        // 同一路径必须命中护栏。
-        let dir = std::env::temp_dir().join(format!(
-            "mt-ssh-svc-guard-{}-{}",
-            std::process::id(),
-            "exact"
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("config.json");
-        std::fs::write(&target, b"{}").unwrap();
+    /// 造一个「数据目录」夹具:`<tmp>/mt-ssh-svc-guard-<pid>-<name>/{data,outside}`,
+    /// 数据目录里放几个真实存在的文件与一个子目录。返回 (夹具根, 数据目录, 外部目录)。
+    fn guard_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("mt-ssh-svc-guard-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("com.mini-term.app");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(data.join("themes")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in ["config.db", "config.json", "credential.key"] {
+            std::fs::write(data.join(file), b"x").unwrap();
+        }
+        (base, data, outside)
+    }
 
-        assert!(is_blocked_local_path_against(
-            target.to_str().unwrap(),
-            &target
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn blocked(local: &std::path::Path, roots: &[PathBuf]) -> bool {
+        is_blocked_local_path_against(local.to_str().unwrap(), roots)
     }
 
     #[test]
-    fn is_blocked_local_path_allows_other_file_in_same_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "mt-ssh-svc-guard-{}-{}",
-            std::process::id(),
-            "other"
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("config.json");
-        std::fs::write(&target, b"{}").unwrap();
-        let other = dir.join("notes.txt");
-        std::fs::write(&other, b"hi").unwrap();
-
-        assert!(!is_blocked_local_path_against(
-            other.to_str().unwrap(),
-            &target
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn guard_blocks_every_file_under_the_data_dir() {
+        // 数据库迁移 + 密码封存之后,要护的远不止 config.json:库本体、备份、WAL、
+        // 存档、主密钥,以及子目录里的东西 —— 存在的与还不存在的(下载目标)都拦。
+        let (base, data, _) = guard_fixture("under");
+        let roots = [data.clone()];
+        for rel in [
+            "config.db",
+            "config.json",
+            "credential.key",
+            "config.db.bak",
+            "config.db-wal",
+            "config.db-shm",
+            "config.json.pre-sqlite",
+            "themes/pack.json",
+            "not-yet/created/deep.bin",
+        ] {
+            let path = data.join(rel);
+            assert!(blocked(&path, &roots), "应拦截 {}", path.display());
+        }
+        assert!(blocked(&data, &roots), "数据目录本身也算在内");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn is_blocked_local_path_blocks_via_dotdot_when_nonexistent() {
-        // local_path 含 `..` 且文件不存在 → canonicalize 失败,走 lexical 兜底,
-        // 规范化后等于 target 仍应命中(防止用 `..` 绕过护栏)。
-        let dir = std::env::temp_dir().join("mt-ssh-svc-guard-dotdot");
-        let target = dir.join("config.json");
-        let sneaky = dir.join("sub").join("..").join("config.json");
-        assert!(is_blocked_local_path_against(
-            sneaky.to_str().unwrap(),
-            &target
-        ));
+    fn guard_allows_paths_outside_the_data_dir() {
+        let (base, data, outside) = guard_fixture("outside");
+        let roots = [data.clone()];
+        std::fs::write(outside.join("notes.txt"), b"hi").unwrap();
+        assert!(!blocked(&outside.join("notes.txt"), &roots));
+        assert!(!blocked(&outside.join("new-download.bin"), &roots));
+        // 同名前缀的兄弟目录按路径分量比较,不误伤
+        let sibling = base.join("com.mini-term.app-backup").join("config.db");
+        assert!(!blocked(&sibling, &roots));
+        // 没有可护的目录(定位失败)时放行
+        assert!(!blocked(&data.join("config.db"), &[]));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn is_blocked_local_path_allows_unrelated_nonexistent_path() {
-        let dir = std::env::temp_dir().join("mt-ssh-svc-guard-unrelated");
-        let target = dir.join("config.json");
-        let unrelated = dir.join("data").join("payload.bin");
-        assert!(!is_blocked_local_path_against(
-            unrelated.to_str().unwrap(),
-            &target
+    fn guard_resolves_dotdot_before_comparing() {
+        let (base, data, outside) = guard_fixture("dotdot");
+        let roots = [data.clone()];
+        // 从外部目录绕回数据目录:存在的文件、以及经由不存在的中间目录
+        let sneaky = outside
+            .join("..")
+            .join("com.mini-term.app")
+            .join("credential.key");
+        assert!(blocked(&sneaky, &roots));
+        let via_missing = outside
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("com.mini-term.app")
+            .join("config.db-wal");
+        assert!(blocked(&via_missing, &roots));
+        // 反过来从数据目录里 `..` 出去的路径不拦
+        let escaped = data
+            .join("themes")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("a.txt");
+        assert!(!blocked(&escaped, &roots));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_works_before_the_data_dir_exists() {
+        // 全新机器上数据目录还没建:两边都按字面折叠到同一个存在的祖先,照样命中。
+        let (base, _, _) = guard_fixture("fresh");
+        let data = base.join("not-created").join("com.mini-term.app");
+        let roots = [data.clone()];
+        assert!(blocked(&data.join("credential.key"), &roots));
+        assert!(!blocked(
+            &base.join("not-created").join("other.txt"),
+            &roots
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_checks_every_protected_root() {
+        // 装机版目录 + MT_APP_DATA_DIR 指的 dev 目录:落在任一个里都拦。
+        let (base, data, outside) = guard_fixture("roots");
+        let dev = outside.join("dev-data");
+        std::fs::create_dir_all(&dev).unwrap();
+        let roots = [data.clone(), dev.clone()];
+        assert!(blocked(&dev.join("config.db"), &roots));
+        assert!(blocked(&data.join("config.db"), &roots));
+        assert!(!blocked(&outside.join("x.txt"), &roots));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn is_blocked_local_path_windows_case_insensitive_nonexistent() {
-        // Windows 路径大小写不敏感:CONFIG.JSON 仍应命中 config.json(走 lexical 兜底)。
-        let dir = std::path::PathBuf::from(r"C:\nonexistent-dir-mt-test");
-        let target = dir.join("config.json");
-        let upper = dir.join("CONFIG.JSON");
-        assert!(is_blocked_local_path_against(
-            upper.to_str().unwrap(),
-            &target
-        ));
+    fn guard_is_case_insensitive_on_windows() {
+        let (base, data, _) = guard_fixture("case");
+        let roots = [data.clone()];
+        let upper = PathBuf::from(data.to_string_lossy().to_uppercase());
+        assert!(blocked(&upper.join("CONFIG.DB"), &roots));
+        assert!(blocked(&upper.join("NEW-FILE.BIN"), &roots));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_follows_symlinks_into_the_data_dir() {
+        let (base, data, outside) = guard_fixture("symlink");
+        let roots = [data.clone()];
+        let link = outside.join("innocent");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(blocked(&link.join("credential.key"), &roots));
+        assert!(blocked(&link.join("not-yet.bin"), &roots));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- format_transfer_audit_line ---------------------------------------
