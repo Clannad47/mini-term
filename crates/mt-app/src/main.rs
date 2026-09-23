@@ -395,6 +395,7 @@ struct Workspace {
     activity_bar_hover_task: Option<Task<()>>,
     /// 弹窗毛玻璃背板的快照(见 [`frost`] 模块注释)。弹窗/用量面板从无到有的
     /// 第一帧抓一次,期间沿用,全关即弃 —— 开着时再抓会把弹窗自己抓进去。
+    /// 弃的时候连图集纹理一起摘(`drop_image`),光清字段每开一次弹窗漏一张。
     frost: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 后台模糊任务(抓帧在 UI 线程、模糊在后台,见 [`frost::finish`])。
     /// drop 即取消 —— 弹窗在模糊完成前就关掉时,结果直接作废。
@@ -1404,7 +1405,13 @@ impl Render for Workspace {
                         let _ = this.update(cx, |this, cx| {
                             this.frost_task = None;
                             if let Some(img) = img {
-                                this.frost = Some(img);
+                                // 防御:按上面的门槛这里不该已有旧图,真有也得先把它
+                                // 的纹理摘掉再换。不在任何窗口的更新里,`drop_image`
+                                // 自己遍历得到本窗口;紧跟的 notify 让下一帧先重画再
+                                // 呈现,旧场景不会拿着已摘的图块再呈现一遍
+                                if let Some(old) = this.frost.replace(img) {
+                                    cx.drop_image(old, None);
+                                }
                                 cx.notify();
                             }
                         });
@@ -1412,7 +1419,14 @@ impl Render for Workspace {
                 }
             }
         } else if self.frost.is_some() || self.frost_task.is_some() {
-            self.frost = None;
+            // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
+            // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
+            // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
+            // `App.windows`,见 `file_viewer::release_mermaid_assets`);本帧不再画它,
+            // 上一帧的场景画完本帧就被替换,摘掉是安全的
+            if let Some(old) = self.frost.take() {
+                cx.drop_image(old, Some(window));
+            }
             self.frost_task = None;
         }
 

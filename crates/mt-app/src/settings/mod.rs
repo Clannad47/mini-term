@@ -58,6 +58,8 @@
 //! about 页要用的版本比较与 GitHub 查询**不在这棵树里** —— 它同时被 `main.rs`
 //! 的启动自检引用,住在顶层 [`crate::update_check`]。
 
+use std::collections::HashSet;
+
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -78,7 +80,7 @@ mod pages_system;
 mod pages_terminal;
 mod widgets;
 
-use pages_appearance::ThemeCard;
+use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
 
 // ─── 分页 ─────────────────────────────────────────────────────
 
@@ -347,6 +349,10 @@ pub struct SettingsView {
 
     // ── appearance 页:外置皮肤 ──
     theme_cards: Vec<ThemeCard>,
+    /// 向 gpui 资源系统要过的卡片缩略图(见 `pages_appearance::ThemeThumbnail`)。
+    /// 资源缓存与图集纹理都是进程级、不自动淘汰的,离开外观页 / 列表变了由
+    /// `release_stale_theme_thumbs` 放,关掉设置由 `on_release` 全放。
+    theme_thumbs: HashSet<ThemeThumbKey>,
     theme_error: Option<String>,
     /// 成功提示(生成示例皮肤);与 `theme_error` 互斥展示。
     theme_notice: Option<String>,
@@ -586,6 +592,7 @@ impl SettingsView {
             txt_ui_font,
             txt_terminal_font,
             theme_cards: Vec::new(),
+            theme_thumbs: HashSet::new(),
             theme_error: None,
             theme_notice: None,
             hook_running: false,
@@ -646,6 +653,14 @@ impl SettingsView {
                 },
             ));
         }
+
+        // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
+        // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口
+        cx.on_release(|this: &mut Self, cx: &mut App| {
+            let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
+            release_theme_thumbs(&keys, cx, None);
+        })
+        .detach();
 
         this.refresh_theme_packs(cx);
         this.refresh_hook_state(cx);
@@ -754,7 +769,9 @@ const DEFAULT_TERMINAL_FONT_PLACEHOLDER: &str =
 // ─── 渲染 ─────────────────────────────────────────────────────
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 先对账再画:换走了外观页 / 皮肤列表变了,缩略图在这一帧放掉
+        self.release_stale_theme_thumbs(window, cx);
         div()
             .id("settings-root")
             .size_full()
@@ -795,7 +812,7 @@ impl Render for SettingsView {
                     .overflow_y_scroll()
                     .px(px(20.0))
                     .py(px(16.0))
-                    .child(self.render_page(cx)),
+                    .child(self.render_page(window, cx)),
             )
     }
 }
@@ -882,11 +899,12 @@ impl SettingsView {
         menu.into_any_element()
     }
 
-    fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             SettingsPage::Terminal => self.render_terminal_page(cx),
             SettingsPage::Clipboard => self.render_clipboard_page(cx),
-            SettingsPage::Appearance => self.render_appearance_page(cx),
+            // 外观页要 `window`:皮肤卡片的缩略图走 `window.use_asset`
+            SettingsPage::Appearance => self.render_appearance_page(window, cx),
             SettingsPage::Font => self.render_font_page(cx),
             SettingsPage::AiNotification => self.render_notification_page(cx),
             SettingsPage::AiHook => self.render_hook_page(cx),

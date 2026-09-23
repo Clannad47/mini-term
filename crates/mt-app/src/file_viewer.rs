@@ -48,11 +48,12 @@
 //!    比对着一屏源码有用。相对资源不再是问题,见 [`rewrite_html_urls`]。远程
 //!    HTML 属于不可信输入，只走源码编辑器，不进入富文本 HTML 渲染器。
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -423,6 +424,11 @@ fn refresh_warning_after_remote_save(
 /// (保存后立刻被 formatter / pre-commit 改写)。不改成内容比对 ——
 /// 那会引入「外部改写结果恰好等于刚保存的内容」的另一类误判。
 pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
+
+/// 看图页签的图在磁盘上被改写后,最后一个变更事件过去这么久才重读(见
+/// [`FileViewer::schedule_image_reload`])。一次保存是一串事件,写到一半就读
+/// 只会读到半截文件。
+const IMAGE_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 // ─── markdown 分段(表格与图片自绘,见 render_markdown) ─────────────
 //
@@ -2364,6 +2370,209 @@ fn release_mermaid_assets(keys: &[MermaidKey], cx: &mut App, mut window: Option<
     }
 }
 
+// ─── 图片(看图页签 / md 预览):进程级缓存按视图计数释放 ─────────────
+
+/// 文件查看器自己的图片资源类型:看图页签与 md 预览里的本地 / 网络图片都走它。
+///
+/// 加载原样转交 [`ImageAssetLoader`](读盘 / 经 [`PreviewHttpClient`] 拉网、解码、
+/// svg 栅格化全在里面),**只换资源类型**:gpui 的资源缓存按「资源类型 + key」
+/// 进程级共享,而窗口级背景图(`mt_ui::background`)用的正是 `ImageAssetLoader` +
+/// `Resource::Path` —— 在文件树里点开当前皮肤的背景图时两边会共用一份缓存,
+/// 这边关页签一放,窗口背景就被连带放掉、重解一遍、闪一下。换成自己的类型,
+/// 缓存条目只归查看器管,[`ViewerImageHolds`] 的账才算得清。
+enum ViewerImage {}
+
+impl gpui::Asset for ViewerImage {
+    type Source = Resource;
+    type Output = <ImageAssetLoader as gpui::Asset>::Output;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        <ImageAssetLoader as gpui::Asset>::load(source, cx)
+    }
+}
+
+/// 本地图片的资源 key。看图页签、md 预览、换代与释放**必须**走同一个构造,
+/// 否则账本里的 key 与缓存里的对不上,放不掉。
+fn local_image_resource(path: &Path) -> Resource {
+    Resource::Path(Arc::from(path))
+}
+
+/// 网络图片的资源 key(口径同上)。
+fn remote_image_resource(url: &str) -> Resource {
+    Resource::Uri(gpui::SharedUri::from(url.to_string()))
+}
+
+/// md 图片落点 → 资源 key;`data:` 之类不加载的没有 key。
+fn md_image_resource(src: &MdImageSrc) -> Option<Resource> {
+    match src {
+        MdImageSrc::Local(path) => Some(local_image_resource(path)),
+        MdImageSrc::Remote(url) => Some(remote_image_resource(url)),
+        MdImageSrc::Unsupported => None,
+    }
+}
+
+/// 分块里还引用着的图片资源。远程文档里没获准加载的也算在内 —— 这里只用来判
+/// 「哪些已经不在文档里了」,多算一个不会多加载一张。
+fn md_image_resources(blocks: &[(f32, MdBlock)], base_dir: &Path) -> HashSet<Resource> {
+    blocks
+        .iter()
+        .filter_map(|(_, block)| match block {
+            MdBlock::Images(images) => Some(images),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|image| md_image_resource(&resolve_image_src(&image.url, base_dir)))
+        .collect()
+}
+
+/// 「一个 key 此刻被几个视图用着」的账本,外加最近一次取到的值(对位图是
+/// 弱引用:只为放的时候找得到它的图集纹理,不给它续命)。
+///
+/// 为什么要按视图计数:资源缓存按 key 进程级共享,同一张图可能同时挂在两个
+/// 页签上(看图页签 + 引用它的 README 预览,或两篇引用同一张图的文档)。
+/// 一个页签关了就直接放的话,另一个不会崩也不会永久空白(依据见
+/// [`evict_viewer_image`]),但下一帧 `use_asset` 取不到、从头重解,这一两帧
+/// 画的是占位卡片 —— md 列表里整块塌下去再撑回来,滚动位置跟着跳。
+/// 所以最后一个持有者走了才真放。
+struct HoldTable<K, V> {
+    entries: HashMap<K, Hold<V>>,
+}
+
+struct Hold<V> {
+    holders: usize,
+    latest: Option<V>,
+}
+
+/// [`HoldTable::release`] 的结论。
+#[derive(Debug, PartialEq)]
+enum Release<V> {
+    /// 还有别的持有者 —— 或者这个 key 根本没登记过:宁可漏放,不能放掉别人的图
+    Shared,
+    /// 最后一个持有者走了,账目已删;带着最近记下的值,调用方据此放资源
+    Last(Option<V>),
+}
+
+impl<K, V> Default for HoldTable<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash, V> HoldTable<K, V> {
+    /// 多一个持有者。同一个视图对同一个 key 只该登记一次(视图自己记着要过哪些)。
+    fn acquire(&mut self, key: K) {
+        self.entries
+            .entry(key)
+            .or_insert(Hold {
+                holders: 0,
+                latest: None,
+            })
+            .holders += 1;
+    }
+
+    /// 记下这个 key 最近一次取到的值。没登记过的不记 —— 没人持有就没人来放。
+    fn note(&mut self, key: &K, value: V) {
+        if let Some(hold) = self.entries.get_mut(key) {
+            hold.latest = Some(value);
+        }
+    }
+
+    /// 取走最近记下的值,持有者计数不动 —— 资源换代(磁盘上的图被改写)时用。
+    fn take_latest(&mut self, key: &K) -> Option<V> {
+        self.entries
+            .get_mut(key)
+            .and_then(|hold| hold.latest.take())
+    }
+
+    /// 少一个持有者。
+    fn release(&mut self, key: &K) -> Release<V> {
+        let Some(hold) = self.entries.get_mut(key) else {
+            return Release::Shared;
+        };
+        if hold.holders > 1 {
+            hold.holders -= 1;
+            return Release::Shared;
+        }
+        Release::Last(self.entries.remove(key).and_then(|hold| hold.latest))
+    }
+
+    #[cfg(test)]
+    fn holders(&self, key: &K) -> usize {
+        self.entries.get(key).map_or(0, |hold| hold.holders)
+    }
+}
+
+/// 进程级:查看器图片的持有账本。key 是 [`ViewerImage`] 的资源,值是最近画过的
+/// 那份位图。
+#[derive(Default)]
+struct ViewerImageHolds(HoldTable<Resource, Weak<gpui::RenderImage>>);
+
+impl gpui::Global for ViewerImageHolds {}
+
+/// 撤掉一个视图对这些图的持有;最后一个持有者走了才真放。`window` 的口径同
+/// [`release_mermaid_assets`]。
+fn release_viewer_images(
+    keys: impl IntoIterator<Item = Resource>,
+    cx: &mut App,
+    mut window: Option<&mut Window>,
+) {
+    for key in keys {
+        if let Release::Last(latest) = cx.default_global::<ViewerImageHolds>().0.release(&key) {
+            evict_viewer_image(&key, latest, cx, window.as_deref_mut());
+        }
+    }
+}
+
+/// 把一张图从资源缓存与图集里放掉,不看账本(调用方已经判过该放)。
+///
+/// 纹理按账本里的弱引用找(还活着就是缓存里那份),**不用 `fetch_asset`**:它对
+/// 缓存里没有的 key 会先发起一次加载(读盘 + 整张解码),而「换代后还没重画过」
+/// 的 key 正是缓存里没有的。
+///
+/// 放早了不会崩(gpui-pre 0.3.5):`remove_asset` 只摘缓存条目(`app.rs:2689`),
+/// 还要这张图的视图下一帧 `use_asset` 取不到就从头加载、完成后被通知重画
+/// (`asset_cache.rs` 的 `CachedLoad::use_by`);`drop_image` 只摘图集条目
+/// (`window.rs:4894`),同一份位图再被画到时 `paint_image` 经
+/// `get_or_insert_with` 重新上传(`window.rs:4800`)。唯一的雷是**不重画就再呈现**:
+/// 窗口不脏时(高频输入下)会把上一帧场景原样再交给渲染器,场景里的图块若
+/// 正好是刚摘的、所在图集纹理又随之释放,DirectX 后端取纹理直接 unwrap 到
+/// `None`(`directx_atlas.rs` 的 `texture()`)。所以在绘制之外放的,调用方
+/// 必须同时把窗口弄脏(关页签时父视图自会重画;换代见 `reload_image`)。
+fn evict_viewer_image(
+    key: &Resource,
+    latest: Option<Weak<gpui::RenderImage>>,
+    cx: &mut App,
+    window: Option<&mut Window>,
+) {
+    if let Some(image) = latest.and_then(|image| image.upgrade()) {
+        cx.drop_image(image, window);
+    }
+    cx.remove_asset::<ViewerImage>(key);
+}
+
+/// 看图页签「磁盘上的图变了」的去抖代次:每来一个事件领一张新票,计时到点时
+/// 手上的票还是最新的才动手 —— 一串事件只在最后一个之后重读一次。
+#[derive(Default)]
+struct ReloadDebounce {
+    generation: u64,
+}
+
+impl ReloadDebounce {
+    fn bump(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    fn is_current(&self, ticket: u64) -> bool {
+        self.generation == ticket
+    }
+}
+
 // ─── 视图 ─────────────────────────────────────────────────────
 
 pub struct FileViewer {
@@ -2418,6 +2627,16 @@ pub struct FileViewer {
     /// 已不在文档里的那些连缓存带纹理一起放掉([`Self::release_stale_mermaid`]),
     /// 页签关闭时全放(`on_release`)。`RefCell` 的理由同 [`Self::md_cache`]。
     mermaid_requested: RefCell<HashSet<MermaidKey>>,
+    /// 本页签向 gpui 资源系统要过的图片([`ViewerImage`]:看图页签那一张,或 md
+    /// 预览里的本地 / 网络图片)。理由同 [`Self::mermaid_requested`] —— 一张
+    /// 2560×1440 的截图解出来 15 MB 内存、上传后再占同样大的显存,一直不放;
+    /// 差别在图片可能被别的页签同时用着,放不放由进程级账本
+    /// [`ViewerImageHolds`] 判。重切分块时放掉不在文档里的
+    /// ([`Self::release_stale_images`]),页签关闭时全放(`on_release`)。
+    images_requested: RefCell<HashSet<Resource>>,
+    /// 看图页签「磁盘上的图变了」的去抖(见 [`Self::schedule_image_reload`])。
+    image_reload: ReloadDebounce,
+    _image_reload_task: Option<Task<()>>,
     /// 点开的 mermaid 图表放大浮层(见 [`crate::image_lightbox`])。整窗遮罩由
     /// 它自己 `deferred` 画,这里只持有实体、在根上 `child` 出来;关闭 = 丢实体。
     lightbox: Option<Entity<ImageLightbox>>,
@@ -2516,6 +2735,9 @@ impl FileViewer {
             md_list_sync: std::cell::Cell::new((0, px(0.0))),
             approved_remote_images: HashSet::new(),
             mermaid_requested: RefCell::new(HashSet::new()),
+            images_requested: RefCell::new(HashSet::new()),
+            image_reload: ReloadDebounce::default(),
+            _image_reload_task: None,
             lightbox: None,
             _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
@@ -2538,10 +2760,13 @@ impl FileViewer {
             _fs_task: fs_task,
             _editor_sub: None,
         };
-        // 页签关掉时把要过的 mermaid 图表从进程级缓存与图集里放掉(理由见字段注释)
+        // 页签关掉时把要过的 mermaid 图表与图片从进程级缓存与图集里放掉(理由见
+        // 字段注释;图片还有别的页签在用的,由账本留着)
         cx.on_release(|this: &mut Self, cx: &mut App| {
             let keys: Vec<MermaidKey> = this.mermaid_requested.get_mut().drain().collect();
             release_mermaid_assets(&keys, cx, None);
+            let images: Vec<Resource> = this.images_requested.get_mut().drain().collect();
+            release_viewer_images(images, cx, None);
         })
         .detach();
         this.reload(window, cx);
@@ -2993,12 +3218,17 @@ impl FileViewer {
         }
     }
 
-    /// 逐条对照 `FileViewerModal.tsx:275-283`。
+    /// 逐条对照 `FileViewerModal.tsx:275-283`。看图页签另走换代
+    /// ([`Self::schedule_image_reload`]),原版那边图片改了是不跟的。
     fn on_fs_change(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if self.source.is_remote() || self.is_img() || self.result.is_none() {
+        if self.source.is_remote() || !same_path(&path.to_string_lossy(), &self.path_str()) {
             return;
         }
-        if !same_path(&path.to_string_lossy(), &self.path_str()) {
+        if self.is_img() {
+            self.schedule_image_reload(window, cx);
+            return;
+        }
+        if self.result.is_none() {
             return;
         }
         // 自己 write 落盘触发的回声,不算「外部」修改
@@ -3016,6 +3246,44 @@ impl FileViewer {
             // 干净:静默重载跟上磁盘
             self.reload(window, cx);
         }
+    }
+
+    /// 看图页签对应的图在磁盘上被改写了:去抖 [`IMAGE_RELOAD_DEBOUNCE`] 后换代。
+    ///
+    /// 此前这里直接 return,缓存里那份永远是第一次读到的,图改了页签照旧显示旧图。
+    /// 一次保存在 Windows 上是一串 modify 事件(分块写、改大小、改时间戳各报
+    /// 一次),写到一半就读只会读到半截文件。每来一个事件就换掉旧任务(= 取消旧
+    /// 计时)重新计时,到点时手上的票还是最新的才动手。万一还是读到半截(写入
+    /// 拖得比去抖还长),解码失败也只是落到「使用默认工具打开」那页,不会崩;
+    /// 写完那一下的事件照样再换代一次。
+    fn schedule_image_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ticket = self.image_reload.bump();
+        self._image_reload_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(IMAGE_RELOAD_DEBOUNCE).await;
+            let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+                if view.image_reload.is_current(ticket) {
+                    view.reload_image(window, cx);
+                }
+            });
+        }));
+    }
+
+    /// 换代:旧图从资源缓存与图集里放掉(**不看持有账** —— 文件变了,谁手上的
+    /// 都是旧图),本页签下一帧 `use_asset` 取不到就从盘上重读;别的页签若也挂着
+    /// 这张图,同样取到新的。
+    fn reload_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let resource = local_image_resource(&self.current_path);
+        let latest = cx
+            .default_global::<ViewerImageHolds>()
+            .0
+            .take_latest(&resource);
+        // `update_in` 里当前窗口被摘出了 `App.windows`,必须递进去
+        // (同 `release_mermaid_assets` 的注释)
+        evict_viewer_image(&resource, latest, cx, Some(window));
+        // 整窗重画而不只是 notify 自己:别的页签(比如引用这张图的 README 预览)
+        // 上一帧的场景里还拿着旧图的图块,窗口不脏就可能被原样再呈现一遍
+        // (理由见 `evict_viewer_image`)
+        window.refresh();
     }
 
     // ── 保存 ──────────────────────────────────────────────
@@ -3636,17 +3904,45 @@ impl FileViewer {
             .child(text)
     }
 
-    /// 图片分支。**位图与 svg 都走 `gpui::img(Resource::Path)`** ——
-    /// 那条路里 gpui 对 svg 做了 `swap_rgba_pa_to_bgra`(`elements/img.rs:698-703`),
-    /// 颜色与预乘 alpha 都是对的;`mt_ui::icons::vector` 注释里记的红蓝互换
-    /// 是**另一条路**(`Image::from_bytes(ImageFormat::Svg, …)` 走 `platform.rs`
-    /// 的 `to_image_data`,那里确实漏了交换)。
+    /// 取一张查看器图片([`ViewerImage`]):首次用到时登记持有 —— **先记后要**,
+    /// 理由同 mermaid(`use_asset` 一调用,资源系统里就有了这个 key 的任务)——
+    /// 取到了顺手把位图记进账本,放的时候靠它找图集纹理。
+    fn use_viewer_image(
+        &self,
+        resource: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<<ViewerImage as gpui::Asset>::Output> {
+        if self.images_requested.borrow_mut().insert(resource.clone()) {
+            cx.default_global::<ViewerImageHolds>()
+                .0
+                .acquire(resource.clone());
+        }
+        let result = window.use_asset::<ViewerImage>(resource, cx);
+        if let Some(Ok(image)) = &result {
+            cx.default_global::<ViewerImageHolds>()
+                .0
+                .note(resource, Arc::downgrade(image));
+        }
+        result
+    }
+
+    /// 图片分支。**位图与 svg 都走 [`ImageAssetLoader`]**([`ViewerImage`] 原样
+    /// 转交给它)—— 那条路里 gpui 对 svg 做了 `swap_rgba_pa_to_bgra`
+    /// (`elements/img.rs:698-703`),颜色与预乘 alpha 都是对的;
+    /// `mt_ui::icons::vector` 注释里记的红蓝互换是**另一条路**
+    /// (`Image::from_bytes(ImageFormat::Svg, …)` 走 `platform.rs` 的
+    /// `to_image_data`,那里确实漏了交换)。
+    ///
+    /// 画的是**这里取到的那一份**,不是 `img(path)`:后者走 gpui 自己的
+    /// `ImgResourceLoader`(另一个资源类型),同一张图会再解一遍、多占一份
+    /// 内存与显存,而且那份谁也放不掉。
     ///
     /// 解不出来的格式(`image` crate 默认 feature 不含 avif 解码)不留白屏:
     /// 走 [`Self::render_fallback`] 给一个「使用默认工具打开」。
     fn render_image(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let resource = Resource::Path(Arc::from(self.current_path.as_path()));
-        match window.use_asset::<ImageAssetLoader>(&resource, cx) {
+        let resource = local_image_resource(&self.current_path);
+        match self.use_viewer_image(&resource, window, cx) {
             None => self
                 .render_center(t("fileViewer", "loading").to_string(), ui::text_muted())
                 .into_any_element(),
@@ -3657,14 +3953,14 @@ impl FileViewer {
                     cx,
                 )
                 .into_any_element(),
-            Some(Ok(_)) => div()
+            Some(Ok(data)) => div()
                 .size_full()
                 .p(px(24.0))
                 .flex()
                 .items_center()
                 .justify_center()
                 // Img 的 object_fit 默认就是 Contain,与原版 `object-contain` 同义
-                .child(img(self.current_path.clone()).size_full())
+                .child(img(data).size_full())
                 .into_any_element(),
         }
     }
@@ -3804,9 +4100,9 @@ impl FileViewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let resource = Resource::Path(Arc::from(path));
+        let resource = local_image_resource(path);
         let hint = path.to_string_lossy().to_string();
-        match window.use_asset::<ImageAssetLoader>(&resource, cx) {
+        match self.use_viewer_image(&resource, window, cx) {
             // 还在读 / 读不出来(文件不在、格式解不了)都给占位,不留白
             None | Some(Err(_)) => md_image_placeholder(id, label, Some(hint), None),
             Some(Ok(data)) => {
@@ -3848,9 +4144,8 @@ impl FileViewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let uri = gpui::SharedUri::from(url.to_string());
-        let resource = Resource::Uri(uri.clone());
-        match window.use_asset::<ImageAssetLoader>(&resource, cx) {
+        let resource = remote_image_resource(url);
+        match self.use_viewer_image(&resource, window, cx) {
             None | Some(Err(_)) => md_image_placeholder(
                 id,
                 label,
@@ -4213,6 +4508,7 @@ impl FileViewer {
             .collect();
 
         self.release_stale_mermaid(&blocks, window, cx);
+        self.release_stale_images(&blocks, base_dir, window, cx);
 
         let blocks = Rc::new(blocks);
         *self.md_cache.borrow_mut() = Some(MdCache {
@@ -4249,6 +4545,30 @@ impl FileViewer {
             requested.remove(key);
         }
         release_mermaid_assets(&stale, cx, Some(window));
+    }
+
+    /// 重切分块后,撤掉本页签对新分块里已经没有的图片的持有(改了图片链接、
+    /// 删了图片行、所在目录变了)。别的页签还在用的由账本留着,见 [`HoldTable`]。
+    ///
+    /// 在渲染途中放是安全的:所有 render / prepaint 都先于本帧任何 paint
+    /// (`window.rs` 的 `draw_roots`),这些图本帧不会再被画;上一帧的场景在
+    /// 本帧画完后就被替换,不会再呈现。
+    fn release_stale_images(
+        &self,
+        blocks: &[(f32, MdBlock)],
+        base_dir: &Path,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let stale: Vec<Resource> = {
+            let mut requested = self.images_requested.borrow_mut();
+            if requested.is_empty() {
+                return;
+            }
+            let live = md_image_resources(blocks, base_dir);
+            requested.extract_if(|key| !live.contains(key)).collect()
+        };
+        release_viewer_images(stale, cx, Some(window));
     }
 
     /// 让 [`Self::md_list`] 与当前分块对齐:块数变了、分块代次变了(源码或所在
