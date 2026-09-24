@@ -3251,6 +3251,9 @@ impl TerminalArea {
 /// pane 里,`main.rs::cached_panel` 的第二、三条前提同样满足。
 ///
 /// 占位样式与 `TerminalPane::render` 根节点(两个分支都是 `size_full`)等价。
+/// 占位节点没有子节点、min-content 为 0,**不会**把分栏撑宽 —— 分屏后三栏被
+/// tab 栏撑出窗口那条是 `main.rs::columns_host` 缺 `min_w(0)`,套不套缓存实测
+/// bounds 完全相同(见该函数注释)。
 fn cached_terminal(entity: Entity<crate::pane::TerminalPane>) -> AnyElement {
     entity
         .cached(gpui::StyleRefinement::default().size_full())

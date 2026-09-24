@@ -1336,6 +1336,23 @@ fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> gpui::Vi
     AnyView::from(view.clone()).cached(style)
 }
 
+/// 三栏(`columns_group`)在 body 横排里的宿主。
+///
+/// ⚠️ **`min_w(0)` 不能省**。flex 项的自动最小宽度是内容的 min-content,而叶子 tab 栏
+/// 里的 tab 片是 `flex_none`(72~200px),tab 栏的 `overflow_x_scroll` 挡不住它往上报;
+/// 一路上的 `size_full` / `min_w(0)` 只管各自那一层,这一层是唯一由 flex 定宽、又
+/// 没钉最小宽度的。分屏把每个叶子的宽度砍半、tab 一个不少,几条 tab 就能让
+/// min-content 超过窗口:宿主被撑宽,三栏的 `ResizableState` 按容器比例把中栏也放大
+/// (「左栏被撑宽」),右侧面板竖条与新 pane 被挤出窗口右缘。
+///
+/// 在 gpui 测试平台上按同一嵌套实测(1280 宽窗口):分屏后左叶 5 个 200px 的 tab,
+/// 不加时三栏被撑到 1496、中栏 300 → 352、竖条整条出界;单叶 12 个 tab 同样溢出。
+/// 加上之后各块 bounds 与 tab 少时逐一吻合。pane 套不套 view 级缓存两种写法测出来
+/// 完全相同 —— 与 `terminal_area::cached_terminal` 无关。
+fn columns_host() -> gpui::Div {
+    div().flex_1().min_w(px(0.0)).h_full()
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸变了就让两组分栏重新以持久化的绝对像素做种(见该函数注释)——
@@ -1960,7 +1977,7 @@ impl Render for Workspace {
             // Activity Bar 的 flex 占位仍是 44px;视觉条本体在 columns 后面以
             // absolute sibling 画,让右伸的标签不被 columns 覆盖。
             .child(div().flex_none().w(px(activity_bar::WIDTH)).h_full())
-            .child(div().flex_1().h_full().child(columns_group))
+            .child(columns_host().child(columns_group))
             .child(toggle_strip)
             .children(drawer_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
@@ -2490,4 +2507,24 @@ fn main() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三栏宿主必须能收缩到内容 min-content 以下,理由与实测数据见 [`columns_host`]。
+    /// 布局本身要真窗口才能跑(本 crate 不开 gpui 的 test-support),这里钉的是
+    /// 那条决定性的样式:哪天有人把 `min_w(0)` 当冗余删了,这条先红。
+    #[test]
+    fn 三栏宿主能收缩到内容最小宽度以下() {
+        let mut host = columns_host();
+        let style = host.style();
+        assert_eq!(
+            style.min_size.width,
+            Some(px(0.0).into()),
+            "min_w(0) 不能省"
+        );
+        assert_eq!(style.flex_grow, Some(1.0), "仍然吃满 body 的剩余宽度");
+    }
 }
