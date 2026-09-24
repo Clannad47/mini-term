@@ -47,9 +47,9 @@
 //! 1. **脏标记**:关键词 / 选项变了 → 立刻**全扫**(用户在等结果,不能拖)。
 //! 2. **去抖**:内容变化引起的重搜最快 200ms 一次(与 xterm SearchAddon
 //!    `_updateMatches` 的 200ms 完全一致);上一次扫描越贵,间隔按比例放大
-//!    (封顶 2s,见 `TerminalSearch::debounce`)。被挡下的那次由宿主排一发
-//!    延后重绘兜底([`TerminalSearch::take_trailing_rescan`]),输出停在去抖窗口里
-//!    也不会让结果永远停在旧样子。
+//!    (封顶 2s,见 `TerminalSearch::debounce`)。被挡下、且内容确实动过的那次
+//!    由宿主排一发延后重绘兜底([`TerminalSearch::take_trailing_rescan`]),输出停在
+//!    去抖窗口里也不会让结果永远停在旧样子。
 //! 3. **变化检测**:去抖到期后先比内容代数(`TerminalEmulator::generation`,
 //!    每批输出 +1)与屏幕内容哈希([`content_fingerprint`]),都没变就直接跳过 ——
 //!    空闲时(最常见)一次扫描都不会发生。代数补的是指纹的盲区:周期性输出恰好
@@ -95,6 +95,11 @@
 //! [`TerminalSearchBar`](super::TerminalSearchBar)(改关键词/翻页)。
 //! 两边共用同一份状态,计数与高亮天然同步,不需要任何回调对账。
 //! 完整接线清单见 [`super::search_bar`] 的模块注释。
+//!
+//! 渲染层每帧(prepaint)调 [`TerminalSearch::frame_sync`],按返回值办两件事:
+//! 结果变了就再要一帧(查找条的计数在同一帧的 render 里已经读过、是扫描前的),
+//! 被去抖挡下就排一发兜底重扫。两件都不能省 —— pane 套着 view 级缓存,
+//! 窗口别处的重绘不会顺手替它补上(见 [`FrameSync`])。
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -152,6 +157,21 @@ impl Default for SearchLimits {
             max_scan_lines: None,
         }
     }
+}
+
+/// 渲染层一帧 sync 完该做的事([`TerminalSearch::frame_sync`] 的返回值)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameSync {
+    /// 结果集(命中 / 当前命中)这一帧变了,宿主要**再画一帧**。
+    ///
+    /// 内容变化引起的重扫发生在终端元素的 prepaint 里,而查找条的「n/总数」早在
+    /// 同一帧的 render 阶段就读过了 —— 这一帧画出去的计数是扫描**之前**的。
+    /// 不再要一帧的话,计数要等别的事碰巧重画这个 pane 才跟上;pane 套着 view 级
+    /// 缓存时,窗口别处的重绘碰不到它(输出停了,计数就一直停在旧值)。
+    pub repaint: bool,
+    /// 被去抖挡下、内容确实动过:这么久之后要再 sync 一次(兜底重扫,
+    /// 见 [`TerminalSearch::take_trailing_rescan`])。
+    pub rescan_after: Option<Duration>,
 }
 
 /// 自适应去抖:内容变化引起的重搜间隔至少是上一次扫描耗时的这么多倍 ——
@@ -539,6 +559,16 @@ impl TerminalSearch {
         self.sync_at(emulator, Instant::now())
     }
 
+    /// 渲染层每帧(prepaint)的入口:[`Self::sync`] 一次,再把宿主要做的两件事
+    /// 一并交代出来,见 [`FrameSync`]。
+    pub fn frame_sync(&mut self, emulator: &TerminalEmulator, now: Instant) -> FrameSync {
+        let repaint = self.sync_at(emulator, now);
+        FrameSync {
+            repaint,
+            rescan_after: self.take_trailing_rescan(now),
+        }
+    }
+
     /// [`Self::sync`] 的可注入时钟版本,单测用。
     pub fn sync_at(&mut self, emulator: &TerminalEmulator, now: Instant) -> bool {
         if !self.is_active() {
@@ -559,7 +589,11 @@ impl TerminalSearch {
             .map(|t| now.saturating_duration_since(t) >= self.debounce())
             .unwrap_or(true);
         if !due {
-            self.deferred = true;
+            // 只有内容真动过(代数变了)才算欠一次重扫。不这么判的话,扫完紧跟着的
+            // 那一帧(结果变了要求的重画、滚轮、键入回显)都会白排一发兜底重绘。
+            // 代数是原子量,不拿 term 锁;所有改内容的路径(推进字节 / resize /
+            // 改回滚行数)都会推进它,`with_term_mut` 只动回看位置与选区
+            self.deferred = emulator.generation() != self.last_generation;
             return false;
         }
         self.deferred = false;
@@ -2023,6 +2057,148 @@ mod tests {
         assert_eq!(
             s.take_trailing_rescan(t0 + Duration::from_millis(200)),
             None
+        );
+    }
+
+    /// 宿主帧时序的模拟,照 pane 套了 view 级缓存之后的真实情形:
+    ///
+    /// - 帧只在三种情况下发生:有输出(节拍器 notify pane)、兜底重扫到点、
+    ///   上一帧要求重画(`FrameSync::repaint`)—— 窗口别处的重绘碰不到这个 pane;
+    /// - 一帧之内查找条先 render(读计数),终端元素后 prepaint(`frame_sync`)。
+    ///
+    /// `bursts` 是 (毫秒, 输出);`honor_repaint = false` 模拟不理会重画请求的宿主。
+    /// 返回输出停下、帧排空之后查找条上停住的计数,以及总帧数。
+    fn simulate_host(
+        s: &mut TerminalSearch,
+        e: &TerminalEmulator,
+        base: Instant,
+        bursts: &[(u64, String)],
+        honor_repaint: bool,
+    ) -> (usize, usize) {
+        use std::collections::BTreeMap;
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        // 待画的帧:毫秒 → 这一帧是不是兜底重扫到点(同一毫秒的帧合并成一帧)
+        let mut frames: BTreeMap<u64, bool> = BTreeMap::new();
+        let mut bursts = bursts.iter().peekable();
+        let mut shown = 0;
+        let mut drawn = 0;
+        loop {
+            let next_frame = frames.keys().next().copied();
+            let next_burst = bursts.peek().map(|(ms, _)| *ms);
+            // 同一毫秒先落输出、再画帧
+            let burst_first = match (next_burst, next_frame) {
+                (None, None) => return (shown, drawn),
+                (Some(b), Some(f)) => b <= f,
+                (burst, _) => burst.is_some(),
+            };
+            if burst_first {
+                let (ms, bytes) = bursts.next().unwrap();
+                e.advance(bytes.as_bytes());
+                frames.entry(*ms).or_insert(false);
+                continue;
+            }
+            let ms = next_frame.unwrap();
+            if frames.remove(&ms).unwrap() {
+                s.trailing_rescan_fired();
+            }
+            drawn += 1;
+            assert!(drawn < 500, "帧排不空:重画 / 兜底互相续命了");
+            // render:查找条读计数
+            shown = s.count();
+            // prepaint:终端元素 sync
+            let frame = s.frame_sync(e, at(ms));
+            if frame.repaint && honor_repaint {
+                frames.entry(ms + 16).or_insert(false);
+            }
+            if let Some(delay) = frame.rescan_after {
+                *frames.entry(ms + delay.as_millis() as u64).or_insert(true) = true;
+            }
+        }
+    }
+
+    /// 回归(w5c 引入):回滚区满了之后命中被挤出顶部,输出停在去抖窗口里。兜底
+    /// 重扫在 prepaint 里把命中剔掉了,但查找条那一帧已经 render 过、画的是扫描
+    /// 前的数 —— pane 套着 view 级缓存,再没有帧来更新它,计数一直停在旧值,
+    /// 滚一下滚轮才纠正。结果一变就再要一帧,停住的计数必须与全扫一致。
+    #[test]
+    fn 输出停下后查找条计数与全扫一致() {
+        let setup = || {
+            let e = TerminalEmulator::with_scrollback(TermSize::new(30, 6), 40);
+            // 历史填满,命中散在回看缓冲里
+            for i in 0..80 {
+                let tag = if i % 7 == 0 { "needle" } else { "filler" };
+                e.advance(format!("{tag} {i}\r\n").as_bytes());
+            }
+            e
+        };
+        // 每 30ms 两行不含关键词的输出,把命中一条条挤出顶部;最后一批(570ms)
+        // 落在 400ms 那次扫描之后的去抖窗口里
+        let bursts: Vec<(u64, String)> = (1..=19u64)
+            .map(|k| (k * 30, format!("plain {k}\r\nplain {k}b\r\n")))
+            .collect();
+
+        let e = setup();
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        let base = Instant::now();
+        assert!(s.frame_sync(&e, base).repaint, "首扫(脏)");
+        let before = s.count();
+        let incremental = s.incremental_scans;
+        let (shown, frames) = simulate_host(&mut s, &e, base, &bursts, true);
+        let expected = fresh_matches(&e, "needle", SearchOptions::default());
+        assert_eq!(s.matches(), expected.as_slice(), "引擎结果与全扫一致");
+        assert!(expected.len() < before, "场景里必须真有命中被挤出顶部");
+        assert!(
+            s.incremental_scans > incremental,
+            "历史满了的挤出场景要走增量重扫"
+        );
+        assert_eq!(shown, expected.len(), "查找条停住的计数与全扫一致");
+        assert!(frames < 60, "重画请求不该让帧数失控:{frames}");
+        // 帧排空之后引擎不再欠任何东西:再来一帧既不要重画也不排兜底
+        assert_eq!(
+            s.frame_sync(&e, base + Duration::from_secs(5)),
+            FrameSync::default()
+        );
+
+        // 对照:不理会重画请求的宿主(= 修复前),计数停在兜底重扫之前的值
+        let e = setup();
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        s.frame_sync(&e, base);
+        let (stale, _) = simulate_host(&mut s, &e, base, &bursts, false);
+        assert_eq!(s.count(), expected.len(), "引擎本身早已扫对");
+        assert_ne!(
+            stale,
+            s.count(),
+            "对照组必须复现出陈旧计数,否则本场景没覆盖到回归"
+        );
+    }
+
+    /// 结果变了要的那一帧紧跟在扫描之后(没到去抖点):内容没再动就什么都不欠,
+    /// 不能再排一发兜底重扫 —— 否则每次结果变化都白多一帧。
+    #[test]
+    fn 重画帧内容未动不再排兜底重扫() {
+        let e = emulator("cat\n");
+        let mut s = TerminalSearch::new();
+        s.set_query("cat");
+        let t0 = Instant::now();
+        assert!(s.frame_sync(&e, t0).repaint, "首扫结果变了,要一帧");
+        let redraw = s.frame_sync(&e, t0 + Duration::from_millis(16));
+        assert_eq!(redraw, FrameSync::default(), "内容没动:不重画、不欠重扫");
+        // 滚动回看只动 display_offset,同样什么都不欠
+        e.with_term_mut(|t| t.scroll_display(Scroll::Delta(1)));
+        assert_eq!(
+            s.frame_sync(&e, t0 + Duration::from_millis(40)),
+            FrameSync::default()
+        );
+        // 真有新输出才欠:排到去抖点
+        e.advance(b"cat\r\n");
+        assert_eq!(
+            s.frame_sync(&e, t0 + Duration::from_millis(50)),
+            FrameSync {
+                repaint: false,
+                rescan_after: Some(Duration::from_millis(150)),
+            }
         );
     }
 

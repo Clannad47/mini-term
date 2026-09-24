@@ -3235,7 +3235,11 @@ impl TerminalArea {
 ///   `TerminalView` 与终端元素的监听器里全是 `cx.notify(自己)`,沿视图路径标脏到本 pane;
 /// - **滚动条淡出**:paint 里 `request_animation_frame`,下一帧 notify 当前视图;
 /// - **查找**:查找条是本 pane 的子视图(改关键词 / 翻页即标脏);输出引起的重扫被
-///   去抖挡下时,渲染层排一发延后 notify 兜底(`TerminalSearch::take_trailing_rescan`);
+///   去抖挡下时,渲染层排一发延后 notify 兜底(`TerminalSearch::take_trailing_rescan`)。
+///   ⚠️ 这类重扫发生在终端元素的 **prepaint**,而查找条的「n/总数」在同一帧的
+///   **render** 就读过了 —— 结果一变,渲染层 `request_animation_frame` 再要一帧
+///   (`FrameSync::repaint`)。缓存之前窗口任何一次重绘都会顺手重画查找条,这层
+///   时序差被掩住了;套上缓存后漏了它,输出一停计数就停在扫描前的值;
 /// - **焦点切换 / 窗口激活 / 缩放与 DPI**:gpui 走 `window.refresh()`,全窗缓存作废;
 /// - **主题 / 字号 / 语言 / 减弱动效**:`set_theme` / `set_style` 自己 notify,
 ///   界面字号与语言走 `refresh_windows`,亮暗切换经 `Theme::change(window)` 刷新;

@@ -34,9 +34,9 @@ pub use mini::{
 };
 pub use scrollbar::{ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
 pub use search::{
-    HighlightKind, HighlightSpan, SearchDirection, SearchHighlights, SearchLimits, SearchMatch,
-    SearchOptions, TerminalSearch, advance_index, build_pattern, escape_literal, index_at_or_after,
-    is_word_char, whole_word_ok,
+    FrameSync, HighlightKind, HighlightSpan, SearchDirection, SearchHighlights, SearchLimits,
+    SearchMatch, SearchOptions, TerminalSearch, advance_index, build_pattern, escape_literal,
+    index_at_or_after, is_word_char, whole_word_ok,
 };
 pub use search_bar::{
     OnSearchClose, SearchBarEvent, SearchBarLabels, TerminalSearchBar, counter_text,
