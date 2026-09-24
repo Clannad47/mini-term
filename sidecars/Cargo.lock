@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "mt-sidecars"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "base64",
  "clap",
@@ -1244,6 +1244,7 @@ dependencies = [
  "futures",
  "mt-core",
  "mt-secret",
+ "ring",
  "rsa",
  "russh",
  "russh-sftp",

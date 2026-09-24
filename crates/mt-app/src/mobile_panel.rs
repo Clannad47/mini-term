@@ -22,7 +22,7 @@
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, fill, point, px, size,
+    Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::AiLauncher;
@@ -70,6 +70,14 @@ pub struct MobilePanel {
     /// 已经点过「生成」但码还没回来(渲染 `modal.qrWaiting`)。
     qr_requested: bool,
     draft: Option<Draft>,
+    /// 已存的桌面密钥(信封)解不开:密钥框回填为空,框下**就地**标红说明;
+    /// 用户一开始输入就隐去,保存成功后清掉。**不走 toast** —— toast 层画在弹窗
+    /// 遮罩之下,面板开着时看不见(与 `ssh_panel::ConnForm::password_unreadable`
+    /// 同一条)。
+    key_unreadable: bool,
+    /// 按钮下的一行红字提示(目前只有「密钥加密失败,本次未保存密钥」)。
+    /// 下一次保存成功时清掉,不走 toast 的理由同上。
+    notice: Option<SharedString>,
     /// 地址 / 密钥两个输入框的回车订阅。
     _subs: Vec<Subscription>,
 }
@@ -106,9 +114,23 @@ impl MobilePanel {
         }
         // 地址变了旧配对二维码即作废
         self.clear_qr();
-        cx.notify();
         let bridge = self.bridge.clone();
-        bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+        let saved = bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+        self.note_key_saved(saved);
+        cx.notify();
+    }
+
+    /// 「保存」的回执落到面板上:成功就收掉两条密钥提示,封存失败就亮红字。
+    fn note_key_saved(&mut self, saved: Result<(), String>) {
+        match saved {
+            Ok(()) => {
+                self.key_unreadable = false;
+                self.notice = None;
+            }
+            Err(err) => {
+                self.notice = Some(tr!("mobileRelay", "keySealFailed", error = err).into());
+            }
+        }
     }
 }
 
@@ -130,13 +152,23 @@ pub fn open(window: &mut Window, cx: &mut App) {
             .placeholder(t("mobileRelay", "urlPlaceholder"))
             .default_value(relay.relay_url.clone())
     });
+    // 库里的密钥是 `mt-secret` 信封,回填前解开;解不开就回填空并在框下就地标红
+    // (字段注释见 [`MobilePanel::key_unreadable`])。用户此时直接保存会把密钥清空,
+    // 那正是「密钥丢了,请重新填写」该有的结果。日志不含密钥。
+    let (key_value, key_unreadable) = match crate::secrets::reveal_relay_key(&relay.desktop_key) {
+        Ok(plain) => (plain, false),
+        Err(err) => {
+            eprintln!("[mobile-panel] 已存桌面密钥无法解密,密钥框回填为空: {err}");
+            (String::new(), true)
+        }
+    };
     // 原版是 `type="password"`;gpui-component 的对应物是 `masked` ——
     // 密钥不该明文常驻在屏幕上
     let key = cx.new(|cx| {
         InputState::new(window, cx)
             .masked(true)
             .placeholder(t("mobileRelay", "keyPlaceholder"))
-            .default_value(relay.desktop_key.clone())
+            .default_value(key_value)
     });
 
     // 打开即可直接改中转地址(密钥框是 masked,不该抢焦点)。聚焦排在
@@ -163,6 +195,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
             qr: None,
             qr_requested: false,
             draft: None,
+            key_unreadable,
+            notice: None,
             _subs: subs,
         }
     });
@@ -207,7 +241,11 @@ fn apply_settings(state: &Entity<MobilePanel>, url: String, key: String, cx: &mu
         cx.notify();
     });
     let bridge = state.read(cx).bridge.clone();
-    bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+    let saved = bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+    state.update(cx, |panel, cx| {
+        panel.note_key_saved(saved);
+        cx.notify();
+    });
 }
 
 fn request_pairing_code(state: &Entity<MobilePanel>, cx: &mut App) {
@@ -265,6 +303,9 @@ struct Frame {
     paired: Option<bool>,
     connected: bool,
     url_value: String,
+    /// 「已存密钥解不开」的红字该不该画:解不开**且**用户还没开始重填。
+    show_key_unreadable: bool,
+    notice: Option<SharedString>,
     qr: Option<(QrMatrix, String)>,
     qr_requested: bool,
     launchers: Vec<AiLauncher>,
@@ -284,6 +325,9 @@ fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
         connected: status.as_ref().map(|s| s.status.as_str()) == Some("connected"),
         status,
         url_value: panel.url.read(cx).value().to_string(),
+        // 弹窗每帧重建,这里读输入框的值是活的:一开始输入红字就换回常规灰字提示
+        show_key_unreadable: panel.key_unreadable && panel.key.read(cx).value().is_empty(),
+        notice: panel.notice.clone(),
         qr: panel.qr.clone(),
         qr_requested: panel.qr_requested,
         launchers: relay.launchers,
@@ -318,12 +362,10 @@ fn render_body(
         status,
         paired,
         connected,
-        url_value,
         ..
     } = &frame;
     let (relay_url, paired, connected) = (relay_url.clone(), *paired, *connected);
     let status = status.clone();
-    let url_value = url_value.clone();
 
     let mut body = div()
         .id("mobile-relay-body")
@@ -342,7 +384,7 @@ fn render_body(
                 .child(t("mobileRelay", "intro")),
         )
         // 2~8. 地址 / 密钥 / 两颗按钮
-        .child(render_endpoint_section(state, &url_value, &relay_url, cx))
+        .child(render_endpoint_section(state, &frame, cx))
         // 9. AI 启动器(与是否连上中转无关,始终可编辑)
         .child(render_launchers(state, &frame, cx))
         // 10. 连接状态行
@@ -466,32 +508,65 @@ fn render_body(
 /// 地址 / 密钥 / 「保存并连接」/「断开并清除」。
 fn render_endpoint_section(
     state: &Entity<MobilePanel>,
-    url_value: &str,
-    saved_url: &str,
+    frame: &Frame,
     cx: &mut App,
 ) -> impl IntoElement {
     let (url_input, key_input) = {
         let panel = state.read(cx);
         (panel.url.clone(), panel.key.clone())
     };
-    let can_apply = !url_value.trim().is_empty();
+    let can_apply = !frame.url_value.trim().is_empty();
     // 「断开并清除」在地址框与已存地址都空时才灰掉
-    let can_clear = can_apply || !saved_url.trim().is_empty();
+    let can_clear = can_apply || !frame.relay_url.trim().is_empty();
+    // 明文 ws:// 连公网主机:只警告不阻断(判据见 `mt_relay::relay_url_needs_tls_warning`)。
+    // 看的是**输入框里**的地址 —— 边敲边提示,别等保存之后才知道
+    let insecure_url = mt_relay::relay_url_needs_tls_warning(&frame.url_value);
 
     div()
         .flex()
         .flex_col()
         .child(field_label(t("mobileRelay", "urlLabel")))
         .child(Input::new(&url_input))
-        .child(div().mt(px(12.0)).child(field_label(t("mobileRelay", "keyLabel"))))
+        .when(insecure_url, |el| {
+            // **黄字不是红字** —— 它不阻塞保存(与启动器的命令警告同一档)
+            el.child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::color_warning())
+                    .child(t("mobileRelay", "urlInsecure")),
+            )
+        })
+        .child(
+            div()
+                .mt(px(12.0))
+                .child(field_label(t("mobileRelay", "keyLabel"))),
+        )
         .child(Input::new(&key_input))
         .child(
             div()
                 .mt(px(4.0))
                 .text_size(ui::font_px(11.0))
-                .text_color(ui::text_muted())
-                .child(t("mobileRelay", "keyHint")),
+                .text_color(if frame.show_key_unreadable {
+                    ui::color_error()
+                } else {
+                    ui::text_muted()
+                })
+                .child(if frame.show_key_unreadable {
+                    t("mobileRelay", "keyUnreadable")
+                } else {
+                    t("mobileRelay", "keyHint")
+                }),
         )
+        .when_some(frame.notice.clone(), |el, notice| {
+            el.child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::color_error())
+                    .child(notice),
+            )
+        })
         .child(
             div()
                 .mt(px(8.0))

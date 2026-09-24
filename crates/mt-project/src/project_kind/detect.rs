@@ -12,15 +12,20 @@
 //!    发生 `fs-change`。原版注释点明了理由:活跃项目的根目录正是唯一能在应用内
 //!    被改到这些文件的地方。
 //!
+//! 缓存与失效的接线在 mt-app(`store::AppStore::ensure_dir_kinds` / `file_tree` 的
+//! fs-change 分支);本模块自 `mt-app/src/project_kind.rs` 移入,只留纯判定与读盘。
+//! 失效比对用的路径规范化直接走 `mt_core::path_key::collapse_separators`
+//! (原先这里有个同名再导出 `norm_path`,随搬迁收掉)。
+//!
 //! # 线程
 //!
 //! [`detect_local`] 会读目录、读 `package.json`,**阻塞**;调用方一律丢
-//! background executor(见 [`crate::store::AppStore::ensure_dir_kinds`])。
+//! background executor(见 mt-app 的 `AppStore::ensure_dir_kinds`)。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use mt_ui::icons::ProjectKind;
+use super::ProjectKind;
 
 /// 出现在项目根目录即触发(重)探测的标记文件。
 ///
@@ -81,8 +86,15 @@ pub const PROJECT_MARKER_FILES: &[&str] = &[
 
 /// 按扩展名认类型的那几类 —— 这些也得触发重探。
 const MARKER_SUFFIXES: &[&str] = &[
-    ".csproj", ".sln", ".vcxproj", ".xcodeproj", ".xcworkspace",
-    ".gemspec", ".cabal", ".rockspec", ".tf",
+    ".csproj",
+    ".sln",
+    ".vcxproj",
+    ".xcodeproj",
+    ".xcworkspace",
+    ".gemspec",
+    ".cabal",
+    ".rockspec",
+    ".tf",
 ];
 
 /// 文件名是不是「一出现就该重探」的标记文件。
@@ -91,30 +103,6 @@ pub fn is_marker_file(name: &str) -> bool {
         || MARKER_SUFFIXES
             .iter()
             .any(|s| name.len() > s.len() && name.to_ascii_lowercase().ends_with(s))
-}
-
-/// 路径规范化(`useProjectKinds.ts::normPath`):分隔符统一成 `/`、去掉尾部斜杠。
-///
-/// 只用于**失效比对**(fs-change 的父目录 vs 项目路径),缓存键仍是路径原文 ——
-/// 与原版 `dirKinds` 用原始路径当 key 同口径。
-pub fn norm_path(p: &str) -> String {
-    let mut out = String::with_capacity(p.len());
-    let mut last_sep = false;
-    for ch in p.chars() {
-        if ch == '\\' || ch == '/' {
-            if !last_sep {
-                out.push('/');
-            }
-            last_sep = true;
-        } else {
-            out.push(ch);
-            last_sep = false;
-        }
-    }
-    while out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
 }
 
 /// 探一个目录得到的原料。纯数据,[`classify_project`] 是纯函数,单测直接打在它上面。
@@ -193,7 +181,9 @@ pub fn classify_project(probe: &ProjectProbe) -> Option<ProjectKind> {
         return Some(ProjectKind::Laravel);
     }
     // Rails 的判据是 Gemfile + config.ru(Rack 入口)——只看 Gemfile 会把所有 Ruby 项目吞掉
-    if probe.has("Gemfile") && (probe.has("config.ru") || probe.has_dir("app") && probe.has_dir("config")) {
+    if probe.has("Gemfile")
+        && (probe.has("config.ru") || probe.has_dir("app") && probe.has_dir("config"))
+    {
         return Some(ProjectKind::Rails);
     }
     if probe.has("manage.py") {
@@ -234,11 +224,15 @@ pub fn classify_project(probe: &ProjectProbe) -> Option<ProjectKind> {
     if probe.has("pubspec.yaml") {
         // 正文读得到且不含 flutter 才是纯 Dart;读不到一律按 Flutter
         // (pubspec.yaml 的项目绝大多数是 Flutter,这也保住了原版行为)
-        return Some(if probe.texts.contains_key("pubspec.yaml") && !probe.text_has("pubspec.yaml", "flutter") {
-            ProjectKind::Dart
-        } else {
-            ProjectKind::Flutter
-        });
+        return Some(
+            if probe.texts.contains_key("pubspec.yaml")
+                && !probe.text_has("pubspec.yaml", "flutter")
+            {
+                ProjectKind::Dart
+            } else {
+                ProjectKind::Flutter
+            },
+        );
     }
     if probe.has("composer.json") {
         return Some(ProjectKind::Php);
@@ -346,7 +340,10 @@ pub fn classify_project(probe: &ProjectProbe) -> Option<ProjectKind> {
     if probe.has("ansible.cfg") || probe.has("playbook.yml") || probe.has("site.yml") {
         return Some(ProjectKind::Ansible);
     }
-    if probe.has("Dockerfile") || probe.has("docker-compose.yml") || probe.has("docker-compose.yaml") {
+    if probe.has("Dockerfile")
+        || probe.has("docker-compose.yml")
+        || probe.has("docker-compose.yaml")
+    {
         return Some(ProjectKind::Docker);
     }
     None
@@ -396,7 +393,7 @@ pub fn parse_package_deps(json_text: &str) -> Option<HashMap<String, String>> {
 /// 读文件这步只对**在场的**标记文件做,一个都不在场时就是一次纯列目录 ——
 /// 半数项目落在这一档。读失败一律按「没有正文」退化成只看文件名的判定。
 pub fn detect_local(dir: &Path) -> Option<ProjectKind> {
-    let entries = mt_project::fs::list_directory(dir, dir).ok()?;
+    let entries = crate::fs::list_directory(dir, dir).ok()?;
     let mut probe = ProjectProbe::default();
     for e in entries {
         if e.is_dir {
@@ -407,7 +404,7 @@ pub fn detect_local(dir: &Path) -> Option<ProjectKind> {
     }
 
     let read = |name: &str| -> Option<String> {
-        mt_project::fs::read_file_content(dir, &dir.join(name))
+        crate::fs::read_file_content(dir, &dir.join(name))
             .ok()
             .filter(|r| !r.is_binary && !r.too_large)
             .map(|r| r.content)
@@ -423,7 +420,9 @@ pub fn detect_local(dir: &Path) -> Option<ProjectKind> {
             && let Some(text) = read(marker)
         {
             // 正文只用来做大小写不敏感的关键词匹配,存之前先小写化
-            probe.texts.insert((*marker).to_string(), text.to_ascii_lowercase());
+            probe
+                .texts
+                .insert((*marker).to_string(), text.to_ascii_lowercase());
         }
     }
     classify_project(&probe)
@@ -537,7 +536,10 @@ mod tests {
             Some(ProjectKind::Django)
         );
         // Laravel 认 artisan,但必须同时是个 PHP 项目
-        assert_eq!(kind(&["artisan", "composer.json"]), Some(ProjectKind::Laravel));
+        assert_eq!(
+            kind(&["artisan", "composer.json"]),
+            Some(ProjectKind::Laravel)
+        );
         assert_eq!(kind(&["artisan"]), None, "光有 artisan 不算 Laravel");
         // Rails 认 Gemfile + Rack 入口;只有 Gemfile 的是普通 Ruby 项目
         assert_eq!(kind(&["Gemfile", "config.ru"]), Some(ProjectKind::Rails));
@@ -742,14 +744,5 @@ mod tests {
         ] {
             assert!(is_marker_file(marker), "{marker} 没登记进重探表");
         }
-    }
-
-    #[test]
-    fn 路径规范化统一分隔符并去尾() {
-        assert_eq!(norm_path(r"D:\Git\demo\"), "D:/Git/demo");
-        assert_eq!(norm_path("D:/Git/demo"), "D:/Git/demo");
-        assert_eq!(norm_path(r"D:\\Git\\demo"), "D:/Git/demo");
-        assert_eq!(norm_path("/"), "/");
-        assert_eq!(norm_path(""), "");
     }
 }

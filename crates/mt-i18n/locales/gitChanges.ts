@@ -14,6 +14,9 @@ export const gitChanges = {
     unstageAll: "↓ 全部取消",
     stageAll: "↑ 全部暂存",
     committing: "提交中...",
+    commitFailed: "提交失败：{detail}",
+    loadFailed: "读取变更失败：{detail}",
+    operationFailed: "Git 操作失败：{detail}",
   },
   en: {
     discardConfirm: "Discard changes to {count} file(s)?\nThis action cannot be undone.",
@@ -30,5 +33,8 @@ export const gitChanges = {
     unstageAll: "↓ Unstage all",
     stageAll: "↑ Stage all",
     committing: "Committing...",
+    commitFailed: "Commit failed: {detail}",
+    loadFailed: "Failed to read changes: {detail}",
+    operationFailed: "Git operation failed: {detail}",
   },
 } as const;

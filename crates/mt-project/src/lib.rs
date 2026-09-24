@@ -1,4 +1,4 @@
-//! 项目侧的本地能力:文件树、目录监听、搜索、Git、外部编辑器、WSL 发行版枚举。
+//! 项目侧的本地能力:文件树、目录监听、搜索、Git、外部编辑器、WSL 发行版枚举、技术栈探测。
 //!
 //! **不依赖 Tauri,也不依赖 GPUI。** 全是同步阻塞的普通函数 + 少量长生命周期对象
 //! ([`watch::FsWatcher`] / [`search::SearchManager`]),线程调度由调用方决定。
@@ -12,6 +12,7 @@
 //! | `src-tauri/src/search.rs` | [`search`] | 全文搜索(可取消) |
 //! | `src-tauri/src/editor.rs` | [`editor`] | 用外部编辑器 / 默认程序打开路径 |
 //! | `src-tauri/src/wsl_distros.rs` | [`wsl_distros`] | 读 `HKCU\...\Lxss` 注册表枚举发行版 |
+//! | `mt-app/src/project_kind.rs` + mt-ui `icons/tech_art.rs` 里的枚举 | [`project_kind`] | 技术栈枚举 `ProjectKind`(落盘)+ 目录标记文件探测 |
 //!
 //! # 移植时改掉的
 //!
@@ -39,18 +40,17 @@
 //! 把它们挪出主线程,这一层不做线程调度,调用方要自己丢到后台执行器上跑,
 //! 否则 30s/120s 的超时会把 UI 线程按死。
 //!
-//! # 未决
+//! # 远程 SSH 项目不在这里
 //!
-//! **远程 SSH 项目**(`remote_ssh.rs` 1281 行)依赖 `mt-ssh`。收尾-1 批已把
-//! `mt-ssh` / `mt-core` 从 `src-tauri/` 物理移入 `crates/`(两者同时仍作为跨工作区
-//! path 依赖服务 `src-tauri` 与 `src-tauri/mt-sidecars`,老构建不受影响),
-//! 前置条件已就绪;远程项目本体的移植归 BB 批(#28),届时按需在本 crate
-//! 加 `mt-ssh.workspace = true`。
+//! 远程项目的服务层(SFTP 文件树 / 读写 / 传输)住在独立的 `mt-remote`(BB 批先落在
+//! mt-app 的 `remote_ssh/`,2026-09 下沉成 crate),由它依赖本 crate 与 `mt-ssh`;
+//! 本 crate 不带 russh / tokio。
 //! 远程文件树复用 [`fs::natural_cmp`],与本地树保持同一排序观感。
 
 pub mod editor;
 pub mod fs;
 pub mod git;
+pub mod project_kind;
 pub mod search;
 pub mod watch;
 pub mod wsl_distros;

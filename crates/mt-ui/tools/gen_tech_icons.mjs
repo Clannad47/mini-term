@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * 技术栈徽标生成器：devicon → crates/mt-ui/src/icons/tech_art.rs
+ *                  + CATALOG → crates/mt-project/src/project_kind/catalog.rs
  *
  * 原版（Tauri/React）用的就是 devicon 的 `*-original.svg` 裸资产；改造前的 GPUI 版
  * 拿不到源文件，只能自绘几何骨架 + 官方品牌色，自己在注释里承认「Java / Python / Go /
@@ -13,12 +14,20 @@
  *
  * ```bash
  * cd crates/mt-ui/tools && npm install
- * node gen_tech_icons.mjs            # 覆写 ../src/icons/tech_art.rs
+ * node gen_tech_icons.mjs            # 覆写 tech_art.rs 与 mt-project 的 catalog.rs
  * node gen_tech_icons.mjs --preview  # 另出 target/tech-icons-preview.html
  * ```
  *
  * 产物是**生成物，禁止手改** —— 连 `ProjectKind` 枚举本身都由下面的 CATALOG 生成，
  * 改种类只改 CATALOG 后重跑。
+ *
+ * ## 为什么一张表出两个文件
+ *
+ * `ProjectKind` 是**落盘的领域数据**（`kindOverride`），归 mt-project，与目录探测
+ * 住在一起；徽标形状是美术资源，归 mt-ui。mt-ui 不依赖 mt-project（它带 git2 等
+ * 重库），所以形状表按**落盘字符串**查（`shapes_of("rust")`），枚举 → 字符串的
+ * 映射由宿主做（mt-app：`TechIcon::new(kind.as_str())`）。两边出自同一张 CATALOG、
+ * 同一次生成，不会漂开；mt-app 另有单测逐项对账（防有人手改其中一边）。
  *
  * ## 深色底可读性
  *
@@ -38,6 +47,7 @@ import {
 const here = path.dirname(fileURLToPath(import.meta.url));
 const deviconDir = path.resolve(here, 'node_modules', 'devicon', 'icons');
 const outFile = path.resolve(here, '..', 'src', 'icons', 'tech_art.rs');
+const kindFile = path.resolve(here, '..', '..', 'mt-project', 'src', 'project_kind', 'catalog.rs');
 const previewFile = path.resolve(here, '..', '..', '..', 'target', 'tech-icons-preview.html');
 
 /**
@@ -241,26 +251,26 @@ export function loadIcon(name) {
 
 // ─────────────────────────── Rust 代码生成 ───────────────────────────
 
-function emitRust(entries) {
+/** mt-ui 那一半：devicon 烘焙出的形状表，按落盘字符串查。 */
+function emitArt(entries) {
   const lines = [];
   const push = (s = '') => lines.push(s);
 
-  push('//! 技术栈徽标与项目类型 —— **生成物，禁止手改**。');
+  push('//! 技术栈徽标 —— **生成物，禁止手改**。');
   push('//!');
   push('//! 由 `crates/mt-ui/tools/gen_tech_icons.mjs` 从 devicon（MIT，与原版 Tauri 前端');
   push('//! 同一批资产）烘焙而来：官方 logo 的那条 `d` 原样搬进 [`Geom::Path`]，渲染仍是自绘');
   push('//! （判据见 [`super::vector`] 模块注释）。');
   push('//!');
-  push('//! 连 [`ProjectKind`] 枚举本身都是生成的 —— 种类、落盘字符串、展示名、菜单分组');
-  push('//! 四者必须同步，分开手写迟早对不上。改种类请改生成器的 CATALOG 后重跑。');
-  push('//!');
-  push('//! ⚠ [`ProjectKind::as_str`] 的取值会**落盘**（用户手动指定的类型存进配置的');
-  push('//! `kindOverride`），已有取值一个字都不能改，否则存量配置读不回来。');
+  push('//! 按技术栈的**落盘字符串**查表（`mt_project::project_kind::ProjectKind::as_str` 的取值）。');
+  push('//! 枚举本身连同展示名、菜单分组由同一个生成器写进 mt-project');
+  push('//! （`crates/mt-project/src/project_kind/catalog.rs`）—— 两边出自同一张 CATALOG，');
+  push('//! 分开手写迟早对不上。改种类请改生成器的 CATALOG 后重跑。mt-ui 不依赖 mt-project');
+  push('//! （它带 git2 等重库），枚举 → 字符串的映射由宿主做：`TechIcon::new(kind.as_str())`。');
   push('//!');
   push('//! 商标注意（沿用 brand.rs 的红线）：logo 仅作「这个项目是什么技术栈」的指示性');
   push('//! 使用，不得用作产品自身标识。');
   push('');
-  push('use super::tech::TechCategory;');
   push('use super::vector::{Geom, Ink, Shape};');
   push('');
 
@@ -270,6 +280,45 @@ function emitRust(entries) {
     push(`static ${rustIdent(e.kind)}: &[Shape] = ${emitShapes(e)};`);
     push('');
   }
+
+  push('/// 落盘字符串（`ProjectKind::as_str` 的取值）→ 形状表。不认识的字符串给 `None`。');
+  push('pub(super) fn shapes_of(kind: &str) -> Option<&\'static [Shape]> {');
+  push('    Some(match kind {');
+  for (const e of entries) push(`        "${e.kind}" => ${rustIdent(e.kind)},`);
+  push('        _ => return None,');
+  push('    })');
+  push('}');
+  push('');
+
+  push('/// 有图的全部落盘字符串，顺序同 `ProjectKind` 的菜单顺序（按分组聚拢）。');
+  push('///');
+  push('/// 宿主（mt-app）拿它与 `mt_project::project_kind::ALL_PROJECT_KINDS` 逐项对账：');
+  push('/// 两边出自同一张 CATALOG，对不上说明有人手改了其中一边的生成物。');
+  push('pub const TECH_ART_KINDS: &[&str] = &[');
+  for (const e of entries) push(`    "${e.kind}",`);
+  push('];');
+  push('');
+
+  return lines.join('\n');
+}
+
+/** mt-project 那一半：`ProjectKind` 枚举 + 落盘字符串 / 展示名 / 菜单分组。 */
+function emitKinds(entries) {
+  const lines = [];
+  const push = (s = '') => lines.push(s);
+
+  push('//! 项目技术栈枚举 —— **生成物，禁止手改**。');
+  push('//!');
+  push('//! 由 `crates/mt-ui/tools/gen_tech_icons.mjs` 从它的 CATALOG 生成，与 mt-ui 的徽标');
+  push('//! 形状表（`crates/mt-ui/src/icons/tech_art.rs`）出自同一张表 —— 种类、落盘字符串、');
+  push('//! 展示名、菜单分组、徽标五者必须同步，分开手写迟早对不上。改种类请改生成器的');
+  push('//! CATALOG 后重跑。');
+  push('//!');
+  push('//! ⚠ [`ProjectKind::as_str`] 的取值会**落盘**（用户手动指定的类型存进配置的');
+  push('//! `kindOverride`），已有取值一个字都不能改，否则存量配置读不回来。');
+  push('');
+  push('use super::TechCategory;');
+  push('');
 
   push('/// 项目技术栈。取值来自生成器 CATALOG，顺序即菜单顺序（按分组聚拢）。');
   push('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]');
@@ -307,12 +356,6 @@ function emitRust(entries) {
   push('    pub fn category(self) -> TechCategory {');
   push('        match self {');
   for (const e of entries) push(`            Self::${e.variant} => TechCategory::${e.category},`);
-  push('        }');
-  push('    }');
-  push('');
-  push('    pub(super) fn shapes(self) -> &\'static [Shape] {');
-  push('        match self {');
-  for (const e of entries) push(`            Self::${e.variant} => ${rustIdent(e.kind)},`);
   push('        }');
   push('    }');
   push('}');
@@ -374,9 +417,12 @@ function main() {
   }
 
   entries.sort((a, b) => order.indexOf(a.category) - order.indexOf(b.category));
-  fs.writeFileSync(outFile, emitRust(entries));
+  fs.writeFileSync(outFile, emitArt(entries));
+  fs.mkdirSync(path.dirname(kindFile), { recursive: true });
+  fs.writeFileSync(kindFile, emitKinds(entries));
 
   console.log(`✓ ${path.relative(process.cwd(), outFile)}`);
+  console.log(`✓ ${path.relative(process.cwd(), kindFile)}`);
   console.log(`  技术栈 ${entries.length} 种：${order.map((c) => `${c} ${entries.filter((e) => e.category === c).length}`).join(' / ')}`);
   const mono = entries.filter((e) => e.recolored === 'mono').map((e) => e.label);
   const lit = entries.filter((e) => e.recolored === 'lighten').map((e) => e.label);

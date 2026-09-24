@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 905;
+pub const ZH_ENTRY_COUNT: usize = 916;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 905;
+pub const EN_ENTRY_COUNT: usize = 916;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -35,14 +35,18 @@ static APP_ZH: &[(&str, &str)] = &[
     ("closeConfirm.titleAi", "有 AI 会话正在运行"),
     ("closeConfirm.titleUnsaved", "有文件尚未保存"),
     ("configLoadFailed", "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}"),
+    ("configSaveFailed.message", "最近的改动没能写入磁盘，重启后可能丢失：{detail}"),
+    ("configSaveFailed.title", "配置保存失败"),
     ("emptyState", "请先在中间栏添加项目"),
     ("firstRun.addLocal", "添加本地项目"),
     ("firstRun.addRemote", "添加 SSH 远程项目"),
     ("firstRun.hintsTitle", "常用快捷键"),
     ("firstRun.subtitle", "添加一个目录，就能在里面开终端、跑 AI 会话"),
     ("firstRun.title", "还没有项目"),
+    ("layoutLoadFailed", "界面布局库不可用，本次调整的分屏、栏宽与窗口位置不会保存。\n\n错误：{detail}"),
     ("menu.settings", "设置"),
     ("mobileStartSession", "移动端新建了会话（{launcher}）"),
+    ("storageIssueTitle", "数据保存异常"),
     ("titleBar.close", "关闭"),
     ("titleBar.maximize", "最大化"),
     ("titleBar.minimize", "最小化"),
@@ -84,14 +88,18 @@ static APP_EN: &[(&str, &str)] = &[
     ("closeConfirm.titleAi", "AI sessions still running"),
     ("closeConfirm.titleUnsaved", "Unsaved files"),
     ("configLoadFailed", "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}"),
+    ("configSaveFailed.message", "Recent changes couldn't be written to disk and may be lost after a restart: {detail}"),
+    ("configSaveFailed.title", "Couldn't save settings"),
     ("emptyState", "Add a project in the middle panel first"),
     ("firstRun.addLocal", "Add local project"),
     ("firstRun.addRemote", "Add SSH remote project"),
     ("firstRun.hintsTitle", "Handy shortcuts"),
     ("firstRun.subtitle", "Add a directory to open terminals and run AI sessions in it"),
     ("firstRun.title", "No projects yet"),
+    ("layoutLoadFailed", "The layout database is unavailable. Split panes, column widths and window position changed this session won't be saved.\n\nError: {detail}"),
     ("menu.settings", "Settings"),
     ("mobileStartSession", "Mobile started a session ({launcher})"),
+    ("storageIssueTitle", "Storage problem"),
     ("titleBar.close", "Close"),
     ("titleBar.maximize", "Maximize"),
     ("titleBar.minimize", "Minimize"),
@@ -329,9 +337,10 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.moveConfirm", "确定要把 \"{name}\" 移动到 \"{target}\" 吗？"),
     ("dialog.moveOk", "移动"),
     ("dialog.moveTitle", "移动"),
-    ("dialog.noEditorMessage", "请先在『设置 → 系统设置 → 外部编辑器』中添加编辑器。"),
+    ("dialog.noEditorMessage", "请先在『设置 → 系统 → 外部编辑器』中添加编辑器。"),
     ("dialog.noEditorTitle", "未配置外部编辑器"),
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
+    ("dialog.openExternalFailedTitle", "打开失败"),
     ("dialog.renameFailedMessage", "重命名失败：{error}"),
     ("dialog.renameFailedTitle", "重命名失败"),
     ("download.contextChanged", "下载上下文已变化，请重新打开或刷新文件后再试。"),
@@ -414,9 +423,10 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.moveConfirm", "Move \"{name}\" to \"{target}\"?"),
     ("dialog.moveOk", "Move"),
     ("dialog.moveTitle", "Move"),
-    ("dialog.noEditorMessage", "Add an editor under Settings → System → External Editors first."),
+    ("dialog.noEditorMessage", "Add an editor under Settings → System → Editors first."),
     ("dialog.noEditorTitle", "No External Editor Configured"),
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
+    ("dialog.openExternalFailedTitle", "Failed to Open"),
     ("dialog.renameFailedMessage", "Rename failed: {error}"),
     ("dialog.renameFailedTitle", "Rename Failed"),
     ("download.contextChanged", "The download context changed. Reopen or refresh the file and try again."),
@@ -570,6 +580,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static GIT_CHANGES_ZH: &[(&str, &str)] = &[
+    ("commitFailed", "提交失败：{detail}"),
     ("committing", "提交中..."),
     ("contextDiscard", "丢弃修改"),
     ("contextViewDiff", "查看 Diff"),
@@ -578,7 +589,9 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
     ("discardOk", "丢弃"),
     ("discardTitle", "丢弃修改"),
     ("empty", "暂无变更"),
+    ("loadFailed", "读取变更失败：{detail}"),
     ("loading", "加载中..."),
+    ("operationFailed", "Git 操作失败：{detail}"),
     ("refresh", "刷新"),
     ("stageAll", "↑ 全部暂存"),
     ("switchToList", "切换到列表视图"),
@@ -587,6 +600,7 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static GIT_CHANGES_EN: &[(&str, &str)] = &[
+    ("commitFailed", "Commit failed: {detail}"),
     ("committing", "Committing..."),
     ("contextDiscard", "Discard Changes"),
     ("contextViewDiff", "View Diff"),
@@ -595,7 +609,9 @@ static GIT_CHANGES_EN: &[(&str, &str)] = &[
     ("discardOk", "Discard"),
     ("discardTitle", "Discard Changes"),
     ("empty", "No changes"),
+    ("loadFailed", "Failed to read changes: {detail}"),
     ("loading", "Loading..."),
+    ("operationFailed", "Git operation failed: {detail}"),
     ("refresh", "Refresh"),
     ("stageAll", "↑ Stage all"),
     ("switchToList", "Switch to list view"),
@@ -672,6 +688,8 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("keyHint", "中转只接受携带正确密钥的桌面端。请在中转服务器上设置环境变量 MT_RELAY_DESKTOP_KEY，并在此填入同一个值；中转未设置该变量时会拒绝一切桌面端连接。"),
     ("keyLabel", "桌面端接入密钥"),
     ("keyPlaceholder", "与中转的 MT_RELAY_DESKTOP_KEY 一致"),
+    ("keySealFailed", "密钥加密失败，本次未保存密钥（当前连接仍使用刚填写的值）：{error}"),
+    ("keyUnreadable", "已存的桌面端密钥无法解密（密钥文件可能已更换或丢失），已按未填写处理。请重新填写后保存并连接，必要时重新配对手机。"),
     ("launchers.add", "新增启动器"),
     ("launchers.cancel", "取消"),
     ("launchers.commandPlaceholder", "启动命令（如 claude）"),
@@ -705,6 +723,7 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("status.reconnecting", "重连中…"),
     ("status.versionMismatch", "协议版本不匹配（桌面端 v{actual}，中转要求 v{expected}），请升级 mini-term 或中转服务器"),
     ("statusLabel", "连接状态"),
+    ("urlInsecure", "该地址使用未加密的 ws://：桌面端密钥与发往终端的指令会以明文在网络上传输，建议改用 wss://。"),
     ("urlLabel", "中转服务器地址"),
     ("urlPlaceholder", "wss://relay.example.com"),
 ];
@@ -716,6 +735,8 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("keyHint", "The relay only accepts desktops presenting the correct key. Set the MT_RELAY_DESKTOP_KEY environment variable on your relay server and enter the same value here; a relay without that variable rejects every desktop connection."),
     ("keyLabel", "Desktop access key"),
     ("keyPlaceholder", "Must match MT_RELAY_DESKTOP_KEY on the relay"),
+    ("keySealFailed", "Couldn't encrypt the key, so it wasn't saved (the current connection still uses the value you entered): {error}"),
+    ("keyUnreadable", "The saved desktop key couldn't be decrypted (the key file may have been replaced or lost) and is treated as empty. Enter it again, then save & connect; re-pair your phone if needed."),
     ("launchers.add", "Add launcher"),
     ("launchers.cancel", "Cancel"),
     ("launchers.commandPlaceholder", "Launch command (e.g. claude)"),
@@ -749,6 +770,7 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("status.reconnecting", "Reconnecting…"),
     ("status.versionMismatch", "Protocol version mismatch (desktop v{actual}, relay expects v{expected}) — please upgrade mini-term or the relay server"),
     ("statusLabel", "Connection status"),
+    ("urlInsecure", "This address uses unencrypted ws:// — the desktop key and the commands sent to your terminals travel over the network in plain text. Use wss:// instead."),
     ("urlLabel", "Relay server address"),
     ("urlPlaceholder", "wss://relay.example.com"),
 ];

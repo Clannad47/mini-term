@@ -13,12 +13,13 @@
 //! **调用方必须自己放到后台执行器上跑**(GPUI 的 `background_executor`),
 //! 否则 30s/120s 的 `recv_timeout` 会卡住 UI 线程。
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use git2::{Repository, RepositoryOpenFlags, Status, StatusOptions};
+use git2::{Commit, Oid, Repository, RepositoryOpenFlags, Status, StatusOptions};
 use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
@@ -546,69 +547,345 @@ pub fn discover_git_repos(project_path: &Path) -> Result<Vec<GitRepoInfo>> {
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// 提交历史分页
+// ---------------------------------------------------------------------------
+//
+// # 为什么不用 libgit2 的排序 revwalk
+//
+// 旧实现是 `revwalk.set_sorting(TIME | TOPOLOGICAL)`。libgit2 只要设了排序就进
+// limited 模式(`revwalk.c` 的 `git_revwalk_sorting`:`sorting != NONE` 即
+// `limited = 1`),产出第一个提交之前 `prepare_walk` 先跑 `limit_list` 把全部可达
+// 提交走一遍、再 `sort_in_topological_order` 整体排序 —— 每页都是 O(全历史)。
+// 十万提交的仓库一页几百毫秒,终端里每 commit 一次还要自动重载一遍。
+//
+// 不设排序(NONE)时 libgit2 按「弹出一个、把它的父按提交时间插回待走链表」走,
+// 是增量的,但只是**按时间**:子提交时间早于父(时钟偏移)或同一秒的并行分支,
+// 都会让父排到子前面。
+//
+// 旧的分页也有洞:续页从「上一页最后一个提交的父」重起一个 revwalk,只沿那一条
+// 父链往下走,页边界时别的分支上还没产出的提交从此再也不会出现(合并历史里必现,
+// 3000 提交的基准仓库里有 108 个永远翻不到);反过来也会把已加载的提交再带回来
+// (UI 那边「重复 hash 必须丢掉」的去重就是为这个加的)。
+//
+// # 现在的做法
+//
+// 自己走:**已发现子图上的 Kahn 拓扑序,就绪集合里按提交时间取最新的**,同一秒按
+// 发现先后(规则同 `git log --date-order`)。发现是懒的 —— 产出一个提交时才读它的
+// 父,所以一页的代价是 O(本页 + frontier),与总历史长度无关。
+//
+// 续页的状态不靠服务端缓存,而是由已加载列表**原样还原**:frontier = 已加载提交
+// 的父 − 已加载提交(见 [`GitLogCursor`])。任何未加载的可达提交都是某个 frontier
+// 提交的祖先(沿任意一条从起点下来的路径,第一个未加载的提交必然是某个已加载
+// 提交的父),从 frontier 接着走、跳过已加载的,所以**跨页不漏、不重**。
+//
+// # 拓扑序:遍历只对「已发现的子」负责,其余由 [`merge_log_page`] 兜底
+//
+// 「父永远在子之后」要求产出父之前确认它**所有**子都已产出。已发现的子提交能确认
+// (上面的 Kahn 就是干这个的);但时钟偏移下,子提交可能还埋在某个时间更早的
+// frontier 提交的祖先里,尚未发现 —— 不走全历史(或没有 commit-graph 的代次号)
+// 就无从得知。这是增量遍历的理论下限,git 自己在没有 commit-graph 时做
+// `--topo-order` 也是退回全量遍历。
+//
+// 于是分两层:遍历按上面的规则出页(页内也可能出现这种迟到的子);UI 合并新页时由
+// [`merge_log_page`] 检查「新提交的父是否已排在它前面」,有就对已加载列表做一次
+// 稳定的拓扑修正,把迟到的子提交挪到它最早那个父的正前方(典型的「慢时钟分支」
+// 场景下,这正是 `git log --date-order` 全量排序给它的位置)。没有时钟偏移的仓库
+// 这一步只是检查,一行不挪。
+
+/// 续页游标:由已加载的提交还原出来的遍历现场。
+///
+/// 不在服务端缓存 revwalk(那要管仓库变更后的失效、多个面板各自的游标),而是
+/// 每次从已加载列表重算 —— O(已加载条数) 的哈希,远小于一次全历史遍历。
+#[derive(Debug, Clone, Default)]
+pub struct GitLogCursor {
+    /// 已加载(已产出)的提交。续页再遇到一律跳过。
+    loaded: HashSet<Oid>,
+    /// 已加载提交的父里还没加载的那些,按第一次出现的先后 —— 与一口气连续遍历时
+    /// 它们被发现的次序相同,同一秒的并列就按这个先后排。
+    frontier: Vec<Oid>,
+}
+
+impl GitLogCursor {
+    /// 按已加载列表(UI 手上那份,顺序即展示顺序)还原游标。
+    pub fn from_loaded(loaded: &[GitCommitInfo]) -> Self {
+        let set: HashSet<Oid> = loaded
+            .iter()
+            .filter_map(|c| Oid::from_str(&c.hash).ok())
+            .collect();
+        let mut queued = HashSet::new();
+        let mut frontier = Vec::new();
+        for commit in loaded {
+            for parent in &commit.parent_hashes {
+                if let Ok(oid) = Oid::from_str(parent)
+                    && !set.contains(&oid)
+                    && queued.insert(oid)
+                {
+                    frontier.push(oid);
+                }
+            }
+        }
+        Self {
+            loaded: set,
+            frontier,
+        }
+    }
+}
+
+/// 取一页提交历史。
+///
+/// - `after = None`:首页,从 `branch`(`None` = HEAD)起走;
+/// - `after = Some(游标)`:续页,只由游标决定从哪接着走,`branch` 不再解析 ——
+///   分支在两页之间被删 / 被移动都不影响翻页(要看新内容由调用方整体重载)。
+///
+/// 空仓库(HEAD 未出生)返回空列表而不是错误。
 pub fn get_git_log(
     repo_path: &Path,
-    before_commit: Option<&str>,
+    after: Option<&GitLogCursor>,
     limit: Option<usize>,
     branch: Option<&str>,
 ) -> Result<Vec<GitCommitInfo>> {
     let repo = Repository::open(repo_path)?;
     let limit = limit.unwrap_or(30);
+    let empty = GitLogCursor::default();
+    let mut walk = DateTopoWalk::new(&repo, after.unwrap_or(&empty));
 
-    let mut revwalk = repo.revwalk()?;
-    // 加 TOPOLOGICAL：保证父提交永远排在子提交之后，否则时钟偏移/rebase 后的仓库
-    // 会出现父在子之前，拓扑图的连线就会断。
-    revwalk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
-
-    if let Some(hash) = before_commit {
-        let oid = git2::Oid::from_str(hash)?;
-        let commit = repo.find_commit(oid)?;
-        for parent_id in commit.parent_ids() {
-            revwalk.push(parent_id)?;
+    if let Some(cursor) = after {
+        for &oid in &cursor.frontier {
+            walk.discover(oid);
         }
-    } else if let Some(b) = branch {
-        // 先找本地 refs/heads/<b>,再找远程 refs/remotes/<b>
-        // worktree 持有的分支也在 refs/heads/ 下(与主 repo 共享 refs 存储),天然支持
-        let local_ref = format!("refs/heads/{}", b);
-        let remote_ref = format!("refs/remotes/{}", b);
-        let reference = repo
-            .find_reference(&local_ref)
-            .or_else(|_| repo.find_reference(&remote_ref))
-            .map_err(|_| anyhow!("未找到分支:{}", b))?;
-        let oid = reference
-            .target()
-            .ok_or_else(|| anyhow!("分支 {} 无有效 target", b))?;
-        revwalk.push(oid)?;
     } else {
-        revwalk.push_head()?;
+        let tip = match branch {
+            Some(b) => {
+                // 先找本地 refs/heads/<b>,再找远程 refs/remotes/<b>
+                // worktree 持有的分支也在 refs/heads/ 下(与主 repo 共享 refs 存储),天然支持
+                let local_ref = format!("refs/heads/{}", b);
+                let remote_ref = format!("refs/remotes/{}", b);
+                let reference = repo
+                    .find_reference(&local_ref)
+                    .or_else(|_| repo.find_reference(&remote_ref))
+                    .map_err(|_| anyhow!("未找到分支:{}", b))?;
+                reference
+                    .peel_to_commit()
+                    .map_err(|_| anyhow!("分支 {} 无有效 target", b))?
+                    .id()
+            }
+            None => match repo.head() {
+                Ok(head) => head.peel_to_commit()?.id(),
+                // 空仓库:HEAD 指向还没出生的分支,没有历史可列
+                Err(e) if e.code() == git2::ErrorCode::UnbornBranch => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            },
+        };
+        walk.discover(tip);
     }
 
-    let mut result = Vec::with_capacity(limit);
-    for oid_result in revwalk {
-        if result.len() >= limit {
-            break;
+    Ok(walk.take(limit))
+}
+
+/// 一次取页的遍历现场。见上面「现在的做法」。
+struct DateTopoWalk<'r> {
+    repo: &'r Repository,
+    /// 上一批已加载的提交(续页时);首页是空集。
+    loaded: &'r HashSet<Oid>,
+    /// 本次发现过的提交(含读不到的),再遇到不重复入队。
+    discovered: HashSet<Oid>,
+    /// 已发现、未产出的提交,连同它的发现序号。
+    pending: HashMap<Oid, (Commit<'r>, u64)>,
+    /// 每个提交还有几个「已发现、未产出」的子提交;归零才轮得到它。
+    waiting_children: HashMap<Oid, u32>,
+    /// 就绪的提交:时间新的先出,同一秒按发现先后。可能有过期条目,弹出时复核。
+    ready: BinaryHeap<(i64, Reverse<u64>, Oid)>,
+    next_seq: u64,
+}
+
+impl<'r> DateTopoWalk<'r> {
+    fn new(repo: &'r Repository, cursor: &'r GitLogCursor) -> Self {
+        Self {
+            repo,
+            loaded: &cursor.loaded,
+            discovered: HashSet::new(),
+            pending: HashMap::new(),
+            waiting_children: HashMap::new(),
+            ready: BinaryHeap::new(),
+            next_seq: 0,
         }
-        let oid = oid_result?;
-        let commit = repo.find_commit(oid)?;
-        let hash = oid.to_string();
-        let short_hash = hash[..7.min(hash.len())].to_string();
-        let message = commit.summary().unwrap_or("").to_string();
-        let body = commit.body().map(|s| s.to_string());
-        let author = commit.author().name().unwrap_or("unknown").to_string();
-        let timestamp = commit.time().seconds();
-        let parent_hashes = commit.parent_ids().map(|id| id.to_string()).collect();
-        result.push(GitCommitInfo {
-            hash,
-            short_hash,
-            message,
-            body,
-            author,
-            timestamp,
-            parent_hashes,
-        });
     }
 
-    Ok(result)
+    fn waiting(&self, oid: &Oid) -> u32 {
+        self.waiting_children.get(oid).copied().unwrap_or(0)
+    }
+
+    /// 把一个提交纳入已发现子图。已加载 / 已发现过的直接跳过;读不到的
+    /// (浅克隆边界、对象缺失)当它不存在,不让整页失败。
+    fn discover(&mut self, oid: Oid) {
+        if self.loaded.contains(&oid) || !self.discovered.insert(oid) {
+            return;
+        }
+        let Ok(commit) = self.repo.find_commit(oid) else {
+            return;
+        };
+        for parent in commit.parent_ids() {
+            *self.waiting_children.entry(parent).or_default() += 1;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let time = commit.time().seconds();
+        self.pending.insert(oid, (commit, seq));
+        if self.waiting(&oid) == 0 {
+            self.ready.push((time, Reverse(seq), oid));
+        }
+    }
+
+    fn take(&mut self, limit: usize) -> Vec<GitCommitInfo> {
+        let mut out = Vec::with_capacity(limit.min(256));
+        while out.len() < limit {
+            let Some((_, _, oid)) = self.ready.pop() else {
+                break;
+            };
+            // 过期条目:已产出过(重复入堆),或入堆之后又发现了它的子提交(时钟偏移)
+            if self.waiting(&oid) > 0 {
+                continue;
+            }
+            let Some((commit, _)) = self.pending.remove(&oid) else {
+                continue;
+            };
+            for parent in commit.parent_ids() {
+                if let Some(n) = self.waiting_children.get_mut(&parent) {
+                    *n = n.saturating_sub(1);
+                }
+                match self.pending.get(&parent) {
+                    // 已发现的父:最后一个子也产出了才就绪
+                    Some((parent_commit, seq)) => {
+                        if self.waiting(&parent) == 0 {
+                            let time = parent_commit.time().seconds();
+                            self.ready.push((time, Reverse(*seq), parent));
+                        }
+                    }
+                    None => self.discover(parent),
+                }
+            }
+            out.push(commit_info(&commit));
+        }
+        out
+    }
+}
+
+fn commit_info(commit: &Commit<'_>) -> GitCommitInfo {
+    let hash = commit.id().to_string();
+    let short_hash = hash[..7.min(hash.len())].to_string();
+    GitCommitInfo {
+        short_hash,
+        message: commit.summary().unwrap_or("").to_string(),
+        body: commit.body().map(|s| s.to_string()),
+        author: commit.author().name().unwrap_or("unknown").to_string(),
+        timestamp: commit.time().seconds(),
+        parent_hashes: commit.parent_ids().map(|id| id.to_string()).collect(),
+        hash,
+    }
+}
+
+/// 把新取到的一页并进已加载列表,返回实际新增的条数。
+///
+/// 1. **去重**:按 hash 丢掉已有的(游标续页本身不会带回已加载的提交,这里是防线);
+/// 2. **跨页拓扑修正**:新提交里若有「父已经排在它前面」的(时钟偏移下迟到的子
+///    提交,见 `get_git_log` 上方的说明),对整个列表做一次稳定的拓扑重排,保证
+///    父永远在子之后 —— 拓扑图的连线依赖这一点。没有这种情况时一行不挪。
+pub fn merge_log_page(loaded: &mut Vec<GitCommitInfo>, page: Vec<GitCommitInfo>) -> usize {
+    let before = loaded.len();
+    let mut known: HashSet<String> = loaded.iter().map(|c| c.hash.clone()).collect();
+    for commit in page {
+        if known.insert(commit.hash.clone()) {
+            loaded.push(commit);
+        }
+    }
+    let added = loaded.len() - before;
+    if added > 0 && !new_tail_is_topo_ordered(loaded, before) {
+        stable_topo_reorder(loaded);
+    }
+    added
+}
+
+/// 新并入的 `loaded[from..]` 有没有「父排在自己前面」的。旧的部分此前已经是拓扑序,
+/// 而新提交全排在旧提交之后,所以只可能是新提交的父在前 —— 只查它们就够。
+fn new_tail_is_topo_ordered(loaded: &[GitCommitInfo], from: usize) -> bool {
+    let pos: HashMap<&str, usize> = loaded
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.hash.as_str(), i))
+        .collect();
+    loaded[from..].iter().enumerate().all(|(k, commit)| {
+        commit
+            .parent_hashes
+            .iter()
+            .all(|p| pos.get(p.as_str()).is_none_or(|&pi| pi > from + k))
+    })
+}
+
+/// 稳定的拓扑重排(子在父前)。
+///
+/// 每个提交的排序键 = 它自己与它全部已加载祖先里**最靠前的位置**:迟到的子提交
+/// 因此被拉到它最早那个父的位置上,再用 Kahn(同键按原位置)排出一个合法拓扑序。
+/// 原本就合法的部分键就是自己的位置,次序原样不动。
+fn stable_topo_reorder(loaded: &mut Vec<GitCommitInfo>) {
+    let n = loaded.len();
+    let pos: HashMap<&str, usize> = loaded
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.hash.as_str(), i))
+        .collect();
+    let parents: Vec<Vec<usize>> = loaded
+        .iter()
+        .map(|c| {
+            c.parent_hashes
+                .iter()
+                .filter_map(|p| pos.get(p.as_str()).copied())
+                .collect()
+        })
+        .collect();
+
+    // 子先父后的 Kahn:入度 = 已加载的子提交个数,就绪集合里按 (rank, 原位置) 取最小
+    let kahn = |rank: &dyn Fn(usize) -> usize| -> Vec<usize> {
+        let mut indegree = vec![0u32; n];
+        for &p in parents.iter().flatten() {
+            indegree[p] += 1;
+        }
+        let mut ready: BinaryHeap<Reverse<(usize, usize)>> = (0..n)
+            .filter(|&i| indegree[i] == 0)
+            .map(|i| Reverse((rank(i), i)))
+            .collect();
+        let mut order = Vec::with_capacity(n);
+        while let Some(Reverse((_, i))) = ready.pop() {
+            order.push(i);
+            for &p in &parents[i] {
+                indegree[p] -= 1;
+                if indegree[p] == 0 {
+                    ready.push(Reverse((rank(p), p)));
+                }
+            }
+        }
+        order
+    };
+
+    // 先按原位置求一个合法拓扑序,倒过来就是「父先于子」,正好用来自底向上算键
+    let by_index = kahn(&|i| i);
+    let mut key = vec![usize::MAX; n];
+    for &i in by_index.iter().rev() {
+        key[i] = parents[i].iter().map(|&p| key[p]).fold(i, usize::min);
+    }
+    let mut order = kahn(&|i| key[i]);
+    if order.len() < n {
+        // 提交图不会有环;真遇上坏数据也别把提交弄丢,排不进去的按原位置垫在后面
+        let mut placed = vec![false; n];
+        for &i in &order {
+            placed[i] = true;
+        }
+        order.extend((0..n).filter(|&i| !placed[i]));
+    }
+
+    let mut slots: Vec<Option<GitCommitInfo>> =
+        std::mem::take(loaded).into_iter().map(Some).collect();
+    loaded.extend(order.into_iter().filter_map(|i| slots[i].take()));
 }
 
 pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
@@ -1387,8 +1664,7 @@ pub struct WorktreeInfo {
 /// 去掉路径尾部分隔符:git2 的 workdir() 带尾杠,而项目配置里的路径不带,
 /// 统一后才能做「该 worktree 是否已是项目」的对比。
 fn display_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    s.trim_end_matches(['/', '\\']).to_string()
+    mt_core::path_key::trim_trailing_separators(&p.to_string_lossy()).to_string()
 }
 
 fn head_branch(repo: &Repository) -> Option<String> {
@@ -1897,5 +2173,368 @@ mod tests {
         assert_eq!(remote.upstream, None, "远程分支自己没有上游");
         assert_eq!(remote.commit_hash, local.commit_hash);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 提交历史分页 ──────────────────────────────────────────
+
+    /// 空仓库(没有任何提交)。提交历史的用例用 [`LogRepo`] 直接造提交对象,
+    /// 提交时间逐个指定 —— 时钟偏移就是这么造出来的。
+    struct LogRepo {
+        root: PathBuf,
+        repo: Repository,
+        tree: Oid,
+    }
+
+    impl LogRepo {
+        fn new(tag: &str) -> Self {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("mini-term-gitlog-{tag}-{ts}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let repo = Repository::init(&root).unwrap();
+            let tree = repo.treebuilder(None).unwrap().write().unwrap();
+            Self { root, repo, tree }
+        }
+
+        /// 提交时间 = `time`(秒),父按给定顺序(第 0 个是主线父)。不动任何引用。
+        fn commit(&self, msg: &str, time: i64, parents: &[Oid]) -> Oid {
+            let sig =
+                git2::Signature::new("tester", "t@example.com", &git2::Time::new(time, 0)).unwrap();
+            let tree = self.repo.find_tree(self.tree).unwrap();
+            let parents: Vec<_> = parents
+                .iter()
+                .map(|p| self.repo.find_commit(*p).unwrap())
+                .collect();
+            let parent_refs: Vec<_> = parents.iter().collect();
+            self.repo
+                .commit(None, &sig, &sig, msg, &tree, &parent_refs)
+                .unwrap()
+        }
+
+        /// `refs/heads/<name>` 指向 `oid`;`head` 为真时 HEAD 也指过去。
+        fn branch(&self, name: &str, oid: Oid, head: bool) {
+            let full = format!("refs/heads/{name}");
+            self.repo.reference(&full, oid, true, "test").unwrap();
+            if head {
+                self.repo.set_head(&full).unwrap();
+            }
+        }
+
+        fn msg_of(&self, hash: &str) -> String {
+            let oid = Oid::from_str(hash).unwrap();
+            self.repo
+                .find_commit(oid)
+                .unwrap()
+                .summary()
+                .unwrap()
+                .to_string()
+        }
+
+        /// 从 `tip` 可达的全部提交(不管顺序)。
+        fn reachable(&self, tip: Oid) -> HashSet<String> {
+            let mut seen = HashSet::new();
+            let mut stack = vec![tip];
+            while let Some(oid) = stack.pop() {
+                if seen.insert(oid.to_string()) {
+                    stack.extend(self.repo.find_commit(oid).unwrap().parent_ids());
+                }
+            }
+            seen
+        }
+    }
+
+    impl Drop for LogRepo {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// 列表里每个提交的父(在列表里的话)都排在它后面。
+    fn assert_parents_after_children(list: &[GitCommitInfo], ctx: &str) {
+        let pos: HashMap<&str, usize> = list
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.hash.as_str(), i))
+            .collect();
+        for (i, c) in list.iter().enumerate() {
+            for p in &c.parent_hashes {
+                if let Some(&pi) = pos.get(p.as_str()) {
+                    assert!(
+                        pi > i,
+                        "{ctx}: 父 {p} 在第 {pi} 行,排到了子 {} (第 {i} 行)前面",
+                        c.hash
+                    );
+                }
+            }
+        }
+    }
+
+    /// 按 UI 的用法一页页翻到底:首页带 `branch`,续页用已加载列表还原游标。
+    /// 每页都查一遍:后端不回已加载的提交(不重)、合并后父在子后。
+    fn load_all(root: &Path, branch: Option<&str>, page: usize) -> Vec<GitCommitInfo> {
+        let mut loaded = Vec::new();
+        let first = get_git_log(root, None, Some(page), branch).unwrap();
+        assert!(first.len() <= page);
+        merge_log_page(&mut loaded, first);
+        assert_parents_after_children(&loaded, "首页");
+        for round in 0.. {
+            assert!(round < 10_000, "翻页不收敛");
+            let cursor = GitLogCursor::from_loaded(&loaded);
+            let next = get_git_log(root, Some(&cursor), Some(page), None).unwrap();
+            if next.is_empty() {
+                break;
+            }
+            assert!(next.len() <= page);
+            let before: HashSet<String> = loaded.iter().map(|c| c.hash.clone()).collect();
+            for c in &next {
+                assert!(!before.contains(&c.hash), "续页带回了已加载的 {}", c.hash);
+            }
+            let added = merge_log_page(&mut loaded, next.clone());
+            assert_eq!(added, next.len(), "页内不该有重复");
+            assert_parents_after_children(&loaded, &format!("第 {round} 次续页后"));
+        }
+        loaded
+    }
+
+    fn hashes(list: &[GitCommitInfo]) -> HashSet<String> {
+        list.iter().map(|c| c.hash.clone()).collect()
+    }
+
+    /// 旧实现的洞:续页只从「上一页最后一个提交的父」往下走。合并提交两侧分支
+    /// 交替出现时,页边界上另一侧还没产出的提交就丢了。游标续页必须一个不漏。
+    #[test]
+    fn 合并历史跨页不漏不重() {
+        let r = LogRepo::new("merge");
+        let base = r.commit("base", 100, &[]);
+        let l1 = r.commit("L1", 110, &[base]);
+        let r1 = r.commit("R1", 120, &[base]);
+        let l2 = r.commit("L2", 130, &[l1]);
+        let r2 = r.commit("R2", 140, &[r1]);
+        let m = r.commit("M", 150, &[l2, r2]);
+        r.branch("main", m, true);
+
+        for page in 1..=7 {
+            let all = load_all(&r.root, None, page);
+            assert_eq!(all.len(), 6, "页大小 {page}");
+            assert_eq!(hashes(&all), r.reachable(m), "页大小 {page}");
+            let msgs: Vec<_> = all.iter().map(|c| r.msg_of(&c.hash)).collect();
+            // 没有时钟偏移:就是按时间倒序
+            assert_eq!(msgs, ["M", "R2", "L2", "R1", "L1", "base"], "页大小 {page}");
+        }
+    }
+
+    /// 时钟偏移且子提交已被发现:分支提交比它的父早,但它是经由合并提交先被
+    /// 发现的 —— 父要等它产出才轮得到,页流本身就是拓扑序,不需要事后修正。
+    #[test]
+    fn 时钟偏移_已发现的子提交挡住父() {
+        let r = LogRepo::new("skew-known");
+        let f = r.commit("F", 1000, &[]);
+        let m1 = r.commit("m1", 1050, &[f]);
+        let b1 = r.commit("B1", 500, &[f]);
+        let m = r.commit("M", 1100, &[m1, b1]);
+        r.branch("main", m, true);
+
+        let page = get_git_log(&r.root, None, Some(10), None).unwrap();
+        let msgs: Vec<_> = page.iter().map(|c| r.msg_of(&c.hash)).collect();
+        assert_eq!(msgs, ["M", "m1", "B1", "F"]);
+        assert_parents_after_children(&page, "单页");
+    }
+
+    /// 时钟偏移且子提交埋在更深处:整条分支都比分叉点早 500 秒,只有分支尖端
+    /// 挂在合并提交上被发现,中间那几个要等时间走到 500 才被读到 —— 那时分叉点 F
+    /// 早已产出。合并页时必须把迟到的这串提到 F 前面(与 `git log --date-order`
+    /// 全量排出来的位置一致),其余行不动。
+    #[test]
+    fn 时钟偏移_迟到的子提交在合并时提到父前() {
+        let r = LogRepo::new("skew-late");
+        let d = r.commit("D", 980, &[]);
+        let e = r.commit("E", 990, &[d]);
+        let f = r.commit("F", 1000, &[e]);
+        let m1 = r.commit("m1", 1010, &[f]);
+        let m2 = r.commit("m2", 1020, &[m1]);
+        let b1 = r.commit("B1", 500, &[f]);
+        let b2 = r.commit("B2", 510, &[b1]);
+        let b3 = r.commit("B3", 520, &[b2]);
+        let m = r.commit("M", 1100, &[m2, b3]);
+        r.branch("main", m, true);
+
+        let expected = ["M", "m2", "m1", "B3", "B2", "B1", "F", "E", "D"];
+        for page in 1..=10 {
+            let all = load_all(&r.root, None, page);
+            assert_eq!(hashes(&all), r.reachable(m), "页大小 {page}");
+            let msgs: Vec<_> = all.iter().map(|c| r.msg_of(&c.hash)).collect();
+            assert_eq!(msgs, expected, "页大小 {page}");
+        }
+    }
+
+    /// 同一秒的并行分支(脚本批量提交、rebase 常见):时间比不出先后,
+    /// 拓扑约束仍要成立,也不能漏。
+    #[test]
+    fn 同一秒的并行分支() {
+        let r = LogRepo::new("same-second");
+        let base = r.commit("base", 100, &[]);
+        let mut left = base;
+        let mut right = base;
+        for i in 0..5 {
+            left = r.commit(&format!("L{i}"), 100, &[left]);
+            right = r.commit(&format!("R{i}"), 100, &[right]);
+        }
+        let m = r.commit("M", 100, &[left, right]);
+        r.branch("main", m, true);
+        for page in 1..=4 {
+            let all = load_all(&r.root, None, page);
+            assert_eq!(hashes(&all), r.reachable(m), "页大小 {page}");
+            assert_eq!(r.msg_of(&all[0].hash), "M");
+            assert_eq!(r.msg_of(&all.last().unwrap().hash), "base");
+        }
+    }
+
+    /// 随机 DAG + 随机提交时间(大量时钟偏移):任意页大小翻到底都是全集、无重复、
+    /// 每次合并后父都在子后。伪随机数用固定种子的 LCG,失败可复现。
+    #[test]
+    fn 随机_dag_翻页性质() {
+        for seed in [1u64, 7, 42] {
+            let mut state = seed;
+            let mut rand = move |n: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % n
+            };
+            let r = LogRepo::new(&format!("random-{seed}"));
+            let mut commits: Vec<Oid> = Vec::new();
+            for i in 0..120 {
+                let mut parents = Vec::new();
+                if !commits.is_empty() {
+                    // 主线父偏向最近的提交,偶尔带第二个父(合并)
+                    let len = commits.len() as u64;
+                    parents.push(commits[(len - 1 - rand(len.min(6))) as usize]);
+                    if rand(4) == 0 {
+                        let other = commits[rand(len) as usize];
+                        if !parents.contains(&other) {
+                            parents.push(other);
+                        }
+                    }
+                }
+                // 时间整体随序号增长,但抖动远大于步长 —— 父比子新的边比比皆是
+                let time = 10_000 + i as i64 * 10 + rand(400) as i64 - 200;
+                commits.push(r.commit(&format!("c{i}"), time, &parents));
+            }
+            // 把所有尖端汇进一个合并链,保证全部提交从 HEAD 可达
+            let mut tip = *commits.last().unwrap();
+            for (k, &c) in commits.iter().enumerate() {
+                if !r.reachable(tip).contains(&c.to_string()) {
+                    tip = r.commit(&format!("join{k}"), 20_000 + k as i64, &[tip, c]);
+                }
+            }
+            r.branch("main", tip, true);
+            let expected = r.reachable(tip);
+            for page in [1, 2, 3, 5, 8, 13, 30, 500] {
+                let all = load_all(&r.root, None, page);
+                assert_eq!(all.len(), expected.len(), "seed {seed} 页大小 {page}");
+                assert_eq!(hashes(&all), expected, "seed {seed} 页大小 {page}");
+            }
+        }
+    }
+
+    /// 起点:不给分支走 HEAD;给本地分支名走那条分支;远程分支名也认;
+    /// 不存在的分支报错。续页不再解析分支(分支删了照样能翻)。
+    #[test]
+    fn 起点_head_与指定分支() {
+        let r = LogRepo::new("branches");
+        let base = r.commit("base", 100, &[]);
+        let main1 = r.commit("main1", 110, &[base]);
+        let main2 = r.commit("main2", 120, &[main1]);
+        let dev1 = r.commit("dev1", 130, &[base]);
+        let dev2 = r.commit("dev2", 140, &[dev1]);
+        r.branch("main", main2, true);
+        r.branch("dev", dev2, false);
+        r.repo
+            .reference("refs/remotes/origin/dev", dev1, true, "test")
+            .unwrap();
+
+        let msgs = |list: &[GitCommitInfo]| -> Vec<String> {
+            list.iter().map(|c| r.msg_of(&c.hash)).collect()
+        };
+        assert_eq!(
+            msgs(&load_all(&r.root, None, 2)),
+            ["main2", "main1", "base"]
+        );
+        assert_eq!(
+            msgs(&load_all(&r.root, Some("dev"), 2)),
+            ["dev2", "dev1", "base"]
+        );
+        assert_eq!(
+            msgs(&load_all(&r.root, Some("origin/dev"), 2)),
+            ["dev1", "base"]
+        );
+        let err = get_git_log(&r.root, None, Some(10), Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("未找到分支"), "实际错误: {err}");
+
+        // 首页之后把 dev 删掉:续页只看游标,照样翻到底
+        let first = get_git_log(&r.root, None, Some(1), Some("dev")).unwrap();
+        r.repo
+            .find_reference("refs/heads/dev")
+            .unwrap()
+            .delete()
+            .unwrap();
+        let cursor = GitLogCursor::from_loaded(&first);
+        let rest = get_git_log(&r.root, Some(&cursor), Some(10), Some("dev")).unwrap();
+        assert_eq!(msgs(&rest), ["dev1", "base"]);
+    }
+
+    /// 空仓库列空而不是报错;单提交仓库一页就到底,续页为空。
+    #[test]
+    fn 空仓库与单提交仓库() {
+        let r = LogRepo::new("empty");
+        assert!(
+            get_git_log(&r.root, None, Some(30), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_all(&r.root, None, 30).is_empty());
+
+        let only = r.commit("only", 100, &[]);
+        r.branch("main", only, true);
+        let page = get_git_log(&r.root, None, Some(30), None).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].hash, only.to_string());
+        assert!(page[0].parent_hashes.is_empty());
+        let cursor = GitLogCursor::from_loaded(&page);
+        assert!(
+            get_git_log(&r.root, Some(&cursor), Some(30), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 合并一页:重复的丢掉、返回真正新增的条数;没有跨页的父子倒挂时一行不挪。
+    #[test]
+    fn 合并页去重且顺序合法时不重排() {
+        let commit = |hash: &str, parents: &[&str]| GitCommitInfo {
+            hash: hash.into(),
+            short_hash: hash.into(),
+            message: String::new(),
+            body: None,
+            author: String::new(),
+            timestamp: 0,
+            parent_hashes: parents.iter().map(|p| p.to_string()).collect(),
+        };
+        let mut loaded = vec![commit("c", &["b"]), commit("x", &["b"])];
+        let added = merge_log_page(&mut loaded, vec![commit("x", &["b"]), commit("b", &["a"])]);
+        assert_eq!(added, 1);
+        let order: Vec<_> = loaded.iter().map(|c| c.hash.as_str()).collect();
+        assert_eq!(order, ["c", "x", "b"]);
+        assert_eq!(merge_log_page(&mut loaded, vec![commit("c", &["b"])]), 0);
+
+        // 迟到的子 y(父是已经排在前面的 b):提到 b 前,其它行相对次序不变
+        let added = merge_log_page(&mut loaded, vec![commit("a", &[]), commit("y", &["b"])]);
+        assert_eq!(added, 2);
+        let order: Vec<_> = loaded.iter().map(|c| c.hash.as_str()).collect();
+        assert_eq!(order, ["c", "x", "y", "b", "a"]);
     }
 }

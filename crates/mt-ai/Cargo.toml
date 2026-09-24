@@ -8,9 +8,7 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 chrono.workspace = true
-regex.workspace = true
 dirs.workspace = true
 # 收尾-1 批去重:atomic_write / parse_wsl_unc / strip_ansi_codes 三个纯函数
 # 原本在 crate::util、crate::detect 里各存一份逐字副本(mt-core 当时还在
@@ -22,8 +20,12 @@ mt-core.workspace = true
 tiny_http = "0.12"
 # Codex 的 ~/.codex/config.toml 要开 features.hooks(旧名 codex_hooks 已弃用),
 # 迁移时必须保留用户自己的注释与排版,故用 toml_edit 而非 toml。
+# `ssh_registry` 摘除项目级 / 全局 Codex 配置里的历史 MCP 注册、写项目信任同理。
 toml_edit = "0.22"
 # AI 感知的那批状态表横跨三条线程(GPUI 主线程 / 500ms 轮询 / hook HTTP)。
 # std::sync::Mutex 的锁中毒会把任一线程的 panic 传染成全进程崩溃,故统一
 # 换 parking_lot(mt-app/mt-pty/mt-terminal 已是同款)。
 parking_lot.workspace = true
+# SSH 工具(CLI + Skill)按项目启用时的能力令牌(UUID v4),`ssh_registry` 用。
+# 工作区里已有这一行(mt-app 同款),净新增 crate = 0。
+uuid.workspace = true

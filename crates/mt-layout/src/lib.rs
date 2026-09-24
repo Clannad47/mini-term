@@ -620,11 +620,8 @@ mod tests {
         config.layout_sizes = Some(vec![20.0, 60.0, 20.0]);
         config.right_drawer_width = Some(400.0);
         config.projects.push(ProjectConfig {
-            id: "p1".into(),
-            name: "proj".into(),
-            path: "D:/proj".into(),
             saved_layout: Some(layout("cmd")),
-            ..project_stub()
+            ..ProjectConfig::new("p1", "proj", "D:/proj")
         });
 
         let n = store.migrate_from_config(&config).unwrap();
@@ -684,24 +681,5 @@ mod tests {
         assert!(store.load_project_layouts().contains_key("p1"));
         assert!(dir.join("layout.db.corrupt").exists(), "旧文件留证");
         fs::remove_dir_all(&dir).ok();
-    }
-
-    fn project_stub() -> ProjectConfig {
-        ProjectConfig {
-            id: String::new(),
-            name: String::new(),
-            path: String::new(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: vec![],
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: vec![],
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
     }
 }

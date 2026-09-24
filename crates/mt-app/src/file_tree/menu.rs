@@ -114,7 +114,7 @@ pub(super) fn file_menu(
         let connection = connection.clone();
         // 父目录:重命名/删除之后要刷的是它;新建时刷的是目录自己
         let parent = if remote {
-            crate::remote_ssh::parent_posix(&path.to_string_lossy())
+            mt_remote::parent_posix(&path.to_string_lossy())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| root.clone())
         } else {
@@ -126,15 +126,7 @@ pub(super) fn file_menu(
         entries.push(match action {
             FileMenuAction::OpenWithDefault => {
                 menu::item(t("fileTree", "menu.openWithDefault"), move |_window, cx| {
-                    let path = path.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path)
-                            {
-                                eprintln!("[files] 默认程序打开失败: {err:#}");
-                            }
-                        })
-                        .detach();
+                    fs_ops::open_external(fs_ops::ExternalOpen::DefaultApp, path.clone(), cx);
                 })
             }
             FileMenuAction::CopyEntry => {
@@ -187,11 +179,8 @@ pub(super) fn file_menu(
             }
             FileMenuAction::CopyRelativePath => {
                 let relative = if remote {
-                    crate::remote_ssh::posix_relative(
-                        &root.to_string_lossy(),
-                        &path.to_string_lossy(),
-                    )
-                    .unwrap_or_default()
+                    mt_remote::posix_relative(&root.to_string_lossy(), &path.to_string_lossy())
+                        .unwrap_or_default()
                 } else {
                     fs_ops::relative_path(&path.to_string_lossy(), &root.to_string_lossy())
                 };
@@ -213,14 +202,7 @@ pub(super) fn file_menu(
             }
             FileMenuAction::RevealInFolder => {
                 menu::item(t("fileTree", "menu.revealInFolder"), move |_window, cx| {
-                    let path = path.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = fs_ops::reveal_in_file_manager(&path) {
-                                eprintln!("[files] 在文件夹中打开失败: {err}");
-                            }
-                        })
-                        .detach();
+                    fs_ops::open_external(fs_ops::ExternalOpen::Reveal, path.clone(), cx);
                 })
             }
             FileMenuAction::OpenInTerminal => {
@@ -270,7 +252,7 @@ pub(super) fn file_menu(
                                 detach_before,
                                 t("fileTree", "operation.renaming").into(),
                                 move || match connection {
-                                    Some(conn) => crate::remote_ssh::rename_entry(
+                                    Some(conn) => mt_remote::rename_entry(
                                         &conn,
                                         &root.to_string_lossy(),
                                         &path.to_string_lossy(),
@@ -338,7 +320,7 @@ pub(super) fn file_menu(
                                         Some(path.clone()),
                                         t("fileTree", "operation.deleting").into(),
                                         move || match connection {
-                                            Some(conn) => crate::remote_ssh::delete_entry(
+                                            Some(conn) => mt_remote::delete_entry(
                                                 &conn,
                                                 &root.to_string_lossy(),
                                                 &operation_path.to_string_lossy(),

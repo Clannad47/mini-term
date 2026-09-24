@@ -51,8 +51,25 @@ docker logs mini-term-relay | grep 'desktop key'   # 应出现 "desktop key conf
 | `RELAY_PORT` | `8080` | 容器内监听端口 |
 | `RELAY_BIND` | `0.0.0.0` | 容器内监听地址 |
 | `RELAY_PWA_DIR` | `/srv/pwa` | PWA 静态资源目录（镜像已内置，无需修改） |
+| `RELAY_MAX_CONNECTIONS` | `64` | 并发 WebSocket 连接数全局上限（含尚未握手的），超限在升级前回 503 |
+| `RELAY_MAX_CONNECTIONS_PER_IP` | `16` | 单个客户端的并发连接数上限，超限回 429 |
+| `RELAY_CLIENT_IP_HEADER` | 不设（按 TCP 对端地址） | 按客户端计数时取地址的请求头，**反代后面必须配**，见下 |
+
+后三项与密钥一样写进 `relay-server/.env`（`docker-compose.yml` 已透传），不写走默认值。
 
 对外地址（域名/端口）不需要配置进中转——桌面端与手机连接哪个地址由你在桌面端设置里填写的中转地址决定。
+
+### 连接数与消息上限
+
+中转是单租户 1×1 拓扑（一台桌面端 + 一部手机），正常只占两三条连接，默认上限远高于正常用量，一般不用改。单条消息上限写死在代码里：桌面端 16 MiB（对话镜像一页 50 条文本）、移动端 1 MiB，超限的一方会被断开；某条连接出站积压 256 帧（对端太慢）也会被断开，两端都会自动重连并重新拿全量快照。
+
+按客户端计数要知道真实客户端地址。中转在反代后面时 TCP 对端永远是反代自己（Docker 端口映射下是网桥网关），必须用 `RELAY_CLIENT_IP_HEADER` 指定反代写入的头（取该头最后一个逗号分段）：
+
+- Cloudflare 橙云：`CF-Connecting-IP`
+- 只有 Caddy：`X-Forwarded-For`（Caddy 默认不信任客户端带来的这个头，会改写成它看到的对端地址）
+- Nginx：先在 `location` 里加 `proxy_set_header X-Real-IP $remote_addr;`，再配 `X-Real-IP`
+
+**没有反代改写该头时不要配**：客户端可以自报任意值绕开按客户端的上限（全局上限不受影响）。不配时按客户端的上限实际上成了第二道全局上限，正常使用不受影响。
 
 ### 桌面端接入密钥（`MT_RELAY_DESKTOP_KEY`）
 

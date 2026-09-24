@@ -24,6 +24,8 @@
 //!    git-bash / pwsh / powershell / cmd 由环境决定、四家引号语义互斥。
 //!    事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递。
 
+use crate::agent::AgentKind;
+use crate::claude_settings;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -140,11 +142,6 @@ pub fn hook_binary_path() -> Result<String, String> {
     Ok(hook_path.to_string_lossy().to_string())
 }
 
-/// 获取 Claude Code 配置文件路径: ~/.claude/settings.json
-fn claude_settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
-}
-
 /// 获取 Codex hook 配置文件路径: ~/.codex/hooks.json
 fn codex_hooks_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("hooks.json"))
@@ -209,62 +206,48 @@ fn build_claude_hook_entry(hook_path: &str, event: &str) -> Value {
 
 /// 注册 Claude Code hooks 到 ~/.claude/settings.json
 fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
-    let settings_path = claude_settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let settings_path =
+        claude_settings::settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
-    // 确保 .claude 目录存在
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
-    }
-
-    // 读取现有配置
-    let mut settings: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?
-    } else {
-        serde_json::json!({})
-    };
-
-    // 确保 hooks 对象存在
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = serde_json::json!({});
-    }
-
-    let hooks = settings["hooks"]
-        .as_object_mut()
-        .ok_or_else(|| "hooks 字段不是对象".to_string())?;
-
-    let mut updated = 0;
-    let mut added = 0;
-
-    for event in CLAUDE_HOOK_EVENTS {
-        let new_entry = build_claude_hook_entry(hook_path, event);
-
-        if let Some(event_hooks) = hooks.get_mut(*event) {
-            if let Some(arr) = event_hooks.as_array_mut() {
-                // 查找已有的 miniterm-hook 条目
-                // Claude Code 格式: [{ "matcher": "", "hooks": [{ "command": "..." }] }]
-                let existing_idx = arr.iter().position(entry_is_miniterm);
-
-                if let Some(idx) = existing_idx {
-                    arr[idx] = new_entry;
-                    updated += 1;
-                } else {
-                    arr.push(new_entry);
-                    added += 1;
-                }
-            }
-        } else {
-            hooks.insert(event.to_string(), serde_json::json!([new_entry]));
-            added += 1;
+    // 读改写走共用助手:建 .claude 目录 / 读现有配置 / 原子写回 / 与 ssh_registry
+    // 进程内串行,口径见 `claude_settings` 模块注释
+    let (added, updated) = claude_settings::update(&settings_path, |settings| {
+        // 确保 hooks 对象存在
+        if settings.get("hooks").is_none() {
+            settings["hooks"] = serde_json::json!({});
         }
-    }
 
-    // 写回配置文件
-    let json_str = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    crate::util::atomic_write(&settings_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
+        let hooks = settings["hooks"]
+            .as_object_mut()
+            .ok_or_else(|| "hooks 字段不是对象".to_string())?;
+
+        let mut updated = 0;
+        let mut added = 0;
+
+        for event in CLAUDE_HOOK_EVENTS {
+            let new_entry = build_claude_hook_entry(hook_path, event);
+
+            if let Some(event_hooks) = hooks.get_mut(*event) {
+                if let Some(arr) = event_hooks.as_array_mut() {
+                    // 查找已有的 miniterm-hook 条目
+                    // Claude Code 格式: [{ "matcher": "", "hooks": [{ "command": "..." }] }]
+                    let existing_idx = arr.iter().position(entry_is_miniterm);
+
+                    if let Some(idx) = existing_idx {
+                        arr[idx] = new_entry;
+                        updated += 1;
+                    } else {
+                        arr.push(new_entry);
+                        added += 1;
+                    }
+                }
+            } else {
+                hooks.insert(event.to_string(), serde_json::json!([new_entry]));
+                added += 1;
+            }
+        }
+        Ok((added, updated))
+    })?;
 
     Ok(format!(
         "Claude Code: {} 个 hook 已添加, {} 个已更新 (共 {} 个事件)",
@@ -274,48 +257,59 @@ fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
     ))
 }
 
+/// 从同构的 `{ "hooks": { "<Event>": [entry, …] } }` 里摘掉全部 mini-term 条目,
+/// 返回摘掉的条数。Claude / Codex / Grok 三家的文件在这一层同构,共用本函数。
+///
+/// 扫 `hooks` 下**每个**事件键,不只当前事件表:老版本注册过、后来从事件表里下线的
+/// 事件也得摘干净(卸载后不该留下任何指向 miniterm-hook 的条目)。只删被**我们**摘空
+/// 的事件键 —— 用户自己留着的空数组不碰;删键用 `retain` 保住其余键的顺序
+/// (`Map::remove` 在 preserve_order 下是 swap_remove,会打乱用户文件的键序)。
+fn strip_miniterm_entries(config: &mut Value) -> usize {
+    let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut emptied: Vec<String> = Vec::new();
+    for (event, entries) in hooks.iter_mut() {
+        let Some(arr) = entries.as_array_mut() else {
+            continue;
+        };
+        let before = arr.len();
+        arr.retain(|entry| !entry_is_miniterm(entry));
+        let n = before - arr.len();
+        if n > 0 && arr.is_empty() {
+            emptied.push(event.clone());
+        }
+        removed += n;
+    }
+    if !emptied.is_empty() {
+        hooks.retain(|event, _| !emptied.contains(event));
+    }
+    removed
+}
+
+/// 摘掉 Claude settings.json 里的 mini-term 条目,返回摘掉的条数。
+///
+/// 文件不在 / 读不懂 / 里面没有我们的条目时**一个字节不写**(返回 0):settings.json 是
+/// 用户的全局配置,读改写一遍哪怕内容不变也会重排格式。
+fn remove_claude_entries_at(path: &std::path::Path) -> Result<usize, String> {
+    if registered_events_in(Some(path.to_path_buf())).is_empty() {
+        return Ok(0);
+    }
+    claude_settings::update(path, |settings| Ok(strip_miniterm_entries(settings)))
+}
+
 /// 从 ~/.claude/settings.json 中卸载 miniterm hooks
 fn unregister_claude_hooks() -> Result<String, String> {
-    let settings_path = match claude_settings_path() {
-        Some(p) if p.exists() => p,
-        _ => return Ok("Claude Code: settings.json 不存在，无需卸载".to_string()),
+    let removed = match claude_settings::settings_path() {
+        Some(path) => remove_claude_entries_at(&path)?,
+        None => 0,
     };
-
-    let content = std::fs::read_to_string(&settings_path)
-        .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-    let mut settings: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?;
-
-    let mut removed = 0;
-
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in CLAUDE_HOOK_EVENTS {
-            if let Some(event_hooks) = hooks.get_mut(*event) {
-                if let Some(arr) = event_hooks.as_array_mut() {
-                    let before = arr.len();
-                    arr.retain(|entry| !entry_is_miniterm(entry));
-                    removed += before - arr.len();
-                }
-            }
-        }
-
-        // 清理空的事件数组
-        let empty_keys: Vec<String> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in empty_keys {
-            hooks.remove(&key);
-        }
-    }
-
-    let json_str = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    crate::util::atomic_write(&settings_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
-
-    Ok(format!("Claude Code: 已移除 {} 个 hook 条目", removed))
+    Ok(if removed == 0 {
+        "Claude Code: 未发现 mini-term 的 hook 条目，无需卸载".to_string()
+    } else {
+        format!("Claude Code: 已移除 {} 个 hook 条目", removed)
+    })
 }
 
 /// 某个 hook 配置文件里已写入 miniterm-hook 条目的事件名集合。
@@ -349,7 +343,7 @@ fn registered_events_in(path: Option<PathBuf>) -> std::collections::HashSet<Stri
 }
 
 fn registered_claude_events() -> std::collections::HashSet<String> {
-    registered_events_in(claude_settings_path())
+    registered_events_in(claude_settings::settings_path())
 }
 
 fn registered_codex_events() -> std::collections::HashSet<String> {
@@ -573,48 +567,39 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
     ))
 }
 
-/// 从 ~/.codex/hooks.json 中卸载 miniterm hooks
-fn unregister_codex_hooks() -> Result<String, String> {
-    let hooks_path = match codex_hooks_path() {
-        Some(p) if p.exists() => p,
-        _ => return Ok("Codex: hooks.json 不存在，无需卸载".to_string()),
-    };
-
+/// 摘掉 Codex hooks.json 里的 mini-term 条目,返回摘掉的条数。没有我们的条目时
+/// 一个字节不写(同 [`remove_claude_entries_at`])。
+///
+/// `config.toml` 里注册时打开的 `features.hooks` 不动:那是 Codex 的总开关,用户自己
+/// 的 hook 也靠它,开着而没有条目是无害的。
+fn remove_codex_entries_at(path: &std::path::Path) -> Result<usize, String> {
+    if registered_events_in(Some(path.to_path_buf())).is_empty() {
+        return Ok(0);
+    }
     let content =
-        std::fs::read_to_string(&hooks_path).map_err(|e| format!("读取 hooks.json 失败: {}", e))?;
+        std::fs::read_to_string(path).map_err(|e| format!("读取 hooks.json 失败: {}", e))?;
     let mut config: Value =
         serde_json::from_str(&content).map_err(|e| format!("解析 hooks.json 失败: {}", e))?;
-
-    let mut removed = 0;
-
-    if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in CODEX_HOOK_EVENTS {
-            if let Some(event_hooks) = hooks.get_mut(*event) {
-                if let Some(arr) = event_hooks.as_array_mut() {
-                    let before = arr.len();
-                    arr.retain(|entry| !entry_is_miniterm(entry));
-                    removed += before - arr.len();
-                }
-            }
-        }
-
-        // 清理空的事件数组
-        let empty_keys: Vec<String> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in empty_keys {
-            hooks.remove(&key);
-        }
-    }
+    let removed = strip_miniterm_entries(&mut config);
 
     let json_str = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
-    crate::util::atomic_write(&hooks_path, json_str.as_bytes())
+    crate::util::atomic_write(path, json_str.as_bytes())
         .map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
+    Ok(removed)
+}
 
-    Ok(format!("Codex: 已移除 {} 个 hook 条目", removed))
+/// 从 ~/.codex/hooks.json 中卸载 miniterm hooks
+fn unregister_codex_hooks() -> Result<String, String> {
+    let removed = match codex_hooks_path() {
+        Some(path) => remove_codex_entries_at(&path)?,
+        None => 0,
+    };
+    Ok(if removed == 0 {
+        "Codex: 未发现 mini-term 的 hook 条目，无需卸载".to_string()
+    } else {
+        format!("Codex: 已移除 {} 个 hook 条目", removed)
+    })
 }
 
 // ─── Grok Build hook 注册/卸载 ───
@@ -722,37 +707,21 @@ fn register_grok_hooks(hook_path: &str) -> Result<String, String> {
     ))
 }
 
-/// 从 {grok_home}/hooks/miniterm.json 中卸载 miniterm hooks，
-/// 条目清空后连同复制进去的二进制一并删除（那份副本只为本文件服务）
-fn unregister_grok_hooks() -> Result<String, String> {
-    let hooks_path = match grok_hooks_path() {
-        Some(p) if p.exists() => p,
-        _ => return Ok(format!("Grok: {} 不存在，无需卸载", GROK_HOOK_FILE)),
-    };
-
-    let content = std::fs::read_to_string(&hooks_path)
+/// 摘掉 {grok_home}/hooks/miniterm.json 里的 mini-term 条目,返回摘掉的条数;
+/// 条目清空后连同复制进去的二进制(`bin`)一并删除(那份副本只为本文件服务)。
+/// 没有我们的条目时一个字节不动(同 [`remove_claude_entries_at`])。
+fn remove_grok_entries_at(
+    hooks_path: &std::path::Path,
+    bin: Option<&std::path::Path>,
+) -> Result<usize, String> {
+    if registered_events_in(Some(hooks_path.to_path_buf())).is_empty() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(hooks_path)
         .map_err(|e| format!("读取 {} 失败: {}", GROK_HOOK_FILE, e))?;
     let mut config: Value = serde_json::from_str(&content)
         .map_err(|e| format!("解析 {} 失败: {}", GROK_HOOK_FILE, e))?;
-
-    let mut removed = 0;
-    if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in GROK_HOOK_EVENTS {
-            if let Some(arr) = hooks.get_mut(*event).and_then(|v| v.as_array_mut()) {
-                let before = arr.len();
-                arr.retain(|entry| !entry_is_miniterm(entry));
-                removed += before - arr.len();
-            }
-        }
-        let empty_keys: Vec<String> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in empty_keys {
-            hooks.remove(&key);
-        }
-    }
+    let removed = strip_miniterm_entries(&mut config);
 
     let file_now_empty = config
         .get("hooks")
@@ -762,23 +731,33 @@ fn unregister_grok_hooks() -> Result<String, String> {
     if file_now_empty {
         // 整个文件都是我们的：直接删掉，别在用户的 hooks 目录留下空壳
         // （sidecar 按该文件是否存在决定要不要丢弃 Claude 兼容层的重复投递）
-        std::fs::remove_file(&hooks_path)
+        std::fs::remove_file(hooks_path)
             .map_err(|e| format!("删除 {} 失败: {}", GROK_HOOK_FILE, e))?;
-        if let Some(bin) = grok_hook_binary_path() {
-            if bin.is_file() {
-                if let Err(e) = std::fs::remove_file(&bin) {
-                    eprintln!("[hook-registry] 删除 grok hook 二进制副本失败: {}", e);
-                }
-            }
+        if let Some(bin) = bin.filter(|b| b.is_file())
+            && let Err(e) = std::fs::remove_file(bin)
+        {
+            eprintln!("[hook-registry] 删除 grok hook 二进制副本失败: {}", e);
         }
     } else {
         let json_str = serde_json::to_string_pretty(&config)
             .map_err(|e| format!("序列化 {} 失败: {}", GROK_HOOK_FILE, e))?;
-        crate::util::atomic_write(&hooks_path, json_str.as_bytes())
+        crate::util::atomic_write(hooks_path, json_str.as_bytes())
             .map_err(|e| format!("写入 {} 失败: {}", GROK_HOOK_FILE, e))?;
     }
+    Ok(removed)
+}
 
-    Ok(format!("Grok: 已移除 {} 个 hook 条目", removed))
+/// 从 {grok_home}/hooks/miniterm.json 中卸载 miniterm hooks
+fn unregister_grok_hooks() -> Result<String, String> {
+    let removed = match grok_hooks_path() {
+        Some(path) => remove_grok_entries_at(&path, grok_hook_binary_path().as_deref())?,
+        None => 0,
+    };
+    Ok(if removed == 0 {
+        "Grok: 未发现 mini-term 的 hook 条目，无需卸载".to_string()
+    } else {
+        format!("Grok: 已移除 {} 个 hook 条目", removed)
+    })
 }
 
 fn registered_grok_events() -> std::collections::HashSet<String> {
@@ -986,22 +965,35 @@ fn register_omp_hooks() -> Result<String, String> {
     })
 }
 
-/// 从 omp 扩展目录卸载：整个文件都是我们的，直接删；不带标识的同名文件不动。
-fn unregister_omp_hooks() -> Result<String, String> {
-    let path = match omp_extension_path() {
-        Some(p) if p.exists() => p,
-        _ => return Ok(format!("oh-my-pi: {} 不存在，无需卸载", OMP_EXTENSION_FILE)),
-    };
-    let content = std::fs::read_to_string(&path)
+/// 删掉我们写的 omp 扩展文件,返回删掉的文件数(0 / 1)。文件不在、或同名文件不带
+/// 标识(那是用户自己的扩展)时不动。
+fn remove_omp_extension_at(path: &std::path::Path) -> Result<usize, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(path)
         .map_err(|e| format!("读取 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
     if !content.contains(HOOK_MARKER) {
-        return Ok(format!(
-            "oh-my-pi: {} 不是 mini-term 写入的文件，未动",
-            path.display()
-        ));
+        return Ok(0);
     }
-    std::fs::remove_file(&path).map_err(|e| format!("删除 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
-    Ok("oh-my-pi: 已移除扩展文件".to_string())
+    std::fs::remove_file(path).map_err(|e| format!("删除 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
+    Ok(1)
+}
+
+/// 从 omp 扩展目录卸载：整个文件都是我们的，直接删；不带标识的同名文件不动。
+fn unregister_omp_hooks() -> Result<String, String> {
+    let removed = match omp_extension_path() {
+        Some(path) => remove_omp_extension_at(&path)?,
+        None => 0,
+    };
+    Ok(if removed == 0 {
+        format!(
+            "oh-my-pi: 未发现 mini-term 写入的 {}，无需卸载",
+            OMP_EXTENSION_FILE
+        )
+    } else {
+        "oh-my-pi: 已移除扩展文件".to_string()
+    })
 }
 
 /// 已注册用户的启动期自愈：扩展文件与当前模板不同就整份重写。
@@ -1045,23 +1037,30 @@ impl HookAgent {
         HookAgent::Omp,
     ];
 
-    fn key(self) -> &'static str {
+    /// 注册目标对应的 agent。标识与展示名都查 [`crate::agent`] 那张表,
+    /// 这里只管「哪几家有 hook、各自怎么注册」。
+    pub fn agent(self) -> AgentKind {
         match self {
-            HookAgent::Claude => "claude",
-            HookAgent::Codex => "codex",
-            HookAgent::Grok => "grok",
-            HookAgent::Omp => "omp",
+            HookAgent::Claude => AgentKind::Claude,
+            HookAgent::Codex => AgentKind::Codex,
+            HookAgent::Grok => AgentKind::Grok,
+            HookAgent::Omp => AgentKind::Omp,
         }
     }
 
+    /// 稳定标识(= serde 名 = 设置页勾选项的值)
+    pub fn key(self) -> &'static str {
+        self.agent().key()
+    }
+
     /// 面板展示名（与 UI 里的品牌写法一致）
-    fn label(self) -> &'static str {
-        match self {
-            HookAgent::Claude => "Claude Code",
-            HookAgent::Codex => "Codex",
-            HookAgent::Grok => "Grok",
-            HookAgent::Omp => "oh-my-pi",
-        }
+    pub fn label(self) -> &'static str {
+        self.agent().spec().label
+    }
+
+    /// [`Self::key`] 的反查;认不出返回 `None`(不退化成「全量注册」,理由见类型注释)。
+    pub fn from_key(key: &str) -> Option<HookAgent> {
+        Self::ALL.iter().copied().find(|a| a.key() == key)
     }
 
     fn events(self) -> &'static [&'static str] {
@@ -1085,7 +1084,7 @@ impl HookAgent {
     /// 配置文件路径的展示形式（`~` 缩写，面板里直接给用户看到写去了哪）
     fn display_path(self) -> String {
         let raw = match self {
-            HookAgent::Claude => claude_settings_path(),
+            HookAgent::Claude => claude_settings::settings_path(),
             HookAgent::Codex => codex_hooks_path(),
             HookAgent::Grok => grok_hooks_path(),
             HookAgent::Omp => omp_extension_path(),
@@ -1121,6 +1120,24 @@ impl HookAgent {
             HookAgent::Codex => unregister_codex_hooks(),
             HookAgent::Grok => unregister_grok_hooks(),
             HookAgent::Omp => unregister_omp_hooks(),
+        }
+    }
+
+    /// 与 [`Self::unregister`] 同一套摘除逻辑,结果是摘掉的条目数(omp 是文件数)。
+    /// 拿不到 home / 配置目录时按「没有可摘的」返回 0。
+    fn remove_entries(self) -> Result<usize, String> {
+        match self {
+            HookAgent::Claude => claude_settings::settings_path()
+                .map_or(Ok(0), |path| remove_claude_entries_at(&path)),
+            HookAgent::Codex => {
+                codex_hooks_path().map_or(Ok(0), |path| remove_codex_entries_at(&path))
+            }
+            HookAgent::Grok => grok_hooks_path().map_or(Ok(0), |path| {
+                remove_grok_entries_at(&path, grok_hook_binary_path().as_deref())
+            }),
+            HookAgent::Omp => {
+                omp_extension_path().map_or(Ok(0), |path| remove_omp_extension_at(&path))
+            }
         }
     }
 }
@@ -1184,6 +1201,19 @@ pub fn unregister_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, Str
         })
         .collect();
     Ok(results.join("\n"))
+}
+
+/// 卸载 mini-term 本体时用(`mini-term.exe --unregister-hooks`,由 NSIS 卸载器调起):
+/// 四家配置里 mini-term 写入的条目全部摘掉,按家返回摘掉的条数。
+///
+/// 与设置页「卸载」同一套摘除逻辑([`HookAgent::remove_entries`]),只认带
+/// `miniterm-hook` 标识的条目 / 文件;没有我们条目的配置文件一个字节不写;单家失败
+/// 不影响其余几家。
+pub fn purge_all_for_uninstall() -> Vec<(HookAgent, Result<usize, String>)> {
+    HookAgent::ALL
+        .iter()
+        .map(|&agent| (agent, agent.remove_entries()))
+        .collect()
 }
 
 /// 各家的注册现状（面板据此定默认勾选、显示状态徽章）。
@@ -1463,6 +1493,32 @@ mod tests {
         assert_eq!(keys.len(), 4);
     }
 
+    /// key / 展示名改由 agent 表供给后,与改造前逐字相同,且与 serde 名对齐
+    /// (设置页拿 key 当勾选值、后端拿 serde 名反序列化,两边必须是同一个串)。
+    #[test]
+    fn key_label_come_from_agent_table_unchanged() {
+        let expected = [
+            (HookAgent::Claude, "claude", "Claude Code"),
+            (HookAgent::Codex, "codex", "Codex"),
+            (HookAgent::Grok, "grok", "Grok"),
+            (HookAgent::Omp, "omp", "oh-my-pi"),
+        ];
+        assert_eq!(expected.len(), HookAgent::ALL.len());
+        for (agent, key, label) in expected {
+            assert_eq!(agent.key(), key);
+            assert_eq!(agent.label(), label);
+            assert_eq!(HookAgent::from_key(key), Some(agent));
+            assert_eq!(
+                serde_json::from_str::<HookAgent>(&format!("\"{key}\"")).ok(),
+                Some(agent)
+            );
+        }
+        // 反查只认 key 原文(不走 agent 表的别名/宽松口径):勾选值只可能是 key
+        assert_eq!(HookAgent::from_key("claude-code"), None);
+        assert_eq!(HookAgent::from_key("Claude"), None);
+        assert_eq!(HookAgent::from_key("opencode"), None);
+    }
+
     // ---- oh-my-pi（omp）扩展 ----
 
     /// 从扩展源码里抠出所有 `pi.on("<event>"` 的事件名。
@@ -1651,6 +1707,160 @@ mod tests {
             enable_codex_hooks_feature(current).expect("现行配置应可解析"),
             current
         );
+    }
+
+    // ---- 卸载摘除(设置页「卸载」与卸载器 `--unregister-hooks` 共用) ----
+
+    /// 每个用例一个独立临时目录,不碰真实 home。
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mt-hook-registry-test-{label}-{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn foreign_entry(command: &str) -> Value {
+        serde_json::json!({ "matcher": "", "hooks": [{ "type": "command", "command": command }] })
+    }
+
+    /// 摘除扫全部事件键(含已从事件表下线的老事件名),只动我们的条目;
+    /// 被我们摘空的键删掉,用户原本就空着的数组与其余键序原样保留。
+    #[test]
+    fn strip_removes_only_ours_across_all_events_and_keeps_key_order() {
+        let ours = |event: &str| build_claude_hook_entry(r"C:\mt\miniterm-hook.exe", event);
+        let mut config = serde_json::json!({
+            "theme": "dark",
+            "hooks": {
+                "Stop": [foreign_entry("notify-send done"), ours("Stop")],
+                "LegacyEvent": [ours("LegacyEvent")],
+                "UserEmpty": [],
+                "PreToolUse": [ours("PreToolUse")],
+                "Notification": [foreign_entry("say hi")]
+            }
+        });
+
+        let keys = |config: &Value| -> Vec<String> {
+            config["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let before = keys(&config);
+
+        assert_eq!(strip_miniterm_entries(&mut config), 3);
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "theme": "dark",
+                "hooks": {
+                    "Stop": [foreign_entry("notify-send done")],
+                    "UserEmpty": [],
+                    "Notification": [foreign_entry("say hi")]
+                }
+            })
+        );
+        // 剩下的键保持原有相对顺序(serde_json 开了 preserve_order 时,swap_remove
+        // 会把末尾的键挪到被删的位置上;没开时 Map 本就按键名排序,这条自然成立)
+        let after = keys(&config);
+        let expected: Vec<String> = before.into_iter().filter(|k| after.contains(k)).collect();
+        assert_eq!(after, expected, "其余键序不能被打乱");
+
+        // 再摘一次:什么都不剩,也什么都不动
+        let snapshot = config.clone();
+        assert_eq!(strip_miniterm_entries(&mut config), 0);
+        assert_eq!(config, snapshot);
+    }
+
+    /// 没有我们条目的文件一个字节都不写(紧凑排版原样保留,不被重排成 pretty);
+    /// 有的话摘掉我们的、别人的照留。
+    #[test]
+    fn removal_leaves_files_without_our_entries_byte_identical() {
+        let dir = unique_test_dir("untouched");
+        let claude = dir.join("settings.json");
+        let codex = dir.join("hooks.json");
+        let raw = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other-tool"}]}]},"model":"x"}"#;
+        std::fs::write(&claude, raw).unwrap();
+        std::fs::write(&codex, raw).unwrap();
+
+        assert_eq!(remove_claude_entries_at(&claude).unwrap(), 0);
+        assert_eq!(remove_codex_entries_at(&codex).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), raw);
+        assert_eq!(std::fs::read_to_string(&codex).unwrap(), raw);
+
+        // 读不懂的文件同样不碰(不冒险改写用户配置)
+        std::fs::write(&codex, "{broken").unwrap();
+        assert_eq!(remove_codex_entries_at(&codex).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&codex).unwrap(), "{broken");
+
+        // 文件不在:不建
+        let missing = dir.join("absent.json");
+        assert_eq!(remove_claude_entries_at(&missing).unwrap(), 0);
+        assert!(!missing.exists());
+
+        let mut with_ours: Value = serde_json::from_str(raw).unwrap();
+        with_ours["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(build_claude_hook_entry(r"C:\mt\miniterm-hook.exe", "Stop"));
+        std::fs::write(&claude, with_ours.to_string()).unwrap();
+        assert_eq!(remove_claude_entries_at(&claude).unwrap(), 1);
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(after, serde_json::from_str::<Value>(raw).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// grok:文件里只剩我们的条目 → 连文件带二进制副本一起删;还有别人的 → 只摘我们的。
+    #[test]
+    fn grok_removal_deletes_file_and_binary_only_when_all_ours() {
+        let dir = unique_test_dir("grok");
+        let hooks = dir.join(GROK_HOOK_FILE);
+        let bin = dir.join(hook_binary_name());
+        let all_ours = serde_json::json!({
+            "hooks": { "Stop": [build_grok_hook_entry()], "SessionEnd": [build_grok_hook_entry()] }
+        });
+        std::fs::write(&hooks, all_ours.to_string()).unwrap();
+        std::fs::write(&bin, b"stub").unwrap();
+
+        assert_eq!(remove_grok_entries_at(&hooks, Some(&bin)).unwrap(), 2);
+        assert!(!hooks.exists() && !bin.exists());
+
+        let mixed = serde_json::json!({
+            "hooks": { "Stop": [build_grok_hook_entry(), foreign_entry("./mine.sh")] }
+        });
+        std::fs::write(&hooks, mixed.to_string()).unwrap();
+        std::fs::write(&bin, b"stub").unwrap();
+        assert_eq!(remove_grok_entries_at(&hooks, Some(&bin)).unwrap(), 1);
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+        assert_eq!(
+            after,
+            serde_json::json!({ "hooks": { "Stop": [foreign_entry("./mine.sh")] } })
+        );
+        assert!(bin.exists(), "文件还在用,二进制副本不能删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// omp:只删带标识的扩展文件,用户自己的同名文件不动。
+    #[test]
+    fn omp_removal_only_deletes_marked_extension() {
+        let dir = unique_test_dir("omp");
+        let ext = dir.join(OMP_EXTENSION_FILE);
+        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 0);
+
+        std::fs::write(&ext, "export default function (pi) {}").unwrap();
+        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 0);
+        assert!(ext.exists());
+
+        std::fs::write(&ext, OMP_EXTENSION_SOURCE).unwrap();
+        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 1);
+        assert!(!ext.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

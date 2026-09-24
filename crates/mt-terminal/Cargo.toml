@@ -7,8 +7,15 @@ authors.workspace = true
 
 [dependencies]
 alacritty_terminal.workspace = true
-mt-pty.workspace = true
-anyhow.workspace = true
 parking_lot.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+# 只给 `tests/terminal_smoke.rs` 用:起真 PTY 把字节喂进状态机,验 PTY → VT → grid
+# 这半截链路。库本身不依赖 mt-pty(字节从哪来由调用方决定)。
+#
+# 这份冒烟测试原先挂在 mt-app 下 —— 一个包只要带 `tests/`,`cargo test` 就得先把
+# 它的 bin 编出来,于是 `cargo test -p mt-app` 要替换 `target/debug/mini-term.exe`,
+# 与运行中的 dev 实例抢文件锁。挪到这里后 mt-app 不再有集成测试。
+mt-pty.workspace = true

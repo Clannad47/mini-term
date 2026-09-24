@@ -3,10 +3,12 @@
 //! # 分页与请求作废(`GitHistoryContent.tsx:234-290`)
 //!
 //! - 每页 30 条;**首页带 `branch`,续页一律 `branch: None`** ——
-//!   分页从上一页末尾 commit 的 parent 续走,不需要 branch;
-//! - **去重是必需的**:有分支时续页会带回已加载的 commit,重复 hash 会让拓扑图
-//!   连线算错,还可能用同一个游标死循环请求。去重后
-//!   `has_more = 本页 >= 30 && 合并后长度 > 之前长度`;
+//!   续页的游标由已加载列表还原([`GitLogCursor::from_loaded`]:已加载集合 +
+//!   它们尚未加载的父),不需要 branch。原版只拿「上一页末尾 commit 的 parent」
+//!   续走,合并历史里页边界上另一侧分支的提交会丢、已加载的会被带回来;
+//! - 合并新页走 [`mt_project::git::merge_log_page`]:按 hash 去重(防线,游标续页
+//!   本身不回已加载的),并在时钟偏移让子提交迟到时做一次稳定的拓扑修正 ——
+//!   拓扑图要求父永远在子之后。`has_more = 本页 >= 30 && 真的新增了`;
 //! - **请求令牌**:换仓库 / 换分支时令牌 +1,迟到响应直接丢弃。
 //!
 //! # 拓扑图为什么自绘
@@ -27,7 +29,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Style, Styled, Window, div,
     point, px, uniform_list,
 };
-use mt_project::git::{BranchInfo, GitCommitInfo};
+use mt_project::git::{BranchInfo, GitCommitInfo, GitLogCursor};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_graph::{
@@ -154,24 +156,20 @@ impl GitHistoryContent {
         self.loading = true;
         let req = self.request;
         let repo = std::path::PathBuf::from(&self.repo_path);
-        // 首页带 branch;续页从上一页末尾 commit 的 parent 续走,不需要 branch
+        // 首页带 branch;续页的游标由已加载列表还原(见模块注释),不需要 branch
         let branch = if first {
             self.view_branch.clone()
         } else {
             None
         };
-        let before = if first {
-            None
-        } else {
-            self.commits.last().map(|c| c.hash.clone())
-        };
+        let after = (!first).then(|| GitLogCursor::from_loaded(&self.commits));
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     mt_project::git::get_git_log(
                         &repo,
-                        before.as_deref(),
+                        after.as_ref(),
                         Some(PAGE_SIZE),
                         branch.as_deref(),
                     )
@@ -193,17 +191,9 @@ impl GitHistoryContent {
         cx.notify();
     }
 
-    /// 合并一页。去重 + `has_more` 判定,见模块注释。
+    /// 合并一页。去重 + 拓扑修正 + `has_more` 判定,见模块注释。
     fn merge_page(&mut self, page: Vec<GitCommitInfo>) {
-        let before_len = self.commits.len();
-        let full_page = page.len() >= PAGE_SIZE;
-        for commit in page {
-            if self.commits.iter().any(|c| c.hash == commit.hash) {
-                continue;
-            }
-            self.commits.push(commit);
-        }
-        self.has_more = full_page && self.commits.len() > before_len;
+        self.has_more = merge_into(&mut self.commits, page);
         self.graph = git_graph::compute(&self.commits);
     }
 
@@ -264,6 +254,14 @@ impl GitHistoryContent {
             hash,
         )
     }
+}
+
+/// [`GitHistoryContent::merge_page`] 的纯函数体,抽出来好测。返回 `has_more`:
+/// 本页满页**且**真的新增了提交 —— 整页重复时停下,免得拿同一个游标死循环请求。
+fn merge_into(commits: &mut Vec<GitCommitInfo>, page: Vec<GitCommitInfo>) -> bool {
+    let full_page = page.len() >= PAGE_SIZE;
+    let added = mt_project::git::merge_log_page(commits, page);
+    full_page && added > 0
 }
 
 /// [`GitHistoryContent::shown_branches`] 的纯函数体,抽出来好测。
@@ -745,50 +743,45 @@ mod tests {
     use super::*;
     use crate::git_graph::test_commit;
 
-    /// 去重:有分支时续页会带回已加载的 commit,重复 hash 必须丢掉,
-    /// 否则拓扑图连线会算错。
+    /// 去重(防线):重复 hash 必须丢掉,否则拓扑图连线会算错;整页重复时
+    /// 停止分页,免得拿同一个游标死循环。
     #[test]
     fn 分页去重与_has_more() {
-        // 借一个不需要 store 的壳来测纯逻辑:merge_page 只碰 commits/graph/has_more
-        struct Fake {
-            commits: Vec<GitCommitInfo>,
-            has_more: bool,
-        }
-        impl Fake {
-            fn merge(&mut self, page: Vec<GitCommitInfo>) {
-                let before_len = self.commits.len();
-                let full_page = page.len() >= PAGE_SIZE;
-                for commit in page {
-                    if self.commits.iter().any(|c| c.hash == commit.hash) {
-                        continue;
-                    }
-                    self.commits.push(commit);
-                }
-                self.has_more = full_page && self.commits.len() > before_len;
-            }
-        }
-
-        let mut fake = Fake {
-            commits: Vec::new(),
-            has_more: false,
-        };
+        let mut commits = Vec::new();
         // 满页 30 条 → 还有更多
         let page: Vec<_> = (0..PAGE_SIZE)
             .map(|i| test_commit(&format!("c{i}"), &[]))
             .collect();
-        fake.merge(page.clone());
-        assert_eq!(fake.commits.len(), PAGE_SIZE);
-        assert!(fake.has_more);
+        assert!(merge_into(&mut commits, page.clone()));
+        assert_eq!(commits.len(), PAGE_SIZE);
 
-        // 整页都是重复的 → 合并后长度没涨 → 停止分页(否则会用同一个游标死循环)
-        fake.merge(page.clone());
-        assert_eq!(fake.commits.len(), PAGE_SIZE, "重复 hash 必须丢掉");
-        assert!(!fake.has_more);
+        // 整页都是重复的 → 合并后长度没涨 → 停止分页
+        assert!(!merge_into(&mut commits, page.clone()));
+        assert_eq!(commits.len(), PAGE_SIZE, "重复 hash 必须丢掉");
 
         // 不满页 → 到底了
-        fake.merge(vec![test_commit("tail", &[])]);
-        assert_eq!(fake.commits.len(), PAGE_SIZE + 1);
-        assert!(!fake.has_more);
+        assert!(!merge_into(&mut commits, vec![test_commit("tail", &[])]));
+        assert_eq!(commits.len(), PAGE_SIZE + 1);
+    }
+
+    /// 迟到的子提交(时钟偏移):它的父已经在上一页展示了,合并时要把它提到父
+    /// 前面 —— 拓扑图按「父永远在子之后」自上而下派 lane,倒挂的话父那条线
+    /// 永远等不到人。
+    #[test]
+    fn 迟到的子提交合并后排到父前面() {
+        let mut commits = vec![
+            test_commit("m", &["a", "late"]),
+            test_commit("a", &["base"]),
+            test_commit("base", &[]),
+        ];
+        merge_into(&mut commits, vec![test_commit("late", &["base"])]);
+        let order: Vec<_> = commits.iter().map(|c| c.hash.as_str()).collect();
+        assert_eq!(order, ["m", "a", "late", "base"]);
+        // 末行(根提交 base)不再往下派线。倒挂时末行是 late,它派给 base 的那条线
+        // 往下空等一个永远不会再出现的父,图上就是一根断在底边的线
+        let layout = git_graph::compute(&commits);
+        let last = layout.rows.last().unwrap();
+        assert!(last.segments.iter().all(|s| s.from != -1), "{last:?}");
     }
 
     /// `origin/` 开头的当远程分支,与 `get_repo_branches` 的产出形态一致。

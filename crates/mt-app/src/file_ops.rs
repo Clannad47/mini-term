@@ -1,6 +1,6 @@
 //! File-manager operation identity and clipboard state.
 //!
-//! Recursive filesystem work stays in `mt-project` / `remote_ssh`; this module owns the
+//! Recursive filesystem work stays in `mt-project` / `mt_remote`; this module owns the
 //! application-layer contract that prevents a path copied from one project or SSH host from being
 //! pasted into another project that happens to use the same textual path.
 

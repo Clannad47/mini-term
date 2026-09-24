@@ -51,8 +51,25 @@ docker logs mini-term-relay | grep 'desktop key'   # expect "desktop key configu
 | `RELAY_PORT` | `8080` | Listen port inside the container |
 | `RELAY_BIND` | `0.0.0.0` | Listen address inside the container |
 | `RELAY_PWA_DIR` | `/srv/pwa` | PWA asset directory (baked into the image; no need to change) |
+| `RELAY_MAX_CONNECTIONS` | `64` | Global cap on concurrent WebSocket connections (including ones still handshaking); over the cap the upgrade is answered with 503 |
+| `RELAY_MAX_CONNECTIONS_PER_IP` | `16` | Cap on concurrent connections per client; over the cap the upgrade is answered with 429 |
+| `RELAY_CLIENT_IP_HEADER` | unset (TCP peer address) | Request header that carries the client address for the per-client cap. **Required behind a reverse proxy**, see below |
+
+Like the key, the last three go into `relay-server/.env` (`docker-compose.yml` passes them through); leave them out to use the defaults.
 
 The public address (domain/port) is not configured on the relay — which address the desktop and phone connect to is determined by the relay URL you enter in the desktop settings.
+
+### Connection and Message Limits
+
+The relay is single-tenant and 1×1 (one desktop + one phone), so it normally holds two or three connections; the defaults are far above normal use and rarely need changing. Per-message limits are fixed in code: 16 MiB for the desktop (a mirror page of 50 text messages) and 1 MiB for the phone — the sender of an oversized message is disconnected. A connection whose outbound backlog reaches 256 frames (the peer is too slow) is disconnected too; both ends reconnect automatically and fetch a fresh full snapshot.
+
+The per-client cap needs the real client address. Behind a reverse proxy the TCP peer is always the proxy itself (the bridge gateway under Docker port mapping), so set `RELAY_CLIENT_IP_HEADER` to the header the proxy writes (the last comma-separated value is used):
+
+- Cloudflare (proxied): `CF-Connecting-IP`
+- Caddy alone: `X-Forwarded-For` (Caddy does not trust this header from clients by default and rewrites it to the peer it sees)
+- Nginx: add `proxy_set_header X-Real-IP $remote_addr;` to the `location`, then use `X-Real-IP`
+
+**Do not set it when no proxy rewrites that header**: clients could then report any value and dodge the per-client cap (the global cap still applies). Left unset, the per-client cap effectively becomes a second global cap, which does not affect normal use.
 
 ### Desktop access key (`MT_RELAY_DESKTOP_KEY`)
 

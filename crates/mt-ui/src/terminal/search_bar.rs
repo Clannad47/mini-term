@@ -66,7 +66,8 @@
 //!     let emulator = self.emulator.clone();
 //!     let this = cx.weak_entity();
 //!     let bar = cx.new(|cx| {
-//!         mt_ui::TerminalSearchBar::new(search, emulator, window, cx).on_close(
+//!         // 第三个参数是文案来源(见下文「文案」一节),mt-app 传 `crate::i18n::terminal_search_labels`
+//!         mt_ui::TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
 //!             move |window, cx| {
 //!                 let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
 //!                     pane.search_bar = None;
@@ -122,9 +123,13 @@
 //!
 //! # 文案
 //!
-//! 默认全部取自 [`mt_i18n`] 的 `terminalSearch` 命名空间(与旧版同 key),
-//! **每帧现取**,所以切语言立刻生效。要自己给文案就传
-//! [`SearchBarLabels`](SearchBarLabels)。
+//! 由宿主在 [`TerminalSearchBar::new`] 时注入一个**文案来源**(`Fn() -> SearchBarLabels`),
+//! 本 crate 不依赖 mt-i18n —— 字典 `dict.rs` 是生成物、改得勤,依赖它就意味着每次
+//! 重生成都把 mt-ui 整个重编。mt-app 传的是 `crate::i18n::terminal_search_labels`
+//! (`terminalSearch` 命名空间,与旧版同 key)。
+//!
+//! 取值时机与注入前一致:按钮提示与「无结果」**每帧现取**(切语言立刻生效),
+//! 输入框占位符只在创建时取一次。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -144,7 +149,8 @@ use crate::tooltip::TooltipExt as _;
 
 use super::search::{SearchDirection, SearchOptions, TerminalSearch};
 
-/// 查找条上的全部文案。默认取 [`mt_i18n`] 的 `terminalSearch` 命名空间。
+/// 查找条上的全部文案。由宿主经 [`TerminalSearchBar::new`] 的文案来源注入
+/// (mt-app 取 mt-i18n 的 `terminalSearch` 命名空间)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchBarLabels {
     /// 整条的名字(旧版 `role="search"` 的 aria-label)。gpui 这边没有无障碍
@@ -158,30 +164,6 @@ pub struct SearchBarLabels {
     pub previous: SharedString,
     pub next: SharedString,
     pub close: SharedString,
-}
-
-impl SearchBarLabels {
-    /// 按**当前**语言取一份。查找条每帧调它,所以切语言不需要额外的刷新通道。
-    pub fn from_i18n() -> Self {
-        let t = |key: &'static str| SharedString::new_static(mt_i18n::t("terminalSearch", key));
-        Self {
-            title: t("title"),
-            placeholder: t("placeholder"),
-            no_results: t("noResults"),
-            case_sensitive: t("caseSensitive"),
-            whole_word: t("wholeWord"),
-            regex: t("regex"),
-            previous: t("previous"),
-            next: t("next"),
-            close: t("close"),
-        }
-    }
-}
-
-impl Default for SearchBarLabels {
-    fn default() -> Self {
-        Self::from_i18n()
-    }
 }
 
 /// 查找条对外发的事件。宿主用 `cx.subscribe` 收,或者只接
@@ -204,8 +186,8 @@ pub struct TerminalSearchBar {
     search: Rc<RefCell<TerminalSearch>>,
     emulator: Arc<TerminalEmulator>,
     input: Entity<InputState>,
-    /// `None` = 跟随 [`mt_i18n`] 的当前语言。
-    labels: Option<SearchBarLabels>,
+    /// 文案来源。[`Render::render`] 每帧调一次,所以切语言不需要额外的刷新通道。
+    labels: Rc<dyn Fn() -> SearchBarLabels>,
     on_close: Option<OnSearchClose>,
     _subscriptions: Vec<Subscription>,
 }
@@ -214,13 +196,18 @@ impl EventEmitter<SearchBarEvent> for TerminalSearchBar {}
 
 impl TerminalSearchBar {
     /// `search` 是与终端视图**共用的同一份**引擎实例。
+    ///
+    /// `labels` 是文案来源:按**当前**语言返回一份 [`SearchBarLabels`]。
+    /// 渲染时每帧调它;输入框占位符只在这里取一次。
     pub fn new(
         search: Rc<RefCell<TerminalSearch>>,
         emulator: Arc<TerminalEmulator>,
+        labels: impl Fn() -> SearchBarLabels + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let placeholder = SearchBarLabels::from_i18n().placeholder;
+        let labels: Rc<dyn Fn() -> SearchBarLabels> = Rc::new(labels);
+        let placeholder = labels().placeholder;
         // 上次的关键词住在引擎里(收起查找条不清它),重开时原样填回输入框
         let initial = search.borrow().query().to_string();
         let input = cx.new(|cx| {
@@ -241,7 +228,7 @@ impl TerminalSearchBar {
             search,
             emulator,
             input,
-            labels: None,
+            labels,
             on_close: None,
             _subscriptions: vec![subscription],
         }
@@ -253,31 +240,22 @@ impl TerminalSearchBar {
         self
     }
 
-    /// 自定义文案。不设就跟随 [`mt_i18n`] 的当前语言。
-    pub fn labels(mut self, labels: SearchBarLabels) -> Self {
-        self.labels = Some(labels);
-        self
-    }
-
-    /// 运行时换文案。
+    /// 运行时换文案来源(连同输入框占位符)。
     pub fn set_labels(
         &mut self,
-        labels: Option<SearchBarLabels>,
+        labels: impl Fn() -> SearchBarLabels + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let placeholder = labels
-            .clone()
-            .unwrap_or_default()
-            .placeholder;
-        self.labels = labels;
+        self.labels = Rc::new(labels);
+        let placeholder = (self.labels)().placeholder;
         self.input
             .update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
         cx.notify();
     }
 
     fn resolved_labels(&self) -> SearchBarLabels {
-        self.labels.clone().unwrap_or_default()
+        (self.labels)()
     }
 
     /// 打开:开引擎、把输入框里的关键词推给引擎搜一遍、聚焦并全选。
@@ -558,38 +536,5 @@ mod tests {
         // 有命中:1-based
         assert_eq!(counter_text(true, 1, 12, "无结果"), "1/12");
         assert_eq!(counter_text(true, 12, 12, "无结果"), "12/12");
-    }
-
-    /// 文案 key 与旧版 `src/i18n/locales/terminalSearch.ts` 逐条对齐 ——
-    /// 打错一个 key 不会崩,只会在界面上显示成 key 本身,肉眼很难第一时间发现。
-    ///
-    /// 这里**不动全局语言**(它是进程级的,并行测试会互相踩),用
-    /// `t_in` 指定语言来验两侧;`from_i18n` 走全局这条只在默认语言下验一次。
-    #[test]
-    fn 文案_key_与旧版字典逐条对上() {
-        use mt_i18n::{Locale, t_in};
-        let zh = |key: &'static str| t_in(Locale::Zh, "terminalSearch", key);
-        let en = |key: &'static str| t_in(Locale::En, "terminalSearch", key);
-
-        assert_eq!(zh("title"), "在终端中查找");
-        assert_eq!(zh("placeholder"), "查找…");
-        assert_eq!(zh("noResults"), "无结果");
-        assert_eq!(zh("caseSensitive"), "区分大小写");
-        assert_eq!(zh("wholeWord"), "全词匹配");
-        assert_eq!(zh("regex"), "正则表达式");
-        assert_eq!(zh("previous"), "上一个 (Shift+Enter)");
-        assert_eq!(zh("next"), "下一个 (Enter)");
-        assert_eq!(zh("close"), "关闭 (Esc)");
-
-        assert_eq!(en("placeholder"), "Find…");
-        assert_eq!(en("noResults"), "No results");
-        assert_eq!(en("caseSensitive"), "Match case");
-        assert_eq!(en("close"), "Close (Esc)");
-
-        // 打错 key 在 debug 下会直接 panic(mt-i18n 的静态断言),
-        // 所以上面这一堆同时也是「key 都存在」的证明。
-        let labels = SearchBarLabels::from_i18n();
-        assert_eq!(labels.placeholder.as_ref(), zh("placeholder"));
-        assert_eq!(labels.close.as_ref(), zh("close"));
     }
 }

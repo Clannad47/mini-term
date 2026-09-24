@@ -110,13 +110,14 @@ impl MoveSource {
     }
 }
 
-/// 两条路径指向同一目录吗。远程走字符串(去尾 `/`),本地走 `Path` 的按段比较
-/// (尾分隔符、`.` 段都不算差异)。
+/// 两条路径指向同一目录吗。远程走字符串(去尾 `/`、根留 `/`,`\` 是文件名字符),
+/// 本地走 `Path` 的按段比较(尾分隔符、`.` 段都不算差异)。
 fn same_path(remote: bool, a: &Path, b: &Path) -> bool {
     if remote {
+        use mt_core::path_key::posix_trim_trailing;
         let a = a.to_string_lossy();
         let b = b.to_string_lossy();
-        trim_posix(&a) == trim_posix(&b)
+        posix_trim_trailing(&a) == posix_trim_trailing(&b)
     } else {
         a == b
     }
@@ -125,16 +126,10 @@ fn same_path(remote: bool, a: &Path, b: &Path) -> bool {
 /// `path` 是 `ancestor` 自身或它的子孙吗。
 fn is_same_or_descendant(remote: bool, ancestor: &Path, path: &Path) -> bool {
     if remote {
-        crate::remote_ssh::posix_relative(&ancestor.to_string_lossy(), &path.to_string_lossy())
-            .is_some()
+        mt_remote::posix_relative(&ancestor.to_string_lossy(), &path.to_string_lossy()).is_some()
     } else {
         path.starts_with(ancestor)
     }
-}
-
-fn trim_posix(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 /// 「移动到 ▸」菜单项。
@@ -205,7 +200,7 @@ impl MoveToPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::remote_ssh::list_directory_for(remote.as_ref(), &root, &list_dir, false)
+                    mt_remote::list_directory_for(remote.as_ref(), &root, &list_dir, false)
                         .map(|entries| entries.into_iter().filter(|e| e.is_dir).collect())
                 })
                 .await;
@@ -502,7 +497,7 @@ mod tests {
             path: PathBuf::from(path),
             name: path.rsplit('/').next().unwrap_or_default().to_string(),
             is_dir,
-            parent: PathBuf::from(crate::remote_ssh::parent_posix(path).unwrap_or_default()),
+            parent: PathBuf::from(mt_remote::parent_posix(path).unwrap_or_default()),
             remote: true,
         }
     }
@@ -586,11 +581,14 @@ mod tests {
         assert!(!can_open_child(MAX_PANEL_LEVEL + 1));
     }
 
+    /// 远程判同一目录:去尾 `/`、根保留;`\` 是远端文件名里的普通字符,不当分隔符。
     #[test]
     fn posix_去尾斜杠_根保留() {
-        assert_eq!(trim_posix("/a/b/"), "/a/b");
-        assert_eq!(trim_posix("/a/b"), "/a/b");
-        assert_eq!(trim_posix("/"), "/");
-        assert_eq!(trim_posix(""), "/");
+        let same = |a: &str, b: &str| same_path(true, Path::new(a), Path::new(b));
+        assert!(same("/a/b/", "/a/b"));
+        assert!(same("/a/b", "/a/b"));
+        assert!(same("/", "//"));
+        assert!(!same("/a", "/"));
+        assert!(!same(r"/a/b\", "/a/b"), "反斜杠不是分隔符");
     }
 }

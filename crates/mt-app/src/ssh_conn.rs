@@ -339,7 +339,7 @@ pub fn session_source(project: &ProjectConfig, connections: &[SshConnection]) ->
 /// 会话池按 `connection.id` 缓存 session,`CachedSession` 不存这些字段;用户在
 /// 弹窗里把 host 改成另一台服务器却保留同一个 id 时,旧 session 会被继续复用。
 /// 本函数就是那道判据 —— 返回 `true` 即必须作废池里那条 session
-/// (`remote_ssh::invalidate_connection`)。
+/// (`mt_remote::invalidate_connection`)。
 ///
 /// **只看会话身份字段**:host / port / user / password / identity_file。
 /// `name` 与 `group` 纯展示,改它们不该白扔一条已建好的连接。
@@ -371,28 +371,16 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            extra: Default::default(),
         }
     }
 
     fn project(enabled: bool, ids: Option<Vec<&str>>) -> ProjectConfig {
-        let mut p = ProjectConfig {
-            id: "p1".into(),
-            name: "proj".into(),
-            path: "/home/u/proj".into(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
+        ProjectConfig {
             ssh_mcp_enabled: enabled,
-            ssh_cli_token: None,
             ssh_connection_ids: ids.map(|v| v.into_iter().map(str::to_string).collect()),
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        };
-        p.ssh_mcp_enabled = enabled;
-        p
+            ..ProjectConfig::new("p1", "proj", "/home/u/proj")
+        }
     }
 
     fn ids(v: &[&str]) -> Vec<String> {

@@ -8,7 +8,8 @@ use mt_config::{ProjectConfig, SshConnection};
 
 use crate::tree::{PaneState, PaneStatus};
 
-use super::{AppStore, ProjectState, SshAssocOutcome};
+use super::events::StoreChanged;
+use super::{AppStore, ConfigSection, ProjectState, SshAssocOutcome, StoreEvent};
 
 // ===========================================================================
 // SSH(audit #28,BB-a 批)
@@ -77,15 +78,20 @@ impl AppStore {
         {
             Some(slot) => {
                 identity_changed = crate::ssh_conn::ssh_session_identity_changed(slot, &conn);
+                // 表单只认识本版本的字段:新版本写进来的未知字段从旧条目上接过来,
+                // 否则编辑一次连接就把它们抹了(见 mt-config `db.rs`「前向兼容」段)
+                if conn.extra.is_empty() {
+                    conn.extra = std::mem::take(&mut slot.extra);
+                }
                 *slot = conn;
             }
             None => self.config.ssh_connections.push(conn),
         }
         if identity_changed {
-            crate::remote_ssh::invalidate_connection(&id);
+            mt_remote::invalidate_connection(&id);
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         match seal_error {
             Some(err) => Err(err),
             None => Ok(()),
@@ -106,9 +112,9 @@ impl AppStore {
         if self.config.ssh_connections.len() == before {
             return;
         }
-        crate::remote_ssh::invalidate_connection(id);
+        mt_remote::invalidate_connection(id);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 新建一个空分组(重名则只切选中态,由调用方处理)。返回是否真的新建了。
@@ -132,7 +138,7 @@ impl AppStore {
         }
         self.config.ssh_groups.push(name.to_string());
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         true
     }
 
@@ -151,7 +157,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 解散分组:组里的连接回落「未分组」,组名从 `sshGroups` 移除(连接不删)。
@@ -163,7 +169,7 @@ impl AppStore {
             }
         }
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 把一条连接挪进某个分组(`group = None` = 挪到未分组)。
@@ -188,7 +194,7 @@ impl AppStore {
         }
         conn.group = target.map(str::to_string);
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     /// 把一条连接拖到另一条连接的前 / 后(右栏行间排序)。落到别的桶里的连接
@@ -216,7 +222,7 @@ impl AppStore {
         };
         self.config.ssh_connections = next;
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
     // --- 远程项目 ---
@@ -230,7 +236,7 @@ impl AppStore {
     /// 远程项目引用的连接;**断链**(连接被删)时 `None`。
     ///
     /// 返回克隆而不是引用:调用方多半要把它丢进 `background_executor`
-    /// (`remote_ssh` 的入口全是阻塞函数,见那个模块的线程口径)。
+    /// (`mt_remote` 的入口全是阻塞函数,见那个 crate 的线程口径)。
     pub fn remote_connection_of(&self, project_id: &str) -> Option<SshConnection> {
         let project = self.project(project_id)?;
         crate::ssh_conn::remote_connection(project, &self.config.ssh_connections).cloned()
@@ -270,7 +276,7 @@ impl AppStore {
 
     /// 添加一个 SSH 远程项目并返回它的 id(`AddRemoteProjectModal.tsx::handleSave`
     /// 的落盘那一半 —— 远程路径的 `~` 展开与目录校验由调用方先跑
-    /// [`crate::remote_ssh::validate_dir`],这里只接**已 canonicalize 的绝对路径**)。
+    /// [`mt_remote::validate_dir`],这里只接**已 canonicalize 的绝对路径**)。
     ///
     /// - `name` 为空时取路径末段(再取不到就用整条路径),与原版一字不差;
     /// - 远程项目**不参与** [`Self::find_project_by_path`] 的去重(那条判据显式
@@ -288,20 +294,8 @@ impl AppStore {
         let final_name = crate::ssh_conn::remote_project_name(name, remote_path);
         let id = self.fresh_project_id();
         self.config.projects.push(ProjectConfig {
-            id: id.clone(),
-            name: final_name,
-            path: remote_path.to_string(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
             ssh_connection_id: Some(connection_id.to_string()),
-            parent_project_id: None,
-            kind_override: None,
+            ..ProjectConfig::new(id.clone(), final_name, remote_path)
         });
         let tree = self.config.project_tree.get_or_insert_with(Vec::new);
         tree.push(mt_config::ProjectTreeItem::ProjectId(id.clone()));
@@ -311,7 +305,8 @@ impl AppStore {
             self.move_item(&id, Some(group_id), None, cx);
         }
         self.save_config_now();
-        cx.notify();
+        cx.emit(StoreEvent::ProjectTreeChanged);
+        cx.changed(StoreEvent::ProjectsChanged);
         id
     }
 
@@ -336,7 +331,7 @@ impl AppStore {
         project.ssh_cli_token = if enabled { project_token } else { None };
         project.ssh_connection_ids = if enabled { Some(scope) } else { None };
         self.save_config_now();
-        cx.notify();
+        cx.changed(StoreEvent::ProjectsChanged);
     }
 
     /// 「关联 SSH」保存的**完整**动作:算计划 → 后台跑注册器 → 回主线程落配置。
@@ -378,9 +373,7 @@ impl AppStore {
                     let token = existing_token.clone();
                     let res = cx
                         .background_executor()
-                        .spawn(async move {
-                            crate::ssh_registry::enable(&dir, token.as_deref())
-                        })
+                        .spawn(async move { mt_ai::ssh_registry::enable(&dir, token.as_deref()) })
                         .await?;
                     SshAssocOutcome {
                         enabled: true,
@@ -396,7 +389,7 @@ impl AppStore {
                     let dir = project_dir.clone();
                     let message = cx
                         .background_executor()
-                        .spawn(async move { crate::ssh_registry::disable(&dir) })
+                        .spawn(async move { mt_ai::ssh_registry::disable(&dir) })
                         .await?;
                     SshAssocOutcome {
                         enabled: false,
@@ -475,7 +468,8 @@ impl AppStore {
         let pane = state.pane_mut(pane_id)?;
         pane.pty_id = Some(new_pty);
         pane.status = PaneStatus::Idle;
-        state.status = state.highest_status();
+        // notify 由 `after_layout_change` 收尾(它另发 `LayoutChanged`)
+        cx.emit(StoreEvent::PaneStatusChanged);
         self.after_layout_change(project_id, cx);
         Some(new_pty)
     }

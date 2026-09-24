@@ -79,12 +79,15 @@ pub fn resolve_appearance(theme: &str, cx: &App) -> Appearance {
 
 /// themes/ 目录。
 ///
-/// `ThemePacks::open()` 现在认 `MT_APP_DATA_DIR`(`mt_config::active_data_dir`,
+/// 目录取 [`mt_config::themes_dir`],认 `MT_APP_DATA_DIR`(`mt_config::active_data_dir`,
 /// 与 [`crate::app_data_dir`] 同一口径),J 批那条「钉死装机版目录、mt-app 用
 /// `ThemePacks::at()` 绕开」的记档已结清 —— 这里只保留定位不到数据目录时的兜底。
+///
+/// 主题包文件层拆进 `mt-theme-packs` 后不再认数据目录口径(原 `ThemePacks::open()`
+/// 就是 `at(themes_dir()?)`),目录由这里算好交给 `ThemePacks::at`,语义不变。
 pub fn theme_packs() -> mt_config::ThemePacks {
-    mt_config::ThemePacks::open()
-        .unwrap_or_else(|_| mt_config::ThemePacks::at(crate::app_data_dir().join("themes")))
+    let root = mt_config::themes_dir().unwrap_or_else(|_| crate::app_data_dir().join("themes"));
+    mt_config::ThemePacks::at(root)
 }
 
 /// 可用的外置主题包(坏包跳过,设置页的皮肤列表用它)。

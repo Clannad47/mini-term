@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mt_ai::sessions::normalize_unix_path;
 use mt_config::SshConnection;
+use mt_core::path_key::posix_ci_eq_key;
 use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
 
 use super::{
@@ -108,7 +108,7 @@ pub fn list_directory(
     refresh_ignore: bool,
 ) -> Result<Vec<FileEntry>, String> {
     let st = state();
-    let ignore_key = format!("{}|{}", conn.id, normalize_unix_path(project_root));
+    let ignore_key = format!("{}|{}", conn.id, posix_ci_eq_key(project_root));
     if refresh_ignore {
         lock(&st.gitignore_cache).remove(&ignore_key);
     }
@@ -182,8 +182,8 @@ pub fn list_directory(
 /// [`mt_project::fs::list_directory`]。两条路返回同一个 [`FileEntry`]。
 ///
 /// 文件树只需问一次「这个项目有没有远程连接」
-/// ([`AppStore::remote_connection_of`](crate::store::AppStore::remote_connection_of),
-/// 断链时是 `None`)就能共用同一段加载代码 —— 分流判据只有这一处,不会出现
+/// (mt-app 的 `AppStore::remote_connection_of`,断链时是 `None`)
+/// 就能共用同一段加载代码 —— 分流判据只有这一处,不会出现
 /// 「树顶刷新走了本地、展开子目录走了远程」这类半截状态。
 ///
 /// 断链项目由 FileTree 在进入此分流函数前拦住，绝不会把远程 POSIX 路径当成本机

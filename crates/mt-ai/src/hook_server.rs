@@ -7,6 +7,7 @@
 //! 命令（与 omp 的进程内扩展）按当前形态 POST 过来,改了等于让存量用户的 AI 感知
 //! 集体失灵。
 
+use crate::agent::AgentKind;
 use crate::monitor::{SessionIdentity, StatusEmitter};
 use crate::tracker::SessionTracker;
 use serde::{Deserialize, Serialize};
@@ -438,8 +439,13 @@ fn map_event_to_status(
     // Codex 的 PermissionRequest 在审批 UI 弹出前触发，批准后直接执行工具，
     // 直到 PostToolUse 之前不再有任何 hook 事件。若映射为 ai-idle，批准后
     // 整个命令执行期间状态都会卡在 ai-idle，且审批弹出时误报"任务完成"，
-    // 因此对 Codex 保持 ai-working（仍处于任务中）。
-    if event == "PermissionRequest" && agent == Some("codex") {
+    // 因此对 Codex 保持 ai-working（仍处于任务中）。哪家是这个形态查
+    // `AgentSpec::permission_request_keeps_working`。
+    if event == "PermissionRequest"
+        && agent
+            .and_then(AgentKind::parse)
+            .is_some_and(|k| k.spec().permission_request_keeps_working)
+    {
         return Some("ai-working");
     }
     // API 错误/重试类 Notification:AI 还在自动重试,保持工作中。
@@ -737,7 +743,7 @@ pub fn start_hook_server(
                         // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
                         tracker.mark_ai_session(
                             pty_id,
-                            payload.agent.as_deref().unwrap_or("claude"),
+                            payload.agent.as_deref().unwrap_or(AgentKind::Claude.key()),
                         );
                         hook_state.update(pty_id, status.to_string());
 

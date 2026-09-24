@@ -8,7 +8,6 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 # 分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
@@ -21,3 +20,5 @@ rusqlite.workspace = true
 toml_edit = "0.22"
 # 会话文件枚举/元信息行解析/grok_home 直连 mt-ai(ai_shim 临时副本已删)
 mt-ai.workspace = true
+# 路径比较键(项目 scope 的 cwd 匹配,`path_key::windows_eq_key`)
+mt-core.workspace = true

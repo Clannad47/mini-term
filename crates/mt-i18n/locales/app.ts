@@ -43,6 +43,12 @@ export const app = {
       remaining: "另有 {count} 项",
     },
     configLoadFailed: "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}",
+    layoutLoadFailed: "界面布局库不可用，本次调整的分屏、栏宽与窗口位置不会保存。\n\n错误：{detail}",
+    storageIssueTitle: "数据保存异常",
+    configSaveFailed: {
+      title: "配置保存失败",
+      message: "最近的改动没能写入磁盘，重启后可能丢失：{detail}",
+    },
     trayAttention: "{count} 个待确认",
     trayStatus: {
       attention: "待确认",
@@ -107,6 +113,12 @@ export const app = {
       remaining: "{count} more items",
     },
     configLoadFailed: "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}",
+    layoutLoadFailed: "The layout database is unavailable. Split panes, column widths and window position changed this session won't be saved.\n\nError: {detail}",
+    storageIssueTitle: "Storage problem",
+    configSaveFailed: {
+      title: "Couldn't save settings",
+      message: "Recent changes couldn't be written to disk and may be lost after a restart: {detail}",
+    },
     trayAttention: "{count} awaiting confirmation",
     trayStatus: {
       attention: "Awaiting confirmation",

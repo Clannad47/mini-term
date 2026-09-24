@@ -36,7 +36,7 @@
 //!
 //! ```ignore
 //! match dir_kind {
-//!     Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
+//!     Some(kind) => TechIcon::new(kind.as_str()).size(px(14.0)).into_any_element(),
 //!     None => FileIcon::new(&entry.name, true, expanded).into_any_element(),
 //! }
 //! ```

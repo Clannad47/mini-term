@@ -6,28 +6,44 @@ name: Build & Release
 #   身份对齐旧 Tauri NSIS —— HKCU Uninstall\Mini-Term 键 + 读旧 InstallLocation,
 #   老用户原地升级:装过就先弹框告知、再跑旧版卸载器,不是文件覆盖写;
 #   包内平铺 exe + 三个 sidecar + portable-conpty/,
-#   运行时全部按「与 exe 同目录」定位)
+#   运行时全部按「与 exe 同目录」定位)+ 调试符号 zip(mini_term.pdb,单独资产,
+#   不进安装包,见「Package debug symbols」步骤)
 # - macOS arm64 + x64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
 #   bundle id 沿用旧 Tauri 版的 com.mini-term.app)。Intel 包(issue #77)在
 #   GitHub 免费的 `macos-15-intel` runner 上原生编译,不交叉编译;该镜像是 Actions
 #   最后一代 x86_64 macOS,官方承诺可用到 2027-08,之后要么在 arm64 runner 上带
 #   `--target x86_64-apple-darwin` 交叉编,要么 lipo 合成 universal 包
 # - Linux x64:deb + tar.gz(deb 版本号把 `-` 换成 `~`,预发布序才正确 ——
-#   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号)
+#   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号;
+#   deb 的 Depends 由 dpkg-shlibdeps 在构建时按二进制实际链接的库算出)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
 #   该目录收集 —— 目录布局即最终包布局
-# - release 壳由 create-release 先建好(prerelease 按 tag 含 `-` 自动标),
-#   三平台只向其上传产物,避免并行抢建 release
+# - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
+#   各平台只向其上传产物,避免并行抢建 release;全部平台构建成功后 publish 作业
+#   算出 SHA256SUMS.txt 一并上传,再把 draft 转正。匿名请求看不到 draft ——
+#   应用内更新检查(update_check.rs 拉公开列表)因此不会在产物传齐之前把用户
+#   引到一个空的 release 页,任何平台构建失败时 release 也不会公开
+#   (v1.13.7 之前是一上来就建公开 release,Windows 包晚 27 分钟才到)
 # - 资产名沿用旧正式版(Tauri v2 bundler)的形态:`Mini-Term_<版本>_<arch>…`,
 #   **不带 v 前缀、不带 gpui 字样**。渲染层从 WebView 换成 GPUI 是内部实现,
 #   用户是按文件名认包的(v1.0.x-beta 那一串 `mini-term-gpui-*` 是迁移期的临时名)
 # ⚠️ macOS / Linux 是「代码支持,可用性欠佳」档,构建线未经真机验证;
-#   fail-fast: false 保证它们失败不拖累 Windows 产物
+#   fail-fast: false 保证它们失败不打断 Windows 的构建与上传(产物照样进 draft)。
+#   但 publish 要**全部**平台成功才跑:任一平台挂了 release 就停在 draft,修好后
+#   在该次运行上 Re-run failed jobs(publish 随之重跑),或确认只发部分平台时
+#   手动 `gh release edit <tag> --draft=false`(这样发出去的没有 SHA256SUMS.txt,
+#   之后任意补建一次平台就会重算补上)
 # - 手动触发(workflow_dispatch)= 给**已发布**的版本补建产物:不新建 release、
 #   不生成 changelog,从 inputs.tag 那个 tag 的代码构建 inputs.platforms 选中的
 #   平台,上传到该 tag 已有的 release。首个用例是 v1.2.6 补 Intel mac 包。
+#   补建成功后 publish 只重算并覆盖 SHA256SUMS.txt,**不碰** draft / prerelease 状态。
 #   ⚠️ 选了已有产物的平台会把用户下载过的同名文件覆盖掉,默认只补 macos-x64;
 #   workflow 文件取自触发时选的分支,代码取自 inputs.tag,两者刻意分离
+#   (rust-toolchain.toml 也随代码取自 tag;更早没有这个文件的 tag 用 runner 自带的 stable)
+# - 安全口径:顶层只给 contents: read,要写 release 的三个作业各自提权;checkout 一律
+#   不把 token 落进 .git/config(构建期几百个依赖的 build.rs 都读得到那个文件),
+#   写 release 的 gh 命令只在各自那一步的 env 里拿 token;所有 action 一律钉 commit SHA
+#   (行尾注释是原 tag,升级时按 tag 重新查 SHA)
 
 on:
   push:
@@ -45,53 +61,70 @@ on:
         default: 'macos-x64'
         type: string
 
+# 默认只读。要写 release 的 create-release / build-gpui / publish 各自提到 contents: write
+permissions:
+  contents: read
+
 env:
   # push 事件是被推的 tag;手动补建是 inputs.tag(push 时 inputs 为空,靠 || 兜底)。
   # 各步骤一律用它,不直接碰 github.ref_name —— 手动触发时那是分支名
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # 原先由 dtolnay/rust-toolchain 顺手设上的;改成 rustup 按文件装之后在这里显式给
+  # (CARGO_INCREMENTAL=0 由 rust-cache 设,不必重复)
+  CARGO_TERM_COLOR: always
 
 jobs:
   create-release:
-    # 手动补建时 release 已经在了,跳过;build-gpui 的 if 里把 skipped 视同成功
+    # 手动补建时 release 已经在了,跳过;build-gpui / publish 的 if 里把 skipped 视同成功
     if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Generate changelog
-        id: changelog
         shell: bash
         run: |
           CURRENT_TAG="$RELEASE_TAG"
-          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          # 基线 = 本 tag 父提交上最近的 v* tag,与 ci.yml 的 diff-base 同一口径。
+          # 不能按版本号排序取第二个:预发布转正式时 v1.13.6-pre 排在 v1.13.6 前面,
+          # 第二个取到的正是当前 tag 自己,changelog 成了空的
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' "${CURRENT_TAG}^" 2>/dev/null || true)
           if [ -z "$PREV_TAG" ]; then
             RANGE="$CURRENT_TAG"
           else
             RANGE="${PREV_TAG}..${CURRENT_TAG}"
           fi
+          echo "changelog range: $RANGE"
           LOGS=$(git log "$RANGE" --pretty=format:"- %s" --no-merges)
-          # write to GITHUB_OUTPUT using delimiter
           {
-            echo "body<<CHANGELOG_EOF"
             echo "## 更新内容"
             echo ""
             echo "$LOGS"
             echo ""
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
+          } > "$RUNNER_TEMP/release-notes.md"
 
-      - name: Create GitHub release
-        id: create
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Mini-Term ${{ env.RELEASE_TAG }}
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+      # 建成 draft,由 publish 作业在全部平台成功后转正(理由见文件头)。
+      # 在同一次运行上 Re-run all jobs 时 release 已经在了:原样沿用 —— 不重建、
+      # 不改 draft 状态、不覆盖 notes(可能已经手改过)
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::notice::release $RELEASE_TAG 已存在,沿用"
+            exit 0
+          fi
+          flags=(--draft --verify-tag --title "Mini-Term $RELEASE_TAG"
+                 --notes-file "$RUNNER_TEMP/release-notes.md")
+          case "$RELEASE_TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$RELEASE_TAG" "${flags[@]}"
 
   # 算出 build-gpui 的矩阵:push 全量四条;手动补建只留 inputs.platforms 点名的。
   # 平台表与过滤规则在 .github/scripts/release_matrix.mjs(job 级 if 拿不到
@@ -101,7 +134,9 @@ jobs:
     outputs:
       include: ${{ steps.plan.outputs.include }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -120,14 +155,18 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     permissions:
+      # 只为最后一步把产物传进 release;token 只在那一步的 env 里出现
       contents: write
 
     steps:
       # 按 tag 检出而不是默认的触发 sha:手动补建时触发 sha 是分支 HEAD,
-      # 产物必须与该版本其它平台的包出自同一份代码
-      - uses: actions/checkout@v5
+      # 产物必须与该版本其它平台的包出自同一份代码。
+      # persist-credentials: false —— 不把 token 写进 .git/config,下面编译期跑的
+      # 依赖 build.rs 读不到它;本作业之后再没有需要 git 凭据的操作
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       # gpui Linux 后端(x11/wayland,见 mt-app 的 target 依赖段)的构建依赖:
       # font-kit 要 fontconfig/freetype,xkb/wayland 头文件给 windowing 层。
@@ -142,18 +181,36 @@ jobs:
             libx11-dev libxcb1-dev libasound2-dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # 工具链按仓库根的 rust-toolchain.toml 装(channel / components / profile 都以它为准),
+      # 版本号只写在那一个文件里,本地与 CI 同一套 clippy。不再用 dtolnay/rust-toolchain:
+      # 它按 input 装一套、rustup 又按 toml 再装一套,CI 上就是两套工具链。
+      # 无参 `rustup toolchain install` = 装当前生效的工具链(rustup ≥ 1.28,托管 runner
+      # 镜像自带的满足);检出的 tag 早于该文件时生效的是 runner 自带的 stable。
+      # 矩阵四条的 target 目前都是 runner 原生 triple,显式 add 一次是给将来在 arm64
+      # runner 上交叉编 Intel 包(macos-15-intel 2027-08 下线)留的口子
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$MATRIX_TARGET"
+          rustc -vV
 
+      # 只读:缓存由 cache-warm.yml 在 main 上预热(tag 运行能恢复 main 作用域的缓存,
+      # tag 之间互相看不见 —— 此前每个 tag 各存一份、从没命中过,还把 10 GB 额度顶满)。
+      # ⚠️ shared-key / workspaces 与 cache-warm.yml 的 release 作业逐字一致,上面装
+      # 工具链的步骤与本 workflow 的 env 也要与那边对齐,否则键对不上。
+      # 手动补建(workflow_dispatch)构建的是旧 tag 的代码,依赖多半对不上,同样不存
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: release
+          save-if: false
           workspaces: |
             . -> target
             sidecars -> target
@@ -227,6 +284,23 @@ jobs:
             /DSOURCE_DIR=$src /DICON_FILE=$ico /DOUT_FILE=$out `
             scripts/windows-installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis 退出码 $LASTEXITCODE" }
+          Get-ChildItem dist
+
+      # 调试符号单独成一个 release 资产,**不进安装包**(根 Cargo.toml 的 release profile
+      # 开了行号表,MSVC 把它写进 exe 旁的 mini_term.pdb,exe 本身不变)。压成 zip:PDB 压缩比
+      # 高;包内保持链接器写进 exe 的原名 mini_term.pdb —— 解压到安装目录(与 mini-term.exe
+      # 同目录),panic 日志里的 backtrace 就直接解析成函数名 + 行号;不放进去也能对着日志里
+      # 的模块基址换算 RVA 离线解析。PDB 与 exe 靠 GUID 配对,只对同一次构建的 exe 有效。
+      # 资产名带版本号;publish 作业的 SHA256SUMS.txt 按 release 的全部资产算,自动包含它
+      - name: Package debug symbols (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $pdb = 'target/release/mini_term.pdb'
+          if (-not (Test-Path $pdb)) { throw "没找到 ${pdb}(release profile 的 debug 设置被改掉了?)" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path $pdb -DestinationPath "dist/Mini-Term_${version}_x64-pdb.zip" -CompressionLevel Optimal -Force
           Get-ChildItem dist
 
       - name: Assemble .app bundle + dmg (macOS)
@@ -313,6 +387,42 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$PKG/usr/lib/mini-term/"
           done
+          # ── 运行时依赖(Depends)──
+          # 由 dpkg-shlibdeps(build-essential 带的 dpkg-dev)按四个二进制实际链接的 .so
+          # (ELF NEEDED)反查所属包与最低版本算出,不手写死一份会过期的列表:哪天多链 / 少链
+          # 一个库,这里自动跟着变。它只认「源码包」目录布局,临时造一个最小的 debian/control。
+          # 算不出来时退回此前的「不声明依赖」并打 warning —— 不为打包细节挡住整次发版
+          # (publish 要全部平台成功)。
+          SHLIBS_DIR="$(mktemp -d)"
+          mkdir -p "$SHLIBS_DIR/debian"
+          printf 'Source: mini-term\n\nPackage: mini-term\nArchitecture: amd64\n' > "$SHLIBS_DIR/debian/control"
+          BIN_ARGS=()
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            BIN_ARGS+=("-e$PWD/$PKG/usr/lib/mini-term/$name")
+          done
+          DEPENDS=""
+          if SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "${BIN_ARGS[@]}") \
+             && [ "${SHLIBS#shlibs:Depends=}" != "$SHLIBS" ]; then
+            DEPENDS="${SHLIBS#shlibs:Depends=}"
+          else
+            echo "::warning::dpkg-shlibdeps 没算出依赖,deb 不带 Depends: ${SHLIBS:-<no output>}"
+          fi
+          # Ubuntu 24.04 的 64 位 time_t 过渡给一批库改了名(libasound2 → libasound2t64 …),
+          # 22.04 runner 上算出的旧名在 24.04 上只剩虚包。对过渡改名名单里的包补一个
+          # `| <名>t64` 备选,两代发行版都装得上。名单是那次一次性改名的历史事实,与
+          # 「依赖列表」不同,不会随代码变化而过期;不在名单里的依赖原样保留。
+          T64_RENAMED=" libasound2 libglib2.0-0 libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 libssl3 libcurl4 libpng16-16 "
+          if [ -n "$DEPENDS" ]; then
+            DEPENDS=$(printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
+              | while IFS= read -r dep; do
+                  name="${dep%% *}"
+                  case "$T64_RENAMED" in
+                    *" $name "*) printf '%s | %st64\n' "$dep" "$name" ;;
+                    *) printf '%s\n' "$dep" ;;
+                  esac
+                done | paste -sd, - | sed 's/,/, /g')
+          fi
+          echo "Depends: ${DEPENDS:-<none>}"
           ln -s ../lib/mini-term/mini-term "$PKG/usr/bin/mini-term"
           cp docs/icon.png "$PKG/usr/share/icons/hicolor/512x512/apps/mini-term.png"
           cat > "$PKG/usr/share/applications/mini-term.desktop" <<'DESKTOP'
@@ -333,22 +443,86 @@ jobs:
           Description: Desktop terminal manager for the AI era
            Multi-project tabs, recursive split panes, AI process awareness.
           CONTROL
+          # Depends 插在 Architecture 之后;为空时整行不写(空字段值不合法)
+          if [ -n "$DEPENDS" ]; then
+            sed -i "/^Architecture:/a Depends: ${DEPENDS}" "$PKG/DEBIAN/control"
+          fi
+          cat "$PKG/DEBIAN/control"
           # deb 的文件名用 DEB_VERSION(`-` 已换成 `~`),与包内 Version 字段一致；
           # 正式版两者本来就相同(1.1.0),预发布才看得出差别(1.1.0~beta)
           dpkg-deb --build --root-owner-group "$PKG" \
             "dist/Mini-Term_${DEB_VERSION}_amd64.deb"
+          dpkg-deb --field "dist/Mini-Term_${DEB_VERSION}_amd64.deb" Depends || true
           ls -la dist
 
-      # tag_name 必须显式给:手动补建时默认的 github.ref_name 是分支名,
-      # 不给就会平白建出一个叫 "main" 的 release。对已存在的 release 这个
-      # action 是更新语义,只上传文件、不覆盖 notes
+      # 用 gh 直传(找得到 draft),只上传文件、不碰 notes / draft / prerelease。
+      # release 不存在时 gh 直接报错,不会像 action-gh-release 那样顺手新建一个。
+      # --clobber:手动补建选了已有产物的平台时覆盖同名文件(与之前的覆盖语义一致)。
+      # 每个平台只产出下面五类里的一两类(Windows 是安装包 + 调试符号 zip),
+      # nullglob 让没匹配到的模式直接消失
       - name: Upload bundles to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          files: |
-            dist/Mini-Term_*-setup.exe
-            dist/Mini-Term_*.dmg
-            dist/Mini-Term_*.tar.gz
-            dist/Mini-Term_*.deb
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s nullglob
+          files=(dist/Mini-Term_*-setup.exe dist/Mini-Term_*-pdb.zip dist/Mini-Term_*.dmg dist/Mini-Term_*.tar.gz dist/Mini-Term_*.deb)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::dist/ 下没有可上传的产物"
+            exit 1
+          fi
+          printf 'upload: %s\n' "${files[@]}"
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+
+  # 全部平台构建成功之后:对 release 的**全部**资产(含 Windows 的调试符号 zip)算 SHA256
+  # → SHA256SUMS.txt 覆盖上传;
+  # push 路径再把 draft 转正。手动补建路径只重算校验和(补传的文件变了,旧的 SUMS 就过期了),
+  # 不改 draft / prerelease —— 已发布的版本不能被改回 draft,还在 draft 的也不由补建来转正。
+  # 校验:下载全部资产后 `sha256sum -c SHA256SUMS.txt`(或 --ignore-missing 只验下载的那个)
+  publish:
+    needs: [create-release, build-gpui]
+    # 与 build-gpui 同一手法:显式 !cancelled() 才能把 skipped 的 create-release 放行;
+    # 矩阵作业的 result 只有全部成功才是 success
+    if: >-
+      !cancelled() && needs.build-gpui.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Generate & upload SHA256SUMS.txt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          export LC_ALL=C
+          dir="$RUNNER_TEMP/assets"
+          mkdir -p "$dir"
+          gh release download "$RELEASE_TAG" --dir "$dir"
+          # 上一轮的校验和文件不算在内(手动补建时它已经在 release 里了)
+          rm -f "$dir/SHA256SUMS.txt"
+          cd "$dir"
+          shopt -s nullglob
+          files=(*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::release $RELEASE_TAG 没有任何资产"
+            exit 1
+          fi
+          sha256sum -- "${files[@]}" > "$RUNNER_TEMP/SHA256SUMS.txt"
+          cat "$RUNNER_TEMP/SHA256SUMS.txt"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/SHA256SUMS.txt" --clobber
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          case "$RELEASE_TAG" in
+            *-*) pre=true ;;
+            *) pre=false ;;
+          esac
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$pre"

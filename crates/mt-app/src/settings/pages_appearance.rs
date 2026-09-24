@@ -1,13 +1,19 @@
 //! 设置面板的 appearance(语言 / 主题 / 外置皮肤)与 font(字号 / 字族 / 连字)两页。
 //!
-//! 外置皮肤那一段是本文件的大头:卡片数据([`ThemeCard`])、导入(目录 / zip)、
-//! 删除确认都在这儿。两条写盘路径统一走 `run_theme_job` 丢后台;「更多皮肤」
-//! 不写盘,它只是把浏览器指向仓库的皮肤库([`THEME_GALLERY_URL`])。
+//! 外置皮肤那一段是本文件的大头:卡片数据([`ThemeCard`])、卡片缩略图
+//! ([`ThemeThumbnail`])、导入(目录 / zip)、删除确认都在这儿。两条写盘路径
+//! 统一走 `run_theme_job` 丢后台;「更多皮肤」不写盘,它只是把浏览器指向仓库的
+//! 皮肤库([`THEME_GALLERY_URL`])。
+
+use std::collections::HashSet;
+use std::future::Future;
+use std::path::Path;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, Context, Hsla, ImageAssetLoader, InteractiveElement, IntoElement,
+    ParentElement, PathPromptOptions, RenderImage, Resource, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 
@@ -15,10 +21,10 @@ use crate::i18n::{Locale, t, tr};
 use crate::prompt::Confirm;
 use crate::ui;
 
-use super::{SettingsView, choice_value};
 use super::widgets::{
     banner, choice_group, font_family_input, mini_bar, page_root, section, toggle_row,
 };
+use super::{SettingsPage, SettingsView, choice_value};
 
 /// 「更多皮肤」按钮的去处:仓库里的成品皮肤库(`theme/`)。
 ///
@@ -89,12 +95,127 @@ impl ThemeCard {
             art: applied.background.clone(),
         }
     }
+
+    /// 这张卡片缩略图的 key;包里没有背景图就没有。
+    fn thumb_key(&self) -> Option<ThemeThumbKey> {
+        self.art.as_ref().map(|art| ThemeThumbKey {
+            path: Arc::from(art.image.as_path()),
+            target: theme_thumb_target(),
+        })
+    }
+}
+
+// ─── 皮肤卡片的缩略图 ─────────────────────────────────────────
+
+/// 卡片宽度上限与内边距(逻辑像素)。卡片样式与缩略图目标尺寸共用这一对,
+/// 改一处两边跟着走。
+const THEME_CARD_MAX_W: f32 = 300.0;
+const THEME_CARD_PADDING: f32 = 12.0;
+/// 预览框宽高比(理由见 [`SettingsView::render_theme_card`] 里的注释)。
+const THEME_PREVIEW_ASPECT: f32 = 16.0 / 9.0;
+/// 缩略图按显示尺寸的几倍生成:2× 覆盖到 200% 缩放都不糊。
+const THEME_THUMB_SCALE: f32 = 2.0;
+
+/// 缩略图要盖满的目标框(设备像素):预览框的最大显示尺寸 × [`THEME_THUMB_SCALE`]。
+fn theme_thumb_target() -> (u32, u32) {
+    let w = (THEME_CARD_MAX_W - 2.0 * THEME_CARD_PADDING) * THEME_THUMB_SCALE;
+    let h = w / THEME_PREVIEW_ASPECT;
+    (w.ceil() as u32, h.ceil() as u32)
+}
+
+/// 缩略图尺寸:等比缩到**刚好盖满**目标框 —— 卡片按 cover 铺,只「放得进」
+/// (contain)的话短的那一维会被拉糊。只缩不放(比框还小的图原样);宽高至少 1。
+fn thumbnail_size(image: (u32, u32), target: (u32, u32)) -> (u32, u32) {
+    let (w, h) = image;
+    if w == 0 || h == 0 {
+        return image;
+    }
+    let scale = (f64::from(target.0) / f64::from(w)).max(f64::from(target.1) / f64::from(h));
+    if scale >= 1.0 {
+        return image;
+    }
+    let fit = |len: u32| ((f64::from(len) * scale).round() as u32).max(1);
+    (fit(w), fit(h))
+}
+
+/// [`ThemeThumbnail`] 的键:原图路径 + 目标框。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ThemeThumbKey {
+    path: Arc<Path>,
+    target: (u32, u32),
+}
+
+/// 皮肤卡片的缩略图,挂在 gpui 的资源系统上:后台线程整张解码 → 按
+/// [`thumbnail_size`] 缩 → 原图随即丢掉,缓存里只留缩略图。
+///
+/// 此前卡片直接画原图(与窗口级背景同一个 `ImageAssetLoader` + 路径 key):
+/// 两三百像素宽的卡片,每张都按原分辨率常驻 —— 2560×1440 的背景是 15 MB 内存
+/// 加同样大的显存,而且谁也不放。改成**独立的资源类型**:缓存条目只归设置页管,
+/// 离开外观页 / 关掉设置时放得干净([`release_theme_thumbs`]),也不会把正在当
+/// 窗口背景的那份原图连带放掉 —— 窗口背景照旧画原图,一个字节没动。
+enum ThemeThumbnail {}
+
+impl gpui::Asset for ThemeThumbnail {
+    type Source = ThemeThumbKey;
+    /// `None` = 解不出来(文件不在 / 格式不认),卡片只剩纯色底,与窗口背景
+    /// 解不出来时同一个观感。
+    type Output = Option<Arc<RenderImage>>;
+
+    fn load(
+        key: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        // 解码原样借 `ImageAssetLoader` 的,格式覆盖与 svg 栅格化与窗口背景一致。
+        // 它返回的 future 连同下面的缩放整个在后台线程跑(gpui 的 `CachedLoad::new`
+        // 把 load 出来的 future 丢给 background executor),原图只在这里活一下
+        let decode = <ImageAssetLoader as gpui::Asset>::load(Resource::Path(key.path.clone()), cx);
+        async move {
+            let full = decode.await.ok()?;
+            downscale(&full, key.target)
+        }
+    }
+}
+
+/// 整张位图 → 缩略图。只取第一帧 —— 窗口级背景本来也只画第一帧。
+fn downscale(full: &RenderImage, target: (u32, u32)) -> Option<Arc<RenderImage>> {
+    let size = full.size(0);
+    let w = u32::try_from(size.width.0).ok()?;
+    let h = u32::try_from(size.height.0).ok()?;
+    let (tw, th) = thumbnail_size((w, h), target);
+    // RenderImage 的帧是 BGRA,这里借 `Rgba<u8>` 当四通道容器:缩放是逐通道的
+    // 线性组合,不解释通道顺序,缩完还是 BGRA(与 frost.rs 同一手法)。借用原图
+    // 字节,不先拷一份 15 MB
+    let src = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(w, h, full.as_bytes(0)?)?;
+    // Triangle 在缩小时按比例放宽采样核,是真正的区域平均,几倍缩小也不出摩尔纹
+    let small = image::imageops::resize(&src, tw, th, image::imageops::FilterType::Triangle);
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(small)])))
+}
+
+/// 把这些缩略图从资源缓存与图集里放掉。`window` 的口径同
+/// `file_viewer::mermaid::release_mermaid_assets`:渲染途中递当前窗口(它此刻被摘出了
+/// `App.windows`),`on_release` 传 `None`。只对要过的 key 调用 —— `fetch_asset`
+/// 对没见过的 key 会先发起一次生成。
+pub(super) fn release_theme_thumbs(
+    keys: &[ThemeThumbKey],
+    cx: &mut App,
+    mut window: Option<&mut Window>,
+) {
+    for key in keys {
+        if let Some(Some(image)) = cx.fetch_asset::<ThemeThumbnail>(key) {
+            cx.drop_image(image, window.as_deref_mut());
+        }
+        cx.remove_asset::<ThemeThumbnail>(key);
+    }
 }
 
 impl SettingsView {
     // ── appearance 页 ──
 
-    pub(super) fn render_appearance_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_appearance_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let config = self.store.read(cx).config();
         let custom = config.custom_theme_id.clone();
         let theme = config.theme.clone();
@@ -148,7 +269,7 @@ impl SettingsView {
                         cx,
                     )),
             )
-            .child(self.render_theme_packs(cx))
+            .child(self.render_theme_packs(window, cx))
             .into_any_element()
     }
 
@@ -190,7 +311,7 @@ impl SettingsView {
     }
 
     /// 外置皮肤段(原版 `CustomThemePacksSection`)。
-    fn render_theme_packs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_theme_packs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active = self.store.read(cx).config().custom_theme_id.clone();
 
         // 标题行 + 五个小按钮。`flex_wrap` 允许换行 —— 680px 弹窗里英文文案会贴边
@@ -215,13 +336,28 @@ impl SettingsView {
             )
             .child(
                 ui::ghost_button("theme-open-dir", t("settings", "themes.openDir")).on_click(
-                    cx.listener(|this, _, _window, cx| {
+                    cx.listener(|_this, _, _window, cx| {
                         let root = crate::theme::theme_packs().root().to_path_buf();
-                        let _ = std::fs::create_dir_all(&root);
-                        if let Err(err) = crate::fs_ops::reveal_in_file_manager(&root) {
-                            this.theme_error = Some(err.to_string());
-                            cx.notify();
-                        }
+                        // 建目录 + spawn 文件管理器都是阻塞 IO(网络盘 / 杀软下会卡),
+                        // 丢后台。失败就地写进主题段的错误行,不走
+                        // `fs_ops::open_external` —— 设置是弹窗,toast 在遮罩下看不见
+                        cx.spawn(async move |this, cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    let _ = std::fs::create_dir_all(&root);
+                                    crate::fs_ops::reveal_in_file_manager(&root)
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                eprintln!("[settings] 打开主题目录失败: {err}");
+                                let _ = this.update(cx, |this: &mut Self, cx| {
+                                    this.theme_error = Some(err.to_string());
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
                     }),
                 ),
             )
@@ -245,7 +381,13 @@ impl SettingsView {
             // 原版 `grid grid-cols-2 gap-2`;gpui 没有 grid,用可换行的 flex 铺
             let mut grid = div().flex().flex_wrap().gap(px(8.0));
             for (idx, card) in self.theme_cards.iter().enumerate() {
-                grid = grid.child(self.render_theme_card(idx, card, active.as_deref(), cx));
+                // 背景图画缩略图(见 [`ThemeThumbnail`])。先记后要:use_asset 一旦
+                // 调用,资源系统里就有了这个 key 的任务,放的时候要找得到它
+                let thumb = card.thumb_key().and_then(|key| {
+                    self.theme_thumbs.insert(key.clone());
+                    window.use_asset::<ThemeThumbnail>(&key, cx).flatten()
+                });
+                grid = grid.child(self.render_theme_card(idx, card, thumb, active.as_deref(), cx));
             }
             grid.into_any_element()
         };
@@ -281,10 +423,12 @@ impl SettingsView {
     }
 
     /// 一张皮肤卡片:缩小版的界面预览 + 名称 + hover 才出现的删除。
+    /// `thumb` 是背景图的缩略图(还没生成好 / 包里没有背景图时为 `None`)。
     fn render_theme_card(
         &self,
         idx: usize,
         card: &ThemeCard,
+        thumb: Option<Arc<RenderImage>>,
         active_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -293,7 +437,8 @@ impl SettingsView {
         let name = card.name.clone();
 
         // 背景图走**与窗口级同一个** `BackgroundArtElement`:cover 铺满 + focus
-        // 百分比定位 + 包声明的压暗纱罩。
+        // 百分比定位 + 包声明的压暗纱罩。只是位图换成缩略图(`prepared_image`,
+        // 与原图同宽高比,落位不变)。
         //
         // ⚠️ 别退回 `img(path).size_full()`:gpui 的 `img()` 默认
         // `ObjectFit::Contain`(整图塞进框、两侧留白)且**恒定居中**,与真实界面的
@@ -304,7 +449,7 @@ impl SettingsView {
         // 276×96 是 2.9:1 的细条,cover 只截得到焦点附近一横条,与真实窗口
         // (接近 16:10)差着一个量级。`aspect_ratio` 由宽推高,卡片被面板压窄时
         // 比例照旧,不像定高那样越窄越接近正方。
-        preview.style().aspect_ratio = Some(16.0 / 9.0);
+        preview.style().aspect_ratio = Some(THEME_PREVIEW_ASPECT);
         let preview = preview
             .relative()
             .w_full()
@@ -314,7 +459,12 @@ impl SettingsView {
             .border_color(ui::border_subtle())
             .bg(card.background)
             .when_some(card.art.clone(), |el, art| {
-                el.child(div().absolute().inset_0().child(mt_ui::background_art(art)))
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(mt_ui::background_art(art).prepared_image(thumb)),
+                )
             })
             // 迷你侧栏(带包声明的 surfaceOpacity)
             .child(
@@ -374,11 +524,11 @@ impl SettingsView {
             // 300 是上限不是定值:面板宽被视口钳到很窄时(内容列 < 300),
             // 定值宽的卡片会横着捅出去被裁掉 —— 与「内容列不许越过面板」同一条
             .w_full()
-            .max_w(px(300.0))
+            .max_w(px(THEME_CARD_MAX_W))
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .p(px(12.0))
+            .p(px(THEME_CARD_PADDING))
             .rounded(px(6.0))
             .border_1()
             .cursor_pointer()
@@ -563,6 +713,32 @@ impl SettingsView {
     }
 
     // ── 外置皮肤 ──
+
+    /// 卡片缩略图对账:不在外观页 → 全放;在外观页 → 放掉已不在卡片列表里的
+    /// (删掉 / 刷新后没了的皮肤)。由 [`SettingsView::render`] 每帧开头调一次 ——
+    /// 换页、刷新列表都会 notify,放的时机因此总在下一帧的渲染里,正好拿得到
+    /// 当前窗口;关掉设置那一下由 `on_release` 全放。
+    ///
+    /// 渲染途中放是安全的:所有 render / prepaint 都先于本帧任何 paint,这些
+    /// 缩略图本帧不会再被画;上一帧的场景画完本帧就被替换,不会再呈现。
+    pub(super) fn release_stale_theme_thumbs(&mut self, window: &mut Window, cx: &mut App) {
+        if self.theme_thumbs.is_empty() {
+            return;
+        }
+        let live: HashSet<ThemeThumbKey> = if self.page == SettingsPage::Appearance {
+            self.theme_cards
+                .iter()
+                .filter_map(ThemeCard::thumb_key)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let stale: Vec<ThemeThumbKey> = self
+            .theme_thumbs
+            .extract_if(|key| !live.contains(key))
+            .collect();
+        release_theme_thumbs(&stale, cx, Some(window));
+    }
 
     pub(super) fn refresh_theme_packs(&mut self, cx: &mut Context<Self>) {
         self.theme_error = None;
@@ -763,5 +939,77 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 缩略图目标框_是预览框最大显示尺寸的两倍() {
+        // 卡片 300 宽、左右各 12 内边距 → 预览框至多 276 宽、16:9 → 155.25 高
+        assert_eq!(theme_thumb_target(), (552, 311));
+    }
+
+    #[test]
+    fn 缩略图尺寸_等比缩到刚好盖满目标框() {
+        let target = (552, 311);
+        // 16:9 的 2560×1440:两维都不小于目标(cover 铺不糊),宽高比不变
+        let (w, h) = thumbnail_size((2560, 1440), target);
+        assert!(w >= target.0 && h >= target.1, "{w}x{h} 盖不满目标框");
+        assert!(w <= target.0 + 1 && h <= target.1 + 1, "{w}x{h} 缩得不够");
+        assert!((w as f32 / h as f32 - 16.0 / 9.0).abs() < 0.01);
+        // 16:10:高那一维有富余,宽刚好
+        assert_eq!(thumbnail_size((2560, 1600), target), (552, 345));
+        // 竖图:宽刚好,高按比例留着(cover 会裁掉上下)
+        assert_eq!(thumbnail_size((1000, 4000), target), (552, 2208));
+        // 4K 省下的量:3840×2160 → 553×311,内存 33 MB → 0.7 MB
+        let (w, h) = thumbnail_size((3840, 2160), target);
+        assert!(u64::from(w) * u64::from(h) * 4 < 700 * 1024);
+    }
+
+    #[test]
+    fn 缩略图尺寸_只缩不放() {
+        let target = (552, 311);
+        assert_eq!(thumbnail_size((400, 300), target), (400, 300));
+        // 一维已经比目标小:放大那一维才盖得满,宁可糊一点也不放大
+        assert_eq!(thumbnail_size((10000, 10), target), (10000, 10));
+        assert_eq!(thumbnail_size((0, 0), target), (0, 0));
+        assert_eq!(thumbnail_size((0, 900), target), (0, 900));
+    }
+
+    #[test]
+    fn 缩略图_缩完尺寸对_颜色与通道顺序不变() {
+        // 64×36 纯色 BGRA(蓝 10 绿 20 红 30),目标 16×9
+        let (w, h) = (64u32, 36u32);
+        let bytes: Vec<u8> = [10u8, 20, 30, 255].repeat((w * h) as usize);
+        let frame = image::Frame::new(image::RgbaImage::from_raw(w, h, bytes).unwrap());
+        let full = RenderImage::new(vec![frame]);
+
+        let thumb = downscale(&full, (16, 9)).expect("能缩");
+        let size = thumb.size(0);
+        assert_eq!((size.width.0, size.height.0), (16, 9));
+        // 纯色是均值的不动点;通道不解释,BGRA 进 BGRA 出
+        for px in thumb.as_bytes(0).unwrap().as_chunks::<4>().0 {
+            assert_eq!(px, &[10, 20, 30, 255]);
+        }
+
+        // 比目标还小的图原样尺寸
+        let small = downscale(&full, (640, 360)).expect("能缩");
+        assert_eq!((small.size(0).width.0, small.size(0).height.0), (64, 36));
+    }
+
+    #[test]
+    fn 缩略图_key_只在有背景图时才有() {
+        let dir = PathBuf::from("/themes/plain");
+        let json = r##"{
+          "id": "plain", "name": "Plain", "appearance": "dark",
+          "colors": {
+            "background": "#120d1c", "panel": "#1c1329", "panelAlt": "#251937",
+            "accent": "#ff9a62", "text": "#ede4f2", "muted": "#9a8caf", "line": "#3a2d52"
+          }
+        }"##;
+        let listing = ThemePackListing {
+            theme_id: "plain".to_string(),
+            def: mt_ui::theme_bridge::parse_theme_pack("plain", json).unwrap(),
+            dir,
+        };
+        assert!(ThemeCard::from_listing(&listing).thumb_key().is_none());
     }
 }

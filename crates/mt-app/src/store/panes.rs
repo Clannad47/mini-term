@@ -9,16 +9,26 @@ use mt_config::{AiLauncher, ProjectConfig, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::{DwellConfig, TerminalStyle};
 
-use crate::pane::{PaneEvent, TerminalPane};
+use crate::pane::{PaneEvent, PaneLaunch, PreparedLaunch, ResumeCwd, TerminalPane};
 use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
 };
 
+use super::events::StoreChanged;
 use super::pure::{
-    find_pane_of_pty, next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
-    resolve_scrollback, sanitize_osc_title, terminal_style_from,
+    apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, next_maximized,
+    resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback, sanitize_osc_title,
+    terminal_style_from,
 };
-use super::AppStore;
+use super::{AppStore, StoreEvent};
+
+/// 启动恢复交给 [`AppStore::start_pty_with`] 的续接反查参数(在后台兑现)。
+struct ResumeLookup {
+    session: AiSessionRef,
+    /// 反查所得的会话 cwd 要不要交回来写回:真要写续接命令时才写(与挪后台之前
+    /// 同一口径 —— 会话 id 过不了白名单时只借它定启动目录,不写回)。
+    write_back: bool,
+}
 
 impl AppStore {
     // === 终端 ===
@@ -353,7 +363,7 @@ impl AppStore {
             return;
         }
         state.maximized_pane_id = next;
-        cx.notify();
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 无条件还原(分屏 / 拖拽移动落地前调),不 notify —— 调用方随后都会走
@@ -386,6 +396,8 @@ impl AppStore {
                 .and_then(|s| s.active_layout())
                 .and_then(|l| l.first_active_pane())
                 .map(|p| p.id.clone());
+            // notify 由下面的 `after_layout_change` 统一收尾
+            cx.emit(StoreEvent::FocusedPaneChanged);
         }
         // 关掉的可能是活动面板的最后一个 pane → 活动指针挪到了邻位面板,
         // 而那个面板可能是恢复出来、从没显示过的(pane 还没有 PTY)—— 补起来
@@ -446,6 +458,8 @@ impl AppStore {
             && let Some(layout) = state.layout_of_pane_mut(pane_id)
         {
             layout.activate_pane(pane_id);
+            // 活动 tab 变了是布局变化;notify 由下面的 `focus_pane` 收尾
+            cx.emit(StoreEvent::LayoutChanged);
         }
         self.focus_pane(project_id, pane_id, window, cx);
         self.save_project_layout_soon(project_id, cx);
@@ -520,7 +534,7 @@ impl AppStore {
         if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)) {
             entity.update(cx, |pane, cx| pane.focus(window, cx));
         }
-        cx.notify();
+        cx.changed(StoreEvent::FocusedPaneChanged);
     }
 
     /// 当前项目里该操作哪个 pane:焦点 pane → 布局里第一个激活 pane
@@ -607,7 +621,9 @@ impl AppStore {
     ///    但 **pane 自己的 cwd 优先**(那是用户显式给这个 pane 定的目录,worktree
     ///    终端靠它),会话 cwd 只在 pane 没指定时兜底;
     /// 2. 存量记录没有 cwd 时向 `mt_ai` 反查 jsonl,查到随身份写回并持久化,
-    ///    下次重启免查;codex 会话不按目录分桶,不反查;
+    ///    下次重启免查;codex 会话不按目录分桶,不反查。**反查是同步翻盘,与 spawn
+    ///    一起在后台跑**(先反查、定 cwd、再 spawn),写回在回填之后
+    ///    ([`Self::apply_resume_cwd`]);多个 pane 之间互不等待;
     /// 3. 写完 resume **只清 `resume_pending`、保留 `ai_session`** ——
     ///    codex resume 不会重新上报 SessionStart,身份清了第二次重启就断代;
     /// 4. 否决条件全在 [`resolve_auto_resume_command`]。
@@ -662,6 +678,8 @@ impl AppStore {
                     && let Some(pane) = state.pane_mut(&item.pane_id)
                 {
                     pane.status = PaneStatus::Error;
+                    // notify 在循环后统一收尾
+                    cx.emit(StoreEvent::PaneStatusChanged);
                 }
                 continue;
             };
@@ -670,50 +688,52 @@ impl AppStore {
             let session = (auto_resume && item.resume_pending && !remote)
                 .then(|| item.ai_session.clone())
                 .flatten();
-            let resume_cwd = session.as_ref().and_then(resolve_resume_cwd);
-            // pane 自己的 cwd 优先,会话 cwd 兜底
-            let start_cwd = item.cwd.clone().or_else(|| resume_cwd.clone());
+            let command = resolve_auto_resume_command(
+                auto_resume,
+                item.resume_pending,
+                item.ai_session.as_ref(),
+                remote,
+            );
+            // 会话 cwd 的反查是同步翻盘,与 spawn 进同一个后台任务:先定启动目录
+            // (pane cwd 优先、会话 cwd 兜底)、再起 PTY(见 `decide_resume_cwd`)。
+            // 反查所得只在真要续接时交回写回 —— 与挪后台之前同一口径。
+            let resume = session.map(|session| ResumeLookup {
+                session,
+                write_back: command.is_some(),
+            });
 
-            let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), cx);
+            // `pty_id` 在这里**同步**分好并落到 pane 上:hydrate 被重复触发(来回切
+            // 项目 / 关 pane 后补起活动面板)时,上面 `pty_id.is_none()` 那道过滤照样
+            // 挡得住,同一个 pane 不会被起两次
+            let pty_id = self.start_pty_with(&project, &shell, item.cwd.as_deref(), resume, cx);
             if let Some(state) = self.project_states.get_mut(project_id)
                 && let Some(pane) = state.pane_mut(&item.pane_id)
             {
                 pane.pty_id = Some(pty_id);
             }
 
-            let Some(command) = resolve_auto_resume_command(
-                auto_resume,
-                item.resume_pending,
-                item.ai_session.as_ref(),
-                remote,
-            ) else {
+            let Some(command) = command else {
                 continue;
             };
 
-            // 先清标记再写命令(顺序同旧版):标记的语义是「这个 pane 还没续过」
-            let mut session_patch: Option<AiSessionRef> = None;
+            // 先清标记再写命令(顺序同旧版):标记的语义是「这个 pane 还没续过」。
+            // 反查所得 cwd 的写回依赖后台结果,挪到了回填之后
+            // (`PaneEvent::ResumeCwd` → `apply_resume_cwd`)。
             if let Some(state) = self.project_states.get_mut(project_id)
                 && let Some(pane) = state.pane_mut(&item.pane_id)
             {
                 pane.resume_pending = false;
-                // 反查所得的启动目录随身份写回,下次重启直达不再查
-                if let Some(cwd) = resume_cwd.as_ref()
-                    && let Some(sess) = pane.ai_session.as_mut()
-                    && sess.cwd.as_deref() != Some(cwd.as_str())
-                {
-                    sess.cwd = Some(cwd.clone());
-                    session_patch = Some(sess.clone());
-                }
             }
-            // PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
+            // PTY 还在后台起:命令进 pane 的写入队列,而且**排在队首**(pane 刚建出来,
+            // 这之间没有任何别的写入能插进来),回填时第一个冲刷 —— 用户抢先敲的字
+            // 只会落在它后面,拼不坏续接命令。PTY 内核缓冲 stdin,shell 就绪前写入
+            // 不丢(与移动端发起会话同一时序)。
             // 走 `write_to_pane` 而不是裸 PTY 写:AI 输入检测那一路要看得见这条命令,
-            // pane 才会正常进入 AI 会话状态。
+            // pane 才会正常进入 AI 会话状态(检测照旧当场跑,不等回填)。
             self.write_to_pane(project_id, &item.pane_id, &format!("{command}\r"), cx);
-            if session_patch.is_some() {
-                self.save_project_layout_soon(project_id, cx);
-            }
         }
-        cx.notify();
+        // PTY 绑定 + 续接标记都是布局数据(中转的活 PTY 镜像、pane 的 PTY 编号靠它)
+        cx.changed(StoreEvent::LayoutChanged);
     }
 
     /// 起 PTY 并拼出 `PaneState`。
@@ -735,6 +755,10 @@ impl AppStore {
 
     /// 真正起一个 PTY + 终端视图,返回 pane 编号。
     ///
+    /// **所有入口的汇合点**(新建 / 分屏 / 新面板 / 挂后台 pane / 启动恢复 / 重连 /
+    /// fork):`pty_id`、环境变量、订阅都在这里同步定好;PTY 本身在后台起
+    /// (见 `pane` 模块注释「PTY 在后台起」),这里不等。
+    ///
     /// PTY 起不到(shell 路径没了 / 目录不存在)时不 panic 也不静默:视图里显示
     /// 错误文本,pane 照样存在,用户看得见是哪个 tab 出的问题。
     // 拆分前是私有方法;调用点在 `store::ssh::reset_pane_for_reconnect`,升到 `pub(super)`。
@@ -745,12 +769,25 @@ impl AppStore {
         cwd_override: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u32 {
+        self.start_pty_with(project, shell, cwd_override, None, cx)
+    }
+
+    /// [`Self::start_pty`] 的全量版。`resume` 只有启动恢复的续接 pane 才给
+    /// ([`Self::hydrate_project`]):此时 `cwd_override` 是 pane 自己的 cwd,启动目录
+    /// 要等后台反查完会话 cwd 才定得下来。
+    fn start_pty_with(
+        &mut self,
+        project: &ProjectConfig,
+        shell: &ShellConfig,
+        cwd_override: Option<&str>,
+        resume: Option<ResumeLookup>,
+        cx: &mut Context<Self>,
+    ) -> u32 {
         let pty_id = self.next_pty_id;
         self.next_pty_id += 1;
 
-        let cwd = cwd_override
-            .map(str::to_string)
-            .unwrap_or_else(|| project.path.clone());
+        let pane_cwd = cwd_override.map(str::to_string);
+        let cwd = pane_cwd.clone().unwrap_or_else(|| project.path.clone());
         let mut env = vec![
             // hook 子进程靠它关联回具体 pane(与装机版同一个变量名,不能改)
             ("MINITERM_PTY_ID".to_string(), pty_id.to_string()),
@@ -770,52 +807,73 @@ impl AppStore {
         //
         // 项目级环境变量对远程 pane **不注入**(装机版同款:那些变量属于本地
         // 机器,注给本地 ssh 客户端毫无意义)。
-        let remote = project.ssh_connection_id.as_deref().map(|conn_id| {
-            crate::remote_ssh::find_connection(&self.config.ssh_connections, conn_id)
-                .and_then(|conn| crate::remote_ssh::prepare_remote_launch(&conn, &cwd))
-        });
-        let (spec, extras) = match remote {
-            None => (
-                PtySpawn {
-                    program: shell.command.clone(),
-                    args: shell.args.clone().unwrap_or_default(),
-                    cwd: Some(cwd.clone()),
-                    env,
-                    rows: mt_pty::INITIAL_PTY_ROWS,
-                    cols: mt_pty::INITIAL_PTY_COLS,
-                },
-                crate::pane::RemoteLaunchExtras::default(),
-            ),
-            Some(Ok(launch)) => (
-                PtySpawn {
-                    program: launch.program,
-                    args: launch.args,
-                    cwd: Some(mt_pty::fallback_local_cwd()),
-                    env,
-                    rows: mt_pty::INITIAL_PTY_ROWS,
-                    cols: mt_pty::INITIAL_PTY_COLS,
-                },
-                crate::pane::RemoteLaunchExtras {
+        //
+        // 定 spec 的活全部打包成「启动预案」交给 pane 在后台兑现:远程预检要在 PATH
+        // 里找 ssh 客户端、复制私钥并**起 `icacls` 子进程**收紧权限、解开已存密码;
+        // 续接要翻 `~/.claude/projects` —— 都是同步 IO,不许上主线程。主线程上只做
+        // 查配置这类纯内存的事(连接在不在)。
+        let remote = project
+            .ssh_connection_id
+            .as_deref()
+            .map(|conn_id| mt_remote::find_connection(&self.config.ssh_connections, conn_id));
+        let (program, args) = (
+            shell.command.clone(),
+            shell.args.clone().unwrap_or_default(),
+        );
+        let launch: PaneLaunch = match remote {
+            None => {
+                let project_path = project.path.clone();
+                Box::new(move || {
+                    let (start_cwd, resume_cwd) = match resume {
+                        None => (cwd, None),
+                        // 续接:先反查会话 cwd、定启动目录(pane cwd 优先、会话 cwd 兜底、
+                        // 都没有落项目根),再 spawn
+                        Some(ResumeLookup {
+                            session,
+                            write_back,
+                        }) => {
+                            let (start, found) =
+                                decide_resume_cwd(pane_cwd, &session, resolve_resume_cwd);
+                            let report = found.filter(|_| write_back).map(|cwd| ResumeCwd {
+                                session_id: session.session_id,
+                                cwd,
+                            });
+                            (start.unwrap_or(project_path), report)
+                        }
+                    };
+                    Ok(PreparedLaunch {
+                        spec: PtySpawn {
+                            program,
+                            args,
+                            cwd: Some(start_cwd),
+                            env,
+                            rows: mt_pty::INITIAL_PTY_ROWS,
+                            cols: mt_pty::INITIAL_PTY_COLS,
+                        },
+                        ssh_password: None,
+                        resume_cwd,
+                    })
+                })
+            }
+            Some(Ok(conn)) => Box::new(move || {
+                // 预检失败(本机缺 ssh 客户端 / 私钥不在):`?` 交回 Err,不 spawn,
+                // pane 里直接显示这条错误
+                let launch = mt_remote::prepare_remote_launch(&conn, &cwd)?;
+                Ok(PreparedLaunch {
+                    spec: PtySpawn {
+                        program: launch.program,
+                        args: launch.args,
+                        cwd: Some(mt_pty::fallback_local_cwd()),
+                        env,
+                        rows: mt_pty::INITIAL_PTY_ROWS,
+                        cols: mt_pty::INITIAL_PTY_COLS,
+                    },
                     ssh_password: launch.password,
-                    preflight_error: None,
-                },
-            ),
-            Some(Err(err)) => (
-                // 预检失败:不 spawn,pane 里直接显示这条错误(见 RemoteLaunchExtras)。
-                // spec 的内容此时不会被用到,给一份无害的占位。
-                PtySpawn {
-                    program: shell.command.clone(),
-                    args: Vec::new(),
-                    cwd: None,
-                    env,
-                    rows: mt_pty::INITIAL_PTY_ROWS,
-                    cols: mt_pty::INITIAL_PTY_COLS,
-                },
-                crate::pane::RemoteLaunchExtras {
-                    ssh_password: None,
-                    preflight_error: Some(err),
-                },
-            ),
+                    resume_cwd: None,
+                })
+            }),
+            // 连接已被删(断链):同上,不 spawn,错误画在 pane 里
+            Some(Err(err)) => Box::new(move || Err(err)),
         };
         let is_remote = project.ssh_connection_id.is_some();
         // 项目级环境变量走 user_env —— 它会被 `MINITERM_` 前缀过滤挡一道,
@@ -841,7 +899,7 @@ impl AppStore {
         let ai = self.ai.clone();
         let entity = cx.new(|cx| {
             TerminalPane::new(
-                pty_id, spec, user_env, style, theme, dwell, scrollback, ai, extras, cx,
+                pty_id, launch, user_env, style, theme, dwell, scrollback, ai, cx,
             )
         });
 
@@ -861,11 +919,33 @@ impl AppStore {
                 PaneEvent::Title(title) => {
                     store.set_pane_osc_title_by_pty(pty_id, title.clone(), cx)
                 }
+                // 启动恢复的续接反查结果,随 PTY 回填一起回来
+                PaneEvent::ResumeCwd(found) => store.apply_resume_cwd(pty_id, found, cx),
             }
         });
         self.pane_subs.insert(pty_id, sub);
         self.terminals.insert(pty_id, entity);
         pty_id
+    }
+
+    /// 续接反查所得的会话 cwd 随身份写回并落盘,下次重启直达不再查。
+    ///
+    /// 挪后台之前这一步在 [`Self::hydrate_project`] 里当场做;反查进了后台,结果随
+    /// PTY 回填一起回来(`PaneEvent::ResumeCwd`)。只认同一个会话、值没变不落盘,
+    /// 见 [`apply_resolved_session_cwd`]。
+    fn apply_resume_cwd(&mut self, pty_id: u32, found: &ResumeCwd, cx: &mut Context<Self>) {
+        let Some((project_id, pane_id)) = find_pane_of_pty(&self.project_states, pty_id) else {
+            return;
+        };
+        let changed = self
+            .project_states
+            .get_mut(&project_id)
+            .and_then(|s| s.pane_mut(&pane_id))
+            .and_then(|p| p.ai_session.as_mut())
+            .is_some_and(|sess| apply_resolved_session_cwd(sess, &found.session_id, &found.cwd));
+        if changed {
+            self.save_project_layout_soon(&project_id, cx);
+        }
     }
 
     // === 页签标题跟随 shell(OSC 0/2)===
@@ -896,7 +976,7 @@ impl AppStore {
             return;
         }
         pane.osc_title = next;
-        cx.notify();
+        cx.changed(StoreEvent::PaneTitleChanged);
     }
 
     /// [`Self::set_pane_osc_title`] 的 `pty_id` 入口 —— pane 只认得自己的 PTY 编号

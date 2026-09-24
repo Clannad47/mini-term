@@ -41,6 +41,10 @@ russh = { version = "0.61", default-features = false, features = ["ring"] }
 futures.workspace = true
 # known_hosts 文件读写时编解码 server pubkey 字节。
 base64 = "0.22"
+# known_hosts 哈希条目(`|1|salt|hash`,OpenSSH `HashKnownHosts`)的 HMAC-SHA1 比对。
+# 不是新依赖:russh 的 `ring` feature 与 mt-secret 早已把它带进两个工作区
+# (两份 Cargo.lock 都锁在 0.17.14),这里只是改成直接依赖。
+ring = "0.17"
 # --- 传统 PKCS#1 RSA 私钥支持 (task 06-06-ssh-mcp-pkcs1-rsa-key) ---
 # russh::keys 底层 ssh-key 默认只解析 OpenSSH / PKCS#8; 传统 `-----BEGIN RSA PRIVATE
 # KEY-----`(PKCS#1) 会报 "Unsupported key type RSA" 导致连接失败。启用 ssh-key 的

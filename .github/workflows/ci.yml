@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # 原先由 dtolnay/rust-toolchain 顺手设上的;改成 rustup 按文件装之后在这里显式给
+  # (CARGO_INCREMENTAL=0 由 rust-cache 设,不必重复)
+  CARGO_TERM_COLOR: always
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,10 +33,14 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v5
+      # persist-credentials: false:不把 token 写进 .git/config(cargo check/test 期间
+      # 依赖的 build.rs 都读得到那个文件)。下面的 git 操作全是本地的,不再 fetch
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
+      # 基线的算法(PR / 发版 tag / 分支 / 手动)见脚本注释,Windows 作业共用同一份
       - name: Resolve changed-file base
         id: diff-base
         shell: bash
@@ -42,35 +51,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE_SHA"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            # 发版 tag:变更行检查覆盖上一个 v* tag 之后的全部提交。tag push 的
-            # `before` 是全零,而 merge-base(HEAD, main) 就是 HEAD 自己,两条都给不出
-            # 有意义的范围。第一个 tag 没有前任就从根提交算。
-            prev="$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)"
-            if [ -n "$prev" ]; then
-              base="$(git rev-parse "$prev^{commit}")"
-            else
-              base="$(git rev-list --max-parents=0 HEAD)"
-            fi
-          elif [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
-            base="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
-          elif [ "$EVENT_NAME" = "push" ] && \
-               [ -n "$PUSH_BEFORE_SHA" ] && \
-               [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-            base="$PUSH_BEFORE_SHA"
-          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            # workflow_dispatch on the default branch has no `before` SHA.
-            # Check the selected revision's latest commit instead of treating
-            # the entire repository history as new work.
-            base="$(git rev-parse HEAD^)"
-          else
-            base="$(git rev-list --max-parents=0 HEAD)"
-          fi
-          git cat-file -e "$base^{commit}"
-          echo "sha=$base" >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/resolve_diff_base.sh
 
       # Keep this list aligned with the Linux build job in release.yml. GPUI's
       # X11/Wayland backend and font/audio dependencies are required even for
@@ -84,23 +65,43 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libxcb1-dev libasound2-dev
 
+      # npm 缓存给下面的移动端构建用,键只看 mobile/package-lock.json;main 上由
+      # cache-warm.yml 预先建好,这里精确命中就不会再往 tag / PR 作用域存一份
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # 工具链(含 rustfmt / clippy 两个组件)按仓库根的 rust-toolchain.toml 装,与本地同版本,
+      # 不再用 dtolnay/rust-toolchain@stable —— 本地 clippy 比 CI 旧、发版后才报红的根因就在这。
+      # 无参 `rustup toolchain install` = 装当前生效的工具链(rustup ≥ 1.28)
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+          cargo clippy -V
+          rustfmt -V
 
+      # 缓存只读:由 cache-warm.yml 在 main 上建(tag / PR 的运行都能恢复 main 作用域的
+      # 缓存,反过来不行;main 推送又不跑本 workflow,所以缓存只能靠那边预热)。
+      # 这里不再保存 —— 此前每个 tag 各存一份约 6.6 GB,tag 之间互相看不见、从没命中过,
+      # 两个 tag 就把仓库 10 GB 额度顶满。
+      # ⚠️ shared-key / workspaces 两项与 cache-warm.yml 的 ci-linux 作业逐字一致,键才对得上;
+      # 改一边必须改另一边。workspaces 的 target 是**相对 workspace 根**的路径
+      # (rust-cache 按 path.join(root, target) 解析),`sidecars -> sidecars/target`
+      # 会落到 sidecars/sidecars/target,sidecar 缓存从来没生效过。
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          cache-on-failure: true
+          shared-key: ci
+          save-if: false
           workspaces: |
             . -> target
-            sidecars -> sidecars/target
+            sidecars -> target
+            relay-server -> target
 
       # The repository has historical rustfmt differences, including inside
       # files that new work may need to touch. Run rustfmt on changed files but
@@ -122,14 +123,15 @@ jobs:
       - name: Sidecar check
         run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
 
-      - name: Clippy affected packages
+      # 全工作区 clippy,只拦**本次变更行**上的 warning(基线存量不算,见
+      # check_changed_clippy.mjs)。deny 级 lint 是 error,clippy 自己就非零退出,
+      # 不经过滤直接判红 —— 所以基线里不许有 deny 级问题。
+      - name: Clippy workspace (changed lines)
         shell: bash
         run: |
           base="${{ steps.diff-base.outputs.sha }}"
           set +e
-          cargo clippy --no-deps \
-            -p mt-project -p mt-ssh -p mt-config -p mt-app \
-            --all-targets --message-format=json \
+          cargo clippy --no-deps --workspace --all-targets --message-format=json \
             | tee /tmp/clippy-messages.jsonl
           clippy_status=${PIPESTATUS[0]}
           set -e
@@ -142,31 +144,81 @@ jobs:
       - name: Cargo test
         run: cargo test --workspace
 
+      - name: Sidecar test
+        run: cargo test --manifest-path sidecars/Cargo.toml
+
+      # 线上部署的中转服务(协议边界、鉴权、fail-closed),此前 CI 连编译都没有
+      - name: Relay server test
+        run: cargo test --manifest-path relay-server/Cargo.toml
+
+      # tests/*.test.cjs:便携 ConPTY 包的 staging 脚本 + 依赖图里 OpenSSL 必须 vendored
+      # (后者跑 `cargo tree --target aarch64-apple-darwin`,只解析依赖图,不需要装该 target)
+      - name: Node script tests
+        shell: bash
+        run: node --test tests/*.test.cjs
+
+      # 移动端 PWA:tsc 类型检查 + vite 构建。协议类型是手写镜像(mobile/src/protocol.ts),
+      # 与 relay-server/protocol 对不上时往往先在这里的 tsc 报出来
+      - name: Mobile build
+        working-directory: mobile
+        run: |
+          npm ci
+          npm run build
+
       - name: Whitespace check
         run: git diff --check "${{ steps.diff-base.outputs.sha }}" HEAD
 
   # 主力平台的编译门。clipboard / tray / frost / notify / dpapi / conpty / logfile
   # 这些 cfg(windows) 模块在 ubuntu 作业里根本不进编译,此前只有发版时才第一次
-  # 编到它们。这里只做 check + 几个不拖 gpui 的 crate 的测试,不重复 rustfmt /
-  # clippy / i18n 对账(那些与平台无关,上面的作业已经管了)。
+  # 编到它们。这里做 check + clippy(同样只拦变更行,覆盖 cfg(windows) 代码)+ 全部
+  # 不拖 gpui 的 crate 的测试 + sidecar 测试;rustfmt / i18n 对账与平台无关,不重复。
   windows:
     name: Windows check
     runs-on: windows-latest
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+      # fetch-depth: 0:clippy 变更行过滤要拿完整历史算基线
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          cache-on-failure: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve changed-file base
+        id: diff-base
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash .github/scripts/resolve_diff_base.sh
+
+      # 变更行过滤与 crate 名单两个脚本要 node;镜像自带的版本不钉,这里钉成与 Linux 同一个
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+
+      # 同上:按 rust-toolchain.toml 装,不另写版本
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+
+      # 只读缓存,理由同 Linux 作业;shared-key / workspaces 与 cache-warm.yml 的
+      # ci-windows 作业逐字一致
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          save-if: false
           workspaces: |
             . -> target
-            sidecars -> sidecars/target
+            sidecars -> target
 
       - name: Cargo check
         run: cargo check --workspace --all-targets
@@ -174,7 +226,34 @@ jobs:
       - name: Sidecar check
         run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
 
-      # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析。
-      # 这几个 crate 都不依赖 gpui,测试二进制几分钟内能编出来。
-      - name: Cargo test (Windows-specific crates)
-        run: cargo test -p mt-pty -p mt-secret -p mt-core -p mt-terminal
+      - name: Clippy workspace (changed lines)
+        shell: bash
+        run: |
+          base="${{ steps.diff-base.outputs.sha }}"
+          messages="$RUNNER_TEMP/clippy-messages.jsonl"
+          set +e
+          cargo clippy --no-deps --workspace --all-targets --message-format=json \
+            | tee "$messages"
+          clippy_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$clippy_status" -ne 0 ]; then
+            exit "$clippy_status"
+          fi
+          node .github/scripts/check_changed_clippy.mjs "$base" "$messages"
+
+      # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析、
+      # mt-project 的 Windows 路径用例等。名单 = 工作区里全部不依赖 gpui 的 crate,
+      # 由脚本从 cargo metadata 现算(2026-09 时是 mt-ai mt-config mt-core mt-i18n
+      # mt-layout mt-project mt-pty mt-relay mt-remote mt-secret mt-ssh mt-terminal
+      # mt-theme-packs mt-usage,
+      # 只剩 mt-app / mt-ui 两个拖 gpui 的不在这里跑)。PTY → VT → grid 的冒烟
+      # (mt-terminal/tests/terminal_smoke.rs,起 powershell)也随 mt-terminal 在这里跑。
+      - name: Cargo test (crates without gpui)
+        shell: bash
+        run: |
+          pkgs="$(node .github/scripts/non_gpui_packages.mjs)"
+          cargo test $pkgs
+
+      # 命名管道 ACL(仅当前用户可连)等 sidecar 的 Windows 专属用例
+      - name: Sidecar test
+        run: cargo test --manifest-path sidecars/Cargo.toml

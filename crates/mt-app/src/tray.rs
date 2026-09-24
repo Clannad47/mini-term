@@ -334,8 +334,9 @@ impl Tray {
         )
     }
 
-    /// 推一份快照。签名相同直接丢弃 —— store 的每一次 notify 都会走到这里,
-    /// 不去重的话光是移动鼠标就会疯狂重建图标。
+    /// 推一份快照。签名相同直接丢弃 —— store 里托盘相关的每一条事件都会走到这里
+    /// (`StoreEvent::touches_tray`),其中大半不改灯色与菜单(比如 ai-working 反复
+    /// 上报),不去重就会反复重建图标。
     pub fn push(&mut self, snapshot: TraySnapshot) {
         let Some(handle) = self.handle.as_ref() else {
             return;

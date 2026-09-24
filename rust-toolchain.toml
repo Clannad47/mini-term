@@ -1,0 +1,13 @@
+# 钉死工具链:本地与 CI 用同一个 rustc / clippy / rustfmt。
+#
+# 此前 CI 走 `dtolnay/rust-toolchain@stable`,本地 stable 常常落后一两版,
+# 新版 clippy 多出来的 lint 要到发版 tag 触发 CI 才第一次报红(已发生两次)。
+# 升级工具链 = 只改这里的 channel 一处(CI 的安装步骤按本文件装,不另写版本)。
+#
+# 作用范围:rustup 从当前目录向上找本文件,所以 `sidecars/`、`relay-server/`
+# 在本地构建时也吃这一份;relay-server 的 Docker 镜像只拷 `relay-server/` 进
+# 构建目录,不受影响。
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

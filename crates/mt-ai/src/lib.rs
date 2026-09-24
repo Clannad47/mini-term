@@ -14,7 +14,10 @@
 //! | `src-tauri/src/ai_sessions.rs` | 2348 | [`sessions`] |
 //! | `src-tauri/src/pty.rs` 的 AI 命令识别 / 打断识别 | — | [`detect`] + [`tracker`] |
 //! | `src-tauri/src/mobile_mirror.rs::agent_has_session_log` | — | [`sessions`] |
+//! | mt-app 的 `ssh_registry.rs`(SSH 工具 skill 启停,2026-09 下沉) | 1131 | [`ssh_registry`] |
 //!
+//! `hook_registry` 与 `ssh_registry` 共动 `~/.claude/settings.json`,读改写统一走
+//! crate 私有的 `claude_settings`(原子写 + 进程内串行)。
 //! # 搬运时的红线(仍然生效)
 //!
 //! - **降级结论必须落盘**:用户打断([`hook_server::note_user_interrupt`])与停摆
@@ -35,6 +38,8 @@
 //!   进程内 `fetch` 本地 hook 服务器,事件名翻译成与 Claude 同名的 PascalCase。
 //! - **hook 接收端原样保留**:端口(23456 起,冲突递增 5 次)、路由(`POST /hook`)、
 //!   payload 形状一个字都没改 —— 各家已注册在用户机器上的 hook 命令还得打得进来。
+//! - **各家 CLI 的知识(识别口径、续接/fork 命令、会话怎么分桶、有无记录……)只住在
+//!   [`agent`] 那张表里**,别处按 [`AgentKind`] 查表,不再写 agent 名字面量的 `match`。
 //!
 //! # 与原实现的接口差异
 //!
@@ -47,15 +52,19 @@
 //!   本 crate 不依赖 mt-pty,也不依赖 gpui。
 //! - 原先经 Tauri 解析的路径(`app_data_dir` 下的端口文件)改为显式参数传入。
 
+pub mod agent;
+mod claude_settings;
 pub mod detect;
 pub mod hook_registry;
 pub mod hook_server;
 pub mod monitor;
 pub mod perception;
 pub mod sessions;
+pub mod ssh_registry;
 pub mod tracker;
 mod util;
 
+pub use agent::{AgentKind, AgentSpec, CwdBucket};
 pub use detect::{AI_COMMANDS, interactive_ai_command_name, is_interactive_ai_command};
 pub use hook_server::{HookState, HookStatusInfo, is_attention_cause};
 pub use monitor::{SessionIdentity, StatusChange, StatusEmitter, StatusSink};

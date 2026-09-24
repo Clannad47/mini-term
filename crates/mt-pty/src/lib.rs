@@ -381,7 +381,8 @@ impl PtySession {
     /// - 观察器里**不要回写同一个 `PtySession`**,会自锁。
     ///
     /// 注意 SSH 密码自动填充的回写不走 `write`,因此**不会**经过观察器 ——
-    /// 明文密码不会漏给上层。
+    /// 明文密码不会漏给上层。终端自动应答走 [`write_reply`](Self::write_reply),
+    /// 同样不经过观察器(它们不是用户键入)。
     pub fn set_input_observer<F>(&self, observer: F)
     where
         F: FnMut(&[u8]) + Send + 'static,
@@ -395,31 +396,59 @@ impl PtySession {
     }
 
     /// 注册 SSH 密码自动填充:后续 PTY 输出命中密码提示时自动回写一次密码。
-    /// 再次调用会重置状态(覆盖密码、清除已完成标记)。
+    /// 再次调用会重置状态(覆盖密码、清除已完成标记、重新起算有效期)。
     ///
-    /// `disarm_on_input`:用户首次真实输入时是否解除本 autofill —— 远程项目
-    /// pane 传 `true`,「SSH 连接」菜单路径传 `false`
-    /// (见 [`ssh::SshAutofill`] 的字段注释)。
+    /// `disarm_on_input`:用户首次真实输入时是否解除本 autofill(见
+    /// [`ssh::SshAutofill`] 的字段注释)。远程项目 pane 在 spawn 后直接用它、
+    /// 传 `true`;往活着的 shell 里敲 `ssh` 的路径用
+    /// [`write_then_arm_ssh_autofill`](Self::write_then_arm_ssh_autofill)。
     pub fn arm_ssh_autofill(&self, password: String, disarm_on_input: bool) {
         *self.autofill.lock() = Some(SshAutofill::new(password, disarm_on_input));
     }
 
-    /// 用户向 PTY 真实输入时调用:仅当该 autofill 标了 `disarm_on_input` 才解除
-    /// 并清除明文密码。[`write`](Self::write) 已自动调用它,一般无需手动调。
+    /// 「SSH 连接」菜单路径:把 `ssh …\r` 命令写进 PTY,**写完再**注册自动填充
+    /// (`disarm_on_input = true`,此后用户任何真实输入都会解除它)。
+    ///
+    /// 为什么不让上层分两步调:
+    /// - 先注册再 [`write`](Self::write):命令写入本身就会把 `disarm_on_input = true`
+    ///   的 autofill 解掉,只能退回 `false`,而 `false` 在公钥登录成功时会一直待命;
+    /// - 先 `write` 再 [`arm_ssh_autofill`](Self::arm_ssh_autofill):`write` 只是入队,
+    ///   writer 线程随时可能把命令送进 PTY,严格说 ssh 的密码提示可以在两步之间
+    ///   被 reader 线程喂掉(要主线程恰好在两句之间停顿到 ssh 走完 TCP + 密钥交换,
+    ///   实际碰不到,但没理由留这条缝)。
+    ///
+    /// 这里**持 autofill 锁跨过「入队 → 注册」**:reader 线程喂输出前要拿同一把锁,
+    /// 命令引出的任何输出都只能在注册之后被看到;这次写入不经过解除逻辑,注册
+    /// 之后它也不可能再回头解除。输入观察器照常先收到字节(与 `write` 同序)。
+    pub fn write_then_arm_ssh_autofill(&self, bytes: &[u8], password: String) -> Result<()> {
+        if let Some(observer) = self.input_observer.lock().as_mut() {
+            observer(bytes);
+        }
+        let mut autofill = self.autofill.lock();
+        self.write_tx
+            .send(bytes.to_vec())
+            .map_err(|_| anyhow!("PTY 已关闭(写线程已退出)"))?;
+        *autofill = Some(SshAutofill::new(password, true));
+        Ok(())
+    }
+
+    /// 用户向 PTY 真实输入时调用:仅当该 autofill 此刻
+    /// [`disarm_on_input`](SshAutofill::disarm_on_input) 才解除并清除明文密码。
+    /// [`write`](Self::write) 已自动调用它,一般无需手动调。
     ///
     /// 语义:SSH 认证阶段用户不打字(ssh 自驱动 publickey,失败才由 autofill 灌
     /// 密码);一旦用户按键即说明会话已进入交互 shell,此后 `su` / `mysql -p` /
     /// `passwd` 等以 "password:" 结尾的提示都不该再被灌入 SSH 登录密码 ——
-    /// 尤其 publickey 登录成功时全程无密码提示、autofill 永不自解除,
-    /// 不在此解除则它终身待命并泄露密码。
+    /// 尤其 publickey 登录成功时全程无密码提示、autofill 不会命中自解除,
+    /// 不在此解除则它一直待命到有效期([`ssh::AUTOFILL_TTL`])结束,期间可能泄露密码。
+    /// 唯一的例外是首连时回答主机密钥确认(`yes` / 指纹)的那一行,见
+    /// [`SshAutofill::disarm_on_input`]。
     pub fn disarm_ssh_autofill_on_user_input(&self) {
-        let mut guard = self.autofill.lock();
-        if guard.as_ref().is_some_and(SshAutofill::disarm_on_input) {
-            *guard = None;
-        }
+        disarm_on_user_input(&self.autofill);
     }
 
-    /// 往 PTY 写字节(用户键入、粘贴、拖入的文件路径都走这里)。
+    /// 往 PTY 写字节(用户键入、粘贴、拖入的文件路径都走这里;终端自动应答走
+    /// [`write_reply`](Self::write_reply))。
     ///
     /// 顺序:通知输入观察器 → 解除 SSH 自动填充(焦点事件除外)→ 交给 writer
     /// 线程。观察器排在入队**之前**:上层拿这一路做的判定(例如为焦点事件开一个
@@ -440,6 +469,23 @@ impl PtySession {
         if bytes != FOCUS_IN_SEQ && bytes != FOCUS_OUT_SEQ {
             self.disarm_ssh_autofill_on_user_input();
         }
+        self.write_tx
+            .send(bytes.to_vec())
+            .map_err(|_| anyhow!("PTY 已关闭(写线程已退出)"))
+    }
+
+    /// 写终端自己的应答(DA / DSR / 光标位置 / OSC 颜色与剪贴板查询 / 文本区尺寸等,
+    /// 即 alacritty 产生的 `PtyWrite` 一类)。与 [`write`](Self::write) 同一条
+    /// writer 队列,相互顺序照旧;区别有两点:
+    ///
+    /// - **不解除 SSH 密码自动填充**:应答是终端替程序回话,不是用户按键。本地
+    ///   shell(pwsh/PSReadLine、fish、nushell……)与 ConPTY 在 ssh 起来前后都可能
+    ///   发查询,当成用户输入会让「SSH 连接」菜单路径的 autofill 在密码提示到达前
+    ///   就被解掉。
+    /// - **不经过输入观察器**:观察器约定的是「用户键入的字节」这一路;上层对应答
+    ///   本来就刻意绕开 AI 输入识别(`mt-app` 的 `write_raw`「不经 AI 输入旁路」),
+    ///   把应答里的转义序列喂进去只会让识别被带偏。
+    pub fn write_reply(&self, bytes: &[u8]) -> Result<()> {
         self.write_tx
             .send(bytes.to_vec())
             .map_err(|_| anyhow!("PTY 已关闭(写线程已退出)"))
@@ -558,6 +604,15 @@ fn write_chunked(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// 用户真实输入时的解除判定(见 [`PtySession::disarm_ssh_autofill_on_user_input`])。
+/// 抽成自由函数是为了单测能与 [`pump_autofill`] 在同一把锁上交替驱动,不必起真 PTY。
+fn disarm_on_user_input(autofill: &Mutex<Option<SshAutofill>>) {
+    let mut guard = autofill.lock();
+    if guard.as_ref().is_some_and(SshAutofill::disarm_on_input) {
+        *guard = None;
+    }
+}
+
 /// 把一段 PTY 输出喂给 SSH 密码自动填充;命中密码提示则直接回写密码 + 回车。
 fn pump_autofill(
     autofill: &Arc<Mutex<Option<SshAutofill>>>,
@@ -567,7 +622,8 @@ fn pump_autofill(
     let password = {
         let mut guard = autofill.lock();
         match guard.as_mut() {
-            Some(state) if !state.is_done() => state.feed(&String::from_utf8_lossy(chunk)),
+            // 直接喂原始字节:feed 只解码它要看的那段尾巴,不必整块 64KB 先转一遍
+            Some(state) if !state.is_done() => state.feed(chunk),
             _ => None,
         }
     };
@@ -747,6 +803,32 @@ mod tests {
         );
     }
 
+    /// 上层(mt-app 的 pane)在后台线程上 spawn、再把会话交回主线程,
+    /// 会话必须能跨线程移动。编译期断言,改字段时别把它弄丢。
+    #[test]
+    fn session_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PtySession>();
+    }
+
+    #[test]
+    fn dropping_session_kills_the_child() {
+        // 上层在回填前丢掉会话(pane 已关闭 / 实体已释放)不再单独 kill,
+        // 靠的就是这一条:`Drop` 必须当场杀子进程,不留孤儿。
+        let session = PtySession::spawn(interactive_spec(), |_| {}).expect("spawn 失败");
+        let child = Arc::clone(&session.child);
+        assert!(
+            child.lock().try_wait().expect("try_wait 失败").is_none(),
+            "交互式 shell 此刻应当还活着"
+        );
+        drop(session);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.lock().try_wait().expect("try_wait 失败").is_none() {
+            assert!(Instant::now() < deadline, "丢弃会话 10s 后子进程仍然活着");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn write_notifies_input_observer_with_raw_bytes() {
         let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -819,12 +901,125 @@ mod tests {
 
     #[test]
     fn user_input_keeps_autofill_when_not_flagged() {
-        // 「SSH 连接」菜单路径:arm 后紧跟的 ssh 命令写入不得解除,
-        // 否则密码提示到达前 autofill 已被删。
+        // `disarm_on_input = false` 的语义:写入不解除,只靠命中提示 / 失败 / 过期自解除。
         let session = PtySession::spawn(smoke_spec(), |_| {}).expect("spawn 失败");
         session.arm_ssh_autofill("secret".into(), false);
         session.write(b"ssh u@h\r").expect("write 失败");
         assert!(session.autofill.lock().is_some());
+    }
+
+    #[test]
+    fn menu_path_command_write_does_not_disarm_but_user_input_does() {
+        // 「SSH 连接」菜单路径:`ssh …\r` 先入队、再以 disarm_on_input = true 注册 ——
+        // 那条命令写入解除不到它;之后用户的任何按键都会解除。
+        // 命令内容无关紧要,用无害的 echo 代替真 ssh。
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let observer_sink = Arc::clone(&seen);
+        let session = PtySession::spawn(interactive_spec(), |_| {}).expect("spawn 失败");
+        session.set_input_observer(move |bytes| observer_sink.lock().extend_from_slice(bytes));
+
+        session
+            .write_then_arm_ssh_autofill(b"echo ssh-menu\r", "secret".into())
+            .expect("write 失败");
+        assert!(
+            session
+                .autofill
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.disarm_on_input() && !state.is_done()),
+            "命令写入之后 autofill 应处于待命状态,且标了 disarm_on_input"
+        );
+        assert_eq!(
+            &*seen.lock(),
+            b"echo ssh-menu\r",
+            "命令字节照常经过输入观察器"
+        );
+
+        // 焦点事件不是用户按键,不解除
+        session.write(FOCUS_IN_SEQ).expect("write 失败");
+        assert!(session.autofill.lock().is_some());
+
+        // 用户开始打字(公钥已登录成功、在跑 sudo 之类)→ 解除
+        session.write(b"s").expect("write 失败");
+        assert!(
+            session.autofill.lock().is_none(),
+            "用户首次输入后应解除,避免把 SSH 密码灌进之后的 sudo / su 提示"
+        );
+    }
+
+    /// 交互式 shell:不给输入就一直活着。`cmd /c echo` 那种会立刻退出,管道一断
+    /// 后续 write 就可能报错。
+    fn interactive_spec() -> PtySpawn {
+        PtySpawn {
+            program: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            rows: INITIAL_PTY_ROWS,
+            cols: INITIAL_PTY_COLS,
+        }
+    }
+
+    #[test]
+    fn terminal_replies_neither_disarm_nor_reach_the_observer() {
+        // DA / DSR / 光标位置 / OSC 颜色查询的应答是终端替程序回话,不是用户按键:
+        // 本地 shell 与 ConPTY 在 ssh 起来前后都会发查询,应答不能把 autofill 解掉,
+        // 也不该混进「用户键入」那一路。
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let observer_sink = Arc::clone(&seen);
+        let session = PtySession::spawn(interactive_spec(), |_| {}).expect("spawn 失败");
+        session.set_input_observer(move |bytes| observer_sink.lock().extend_from_slice(bytes));
+        session.arm_ssh_autofill("secret".into(), true);
+
+        session
+            .write_reply(b"\x1b[24;1R")
+            .expect("write_reply 失败");
+        session
+            .write_reply(b"\x1b[?1;2c")
+            .expect("write_reply 失败");
+        session
+            .write_reply(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\")
+            .expect("write_reply 失败");
+        assert!(
+            session.autofill.lock().is_some(),
+            "终端应答不该解除 autofill"
+        );
+        assert!(seen.lock().is_empty(), "终端应答不该经过输入观察器");
+
+        // 真正的用户按键照常解除
+        session.write(b"a").expect("write 失败");
+        assert!(session.autofill.lock().is_none());
+    }
+
+    #[test]
+    fn host_key_confirm_answer_does_not_disarm_but_later_input_does() {
+        // 模拟 reader 线程(pump_autofill)与用户写入(解除判定)在同一把锁上交替:
+        // 首连确认处敲 yes 不解除 → 密码提示照常填入;确认之后的输入照常解除。
+        // 不起真 PTY:shell 自己的输出会与手喂的提示交错,判定结果不稳定。
+        let prompt: &[u8] = b"The authenticity of host 'h (10.0.0.5)' can't be established.\r\n\
+            Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+        let written = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink: Arc<Mutex<BoxedWriter>> =
+            Arc::new(Mutex::new(Box::new(SharedSink(Arc::clone(&written)))));
+
+        let autofill = Arc::new(Mutex::new(Some(SshAutofill::new("secret".into(), true))));
+        pump_autofill(&autofill, &sink, prompt);
+        for key in [&b"y"[..], b"e", b"s", b"\r"] {
+            disarm_on_user_input(&autofill);
+            assert!(autofill.lock().is_some(), "回答确认提示不该解除");
+            // 回显(回车的回显是换行)
+            let echo: &[u8] = if key == b"\r" { b"\r\n" } else { key };
+            pump_autofill(&autofill, &sink, echo);
+        }
+        pump_autofill(&autofill, &sink, b"root@h's password: ");
+        assert_eq!(&*written.lock(), b"secret\r", "确认之后的密码提示仍要填入");
+
+        // 另一轮:确认之后、密码提示之前用户又敲了键 → 照常解除
+        let autofill = Arc::new(Mutex::new(Some(SshAutofill::new("secret".into(), true))));
+        pump_autofill(&autofill, &sink, prompt);
+        pump_autofill(&autofill, &sink, b"yes\r\n");
+        disarm_on_user_input(&autofill);
+        assert!(autofill.lock().is_none(), "确认之后的用户输入应当解除");
     }
 
     #[test]

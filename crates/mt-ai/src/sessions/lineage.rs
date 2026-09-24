@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use crate::agent::AgentKind;
+
 use super::codex::{
     codex_meta_from_line, codex_user_title_from_line, collect_codex_session_paths,
     find_codex_session_file,
@@ -392,7 +394,7 @@ fn enrich_bookkept_edges(
         if have.contains(&e.session_id) {
             continue;
         }
-        let branch_title = if e.agent.to_lowercase() == "codex" {
+        let branch_title = if AgentKind::parse(&e.agent) == Some(AgentKind::Codex) {
             codex_dir.as_ref().filter(|d| d.exists()).and_then(|d| {
                 let child = find_codex_session_file(d, &e.session_id)?;
                 let parent = find_codex_session_file(d, &e.parent_session_id)?;

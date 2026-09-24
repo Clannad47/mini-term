@@ -4777,16 +4777,15 @@ dependencies = [
 name = "mt-ai"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "chrono",
  "dirs 6.0.0",
  "mt-core",
  "parking_lot",
- "regex",
  "serde",
  "serde_json",
  "tiny_http",
  "toml_edit 0.22.27",
+ "uuid",
 ]
 
 [[package]]
@@ -4795,7 +4794,6 @@ version = "1.13.7"
 dependencies = [
  "anyhow",
  "chrono",
- "dirs 6.0.0",
  "futures",
  "gpui-component",
  "gpui-kit-assets",
@@ -4813,8 +4811,8 @@ dependencies = [
  "mt-project",
  "mt-pty",
  "mt-relay",
+ "mt-remote",
  "mt-secret",
- "mt-ssh",
  "mt-terminal",
  "mt-ui",
  "mt-usage",
@@ -4822,10 +4820,7 @@ dependencies = [
  "qrcode",
  "raw-window-handle",
  "ropey",
- "serde",
  "serde_json",
- "tokio",
- "toml_edit 0.22.27",
  "tree-sitter",
  "tree-sitter-batch",
  "tree-sitter-c-sharp",
@@ -4841,8 +4836,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-xml",
  "unicode-segmentation",
- "uuid",
- "windows 0.61.3",
+ "windows 0.62.2",
  "winresource",
  "zed-reqwest",
 ]
@@ -4855,11 +4849,10 @@ dependencies = [
  "dirs 6.0.0",
  "mt-core",
  "mt-secret",
+ "mt-theme-packs",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.11.0",
- "zip",
 ]
 
 [[package]]
@@ -4903,7 +4896,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "windows-registry 0.2.0",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -4920,7 +4913,6 @@ dependencies = [
 name = "mt-relay"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "dirs 6.0.0",
  "futures-util",
  "mt-ai",
@@ -4932,7 +4924,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "uuid",
 ]
 
 [[package]]
@@ -4941,6 +4932,21 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mt-remote"
+version = "1.13.7"
+dependencies = [
+ "mt-ai",
+ "mt-config",
+ "mt-core",
+ "mt-project",
+ "mt-pty",
+ "mt-secret",
+ "mt-ssh",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4965,6 +4971,7 @@ dependencies = [
  "futures",
  "mt-core",
  "mt-secret",
+ "ring",
  "rsa",
  "russh",
  "russh-sftp",
@@ -4977,11 +4984,21 @@ name = "mt-terminal"
 version = "1.13.7"
 dependencies = [
  "alacritty_terminal",
- "anyhow",
  "mt-pty",
  "parking_lot",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "mt-theme-packs"
+version = "1.13.7"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "zip",
 ]
 
 [[package]]
@@ -4992,10 +5009,8 @@ dependencies = [
  "anyhow",
  "gpui-component",
  "gpui-pre",
- "mt-config",
- "mt-i18n",
  "mt-terminal",
- "parking_lot",
+ "mt-theme-packs",
  "serde",
  "serde_json",
 ]
@@ -5004,11 +5019,11 @@ dependencies = [
 name = "mt-usage"
 version = "1.13.7"
 dependencies = [
- "anyhow",
  "chrono",
  "chrono-tz",
  "dirs 6.0.0",
  "mt-ai",
+ "mt-core",
  "rusqlite",
  "serde",
  "serde_json",
@@ -10286,17 +10301,6 @@ checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
  "windows-core 0.62.2",
  "windows-link 0.2.1",
-]
-
-[[package]]
-name = "windows-registry"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e400001bb720a623c1c69032f8e3e4cf09984deec740f007dd2b03ec864804b0"
-dependencies = [
- "windows-result 0.2.0",
- "windows-strings 0.1.0",
- "windows-targets 0.52.6",
 ]
 
 [[package]]

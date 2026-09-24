@@ -320,6 +320,10 @@ pub struct MobileRelayConfig {
     pub relay_url: String,
     /// 桌面端接入密钥:必须与中转的 `MT_RELAY_DESKTOP_KEY` 一致,握手时携带。
     /// 空字符串 = 未填,中转一律拒绝(fail-closed,见 ADR 0002)。
+    ///
+    /// 非空时在库、备份、存档里**一律是 [`mt_secret`] 信封**(与 SSH 密码同一套,
+    /// 见 [`ConfigStore`] 的「密码封存」段):泄露出去的明文能向中转申请配对码、
+    /// 顶掉用户的手机并往 PTY 写命令。明文只在 mt-app 边界解开后交给 mt-relay。
     #[serde(default)]
     pub desktop_key: String,
     /// AI 启动器列表:移动端能发起哪些 agent 由此决定。
@@ -447,7 +451,12 @@ pub struct ProjectEnvVar {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 一个项目(`projects[]` 的元素)。
+///
+/// `Default` 是「刚添加的本地项目」:没有描述、没关联 SSH、不挂父项目、类型自动探测,
+/// 与此前各处全字段字面量的取值一致。新建走 [`ProjectConfig::new`],远程项目 /
+/// 子项目在返回值上改对应字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     pub id: String,
@@ -492,6 +501,26 @@ pub struct ProjectConfig {
     /// 项目类型徽标覆盖:`None` = 自动探测,"none" = 不显示,其余为技术栈 key。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_override: Option<String>,
+    /// 本版本不认识的字段(多半是更新的版本写的),原样带着往返 —— 旧版本存一次
+    /// 配置不该把新版本的项目字段抹掉(口径见 [`crate::db`] 的「前向兼容」段)。
+    ///
+    /// 只由反序列化填充:已知字段(含只读不写的 `savedLayout`)先被各自的字段吃掉,
+    /// 落不进这里。**不许手工往里塞已知字段名** —— flatten 序列化时会与真字段
+    /// 重复成两个同名键。SSH 投影只取四个已知字段,不带它。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ProjectConfig {
+    /// 新建一个项目:只给 id / 名字 / 路径,其余取 [`Default`]。
+    pub fn new(id: impl Into<String>, name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            path: path.into(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1008,10 +1037,20 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
         })
         .collect();
 
+    // 连接上的未知字段(`extra`,新版本写的)不进投影:投影形状只认本版本
+    // 已知的字段,sidecar 与本程序同版本,读不懂也用不上;新版本自己会写它的投影。
+    let connections: Vec<SshConnection> = config
+        .ssh_connections
+        .iter()
+        .map(|c| SshConnection {
+            extra: Map::new(),
+            ..c.clone()
+        })
+        .collect();
     let mut root = Map::new();
     root.insert(
         "sshConnections".into(),
-        serde_json::to_value(&config.ssh_connections).unwrap_or(Value::Array(vec![])),
+        serde_json::to_value(&connections).unwrap_or(Value::Array(vec![])),
     );
     root.insert("projects".into(), Value::Array(projects));
     Value::Object(root)
@@ -1032,8 +1071,8 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// 不会碰它。
 ///
 /// 存量用户的完整 `config.json` 在首次迁移时被另存为 `config.json.pre-sqlite`,
-/// 除 `sshConnections[].password` 会随主库一起封存外不删不改 —— 那是回退到旧版本
-/// 的唯一凭据。
+/// 除 `sshConnections[].password` 与 `mobileRelay.desktopKey` 会随主库一起封存外
+/// 不删不改 —— 那是回退到旧版本的唯一凭据。
 ///
 /// # 密码封存
 ///
@@ -1042,6 +1081,11 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// 认证那一刻。本结构负责两件事:[`load`](Self::load) 时把存量明文一次性封存
 /// (并清扫库文件里的碎片),[`save`](Self::save) 时兜底封存漏网的明文。密钥文件
 /// 与库同目录,dev 实例的隔离目录自然各有各的钥匙。
+///
+/// 中转桌面密钥 `mobileRelay.desktopKey` 走**同一套**(同一把钥匙、同一个迁移
+/// 时机、同一次清扫):它不进投影,所以只涉及库、备份、存档三处;空串 = 未填,
+/// 不封存。解封在 mt-app 边界(`secrets::reveal_relay_key`),交给 mt-relay 的
+/// 仍是明文。
 ///
 /// 令牌是一个乐观并发计数:[`load`](Self::load) 每成功一次就轮换,
 /// [`save`](Self::save) 必须携带当前令牌才允许写盘。不变量:**写盘的每一份配置,
@@ -1137,7 +1181,22 @@ impl ConfigStore {
     /// 伪装成加载成功(那会让调用方拿着空配置开始运行,下一次保存就把库覆盖了)。
     ///
     /// 加载成功才轮换发放令牌;上一轮的令牌随之作废。
+    ///
+    /// 成功后当场留一代库备份(见 [`backup_db`](Self::backup_db))。启动路径改走
+    /// [`load_without_backup`](Self::load_without_backup),把备份挪去写线程。
     pub fn load(&self) -> Result<LoadedConfig> {
+        let loaded = self.load_without_backup()?;
+        self.backup_db();
+        Ok(loaded)
+    }
+
+    /// 与 [`load`](Self::load) 相同,只是**不做**这一代库备份。
+    ///
+    /// ⚠️ 调用方必须保证在这之后、**任何一次 [`save`](Self::save) 之前**调
+    /// [`backup_db`](Self::backup_db) —— 备份存在的意义是留住「本次运行改动之前」
+    /// 的那一代,晚于第一次写入就不是那一代了。应用侧的保证方式见 mt-app 的
+    /// `store::config_writer`(备份是单写者线程的第一件活)。
+    pub fn load_without_backup(&self) -> Result<LoadedConfig> {
         let db = self.db()?;
         let mut config = match db.load()? {
             Some(config) => migrate_config(config),
@@ -1146,17 +1205,23 @@ impl ConfigStore {
         // 密码封存:存量明文一次性换成信封并回写库(存档同理)。放在备份**之前**,
         // 这一代 .bak 里才不会再躺着明文。
         self.seal_passwords_on_load(&db, &mut config);
-        // 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
-        // 失败只记日志:备份不该拦住启动。
-        if let Err(err) = db.backup_to(&self.db_backup_path()) {
-            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
-        }
         // 投影与库对齐 —— sidecar 读的是它。内容没变时是 no-op。
         self.write_ssh_projection(&config);
 
         let token = self.token.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         eprintln!("[config] load ok, token={token}");
         Ok(LoadedConfig { config, token })
+    }
+
+    /// 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
+    /// 失败只记日志:备份不该拦住启动。
+    pub fn backup_db(&self) {
+        let result = self
+            .db()
+            .and_then(|db| db.backup_to(&self.db_backup_path()));
+        if let Err(err) = result {
+            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
+        }
     }
 
     /// 库是空的 → 从 `config.json` 灌一次(存量用户),或落一份默认配置(全新安装)。
@@ -1229,7 +1294,8 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// 加载时的密码封存(见 [`mt_secret`] 的模块注释)。
+    /// 加载时的密码封存(见 [`mt_secret`] 的模块注释)。SSH 密码与中转桌面密钥
+    /// 在同一处、同一次回写里封存。
     ///
     /// 凭据库开不起来只记日志、密码保持原样 —— 那是「本机生成不了密钥」这种环境
     /// 故障,不该让配置加载失败;[`Self::save`] 每次写盘还会再试。封存过东西就
@@ -1241,17 +1307,20 @@ impl ConfigStore {
         let vault = match self.vault() {
             Ok(vault) => vault,
             Err(err) => {
-                eprintln!("[config] {err:#};已存 SSH 密码本次保持原样(未封存)");
+                eprintln!("[config] {err:#};已存 SSH 密码与中转密钥本次保持原样(未封存)");
                 return;
             }
         };
-        let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault);
+        let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault)
+            + usize::from(seal_plaintext_relay_key(config, &vault));
         if sealed > 0 {
             match db
                 .save(config)
                 .and_then(|()| db.scrub_after_secret_rewrite())
             {
-                Ok(()) => eprintln!("[config] 已把 {sealed} 条 SSH 密码封存进 config.db"),
+                Ok(()) => {
+                    eprintln!("[config] 已把 {sealed} 条凭据(SSH 密码 / 中转密钥)封存进 config.db")
+                }
                 Err(err) => {
                     eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
                 }
@@ -1261,8 +1330,9 @@ impl ConfigStore {
         mt_secret::install(vault);
     }
 
-    /// 存量存档 `config.json.pre-sqlite` 里的 `sshConnections[].password` 同样封存。
-    /// 存档的其余内容不动(它是回退旧版本的凭据),只改这一个字段;没有明文就不写。
+    /// 存量存档 `config.json.pre-sqlite` 里的 `sshConnections[].password` 与
+    /// `mobileRelay.desktopKey` 同样封存。存档的其余内容不动(它是回退旧版本的
+    /// 凭据),只改这两个字段;没有明文就不写。
     fn seal_legacy_archive(&self, vault: &Vault) {
         let path = self.legacy_archive_path();
         let raw = match fs::read_to_string(&path) {
@@ -1280,7 +1350,8 @@ impl ConfigStore {
                 return;
             }
         };
-        let sealed = seal_passwords_in_json(&mut root, vault);
+        let sealed = seal_passwords_in_json(&mut root, vault)
+            + usize::from(seal_relay_key_in_json(&mut root, vault));
         if sealed == 0 {
             return;
         }
@@ -1293,17 +1364,17 @@ impl ConfigStore {
         };
         match atomic_write(&path, json.as_bytes()) {
             Ok(()) => eprintln!(
-                "[config] 已把存档 {} 里的 {sealed} 条 SSH 密码封存",
+                "[config] 已把存档 {} 里的 {sealed} 条凭据(SSH 密码 / 中转密钥)封存",
                 path.display()
             ),
             Err(err) => eprintln!("[config] 存档密码封存写盘失败: {err}"),
         }
     }
 
-    /// 落盘前的兜底:还有明文密码就克隆一份封存后再写,没有就原样借用。
+    /// 落盘前的兜底:还有明文密码(或中转密钥)就克隆一份封存后再写,没有就原样借用。
     /// 凭据库开不起来只记日志、原样写(与加载时同一条降级)。
     fn sealed_for_disk<'a>(&self, config: &'a AppConfig) -> Cow<'a, AppConfig> {
-        if !has_plaintext_password(&config.ssh_connections) {
+        if !has_plaintext_password(&config.ssh_connections) && !has_plaintext_relay_key(config) {
             return Cow::Borrowed(config);
         }
         let vault = match self.vault() {
@@ -1314,8 +1385,9 @@ impl ConfigStore {
             }
         };
         let mut owned = config.clone();
-        let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault);
-        eprintln!("[config] 写盘前兜底封存了 {sealed} 条 SSH 密码");
+        let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault)
+            + usize::from(seal_plaintext_relay_key(&mut owned, &vault));
+        eprintln!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥)");
         Cow::Owned(owned)
     }
 
@@ -1342,8 +1414,9 @@ impl ConfigStore {
     }
 }
 
-/// 这个值是「还没封存的明文密码」吗(非空且不带信封前缀)。
-fn is_plaintext_password(value: &str) -> bool {
+/// 这个值是「还没封存的明文凭据」吗(非空且不带信封前缀)。SSH 密码与中转桌面
+/// 密钥共用这条判据:空串 = 没填,不封存。
+fn is_plaintext_secret(value: &str) -> bool {
     !value.is_empty() && !mt_secret::is_sealed(value)
 }
 
@@ -1351,7 +1424,37 @@ fn is_plaintext_password(value: &str) -> bool {
 fn has_plaintext_password(connections: &[SshConnection]) -> bool {
     connections
         .iter()
-        .any(|c| c.password.as_deref().is_some_and(is_plaintext_password))
+        .any(|c| c.password.as_deref().is_some_and(is_plaintext_secret))
+}
+
+/// 中转桌面密钥还是明文吗。
+fn has_plaintext_relay_key(config: &AppConfig) -> bool {
+    config
+        .mobile_relay
+        .as_ref()
+        .is_some_and(|relay| is_plaintext_secret(&relay.desktop_key))
+}
+
+/// 把 `mobileRelay.desktopKey` 的明文换成信封。返回改了没有;封存失败只记日志、
+/// 原样保留(下次再试)。日志不含密钥。
+fn seal_plaintext_relay_key(config: &mut AppConfig, vault: &Vault) -> bool {
+    let Some(relay) = config
+        .mobile_relay
+        .as_mut()
+        .filter(|relay| is_plaintext_secret(&relay.desktop_key))
+    else {
+        return false;
+    };
+    match vault.seal(&relay.desktop_key) {
+        Ok(envelope) => {
+            relay.desktop_key = envelope;
+            true
+        }
+        Err(err) => {
+            eprintln!("[config] 中转桌面密钥封存失败,保持原样: {err}");
+            false
+        }
+    }
 }
 
 /// 把 `sshConnections[].password` 里的明文换成信封。返回改了几条;单条封存失败
@@ -1362,7 +1465,7 @@ fn seal_plaintext_passwords(connections: &mut [SshConnection], vault: &Vault) ->
         let Some(plain) = conn
             .password
             .as_deref()
-            .filter(|p| is_plaintext_password(p))
+            .filter(|p| is_plaintext_secret(p))
             .map(str::to_string)
         else {
             continue;
@@ -1391,7 +1494,7 @@ fn seal_passwords_in_json(root: &mut serde_json::Value, vault: &Vault) -> usize 
         let Some(plain) = conn
             .get("password")
             .and_then(serde_json::Value::as_str)
-            .filter(|p| is_plaintext_password(p))
+            .filter(|p| is_plaintext_secret(p))
             .map(str::to_string)
         else {
             continue;
@@ -1402,6 +1505,31 @@ fn seal_passwords_in_json(root: &mut serde_json::Value, vault: &Vault) -> usize 
         }
     }
     sealed
+}
+
+/// 存档里的 `mobileRelay.desktopKey` 同样封存。返回改了没有;字段缺失 / 形状
+/// 不对就当没有。
+fn seal_relay_key_in_json(root: &mut serde_json::Value, vault: &Vault) -> bool {
+    let Some(key) = root
+        .get_mut("mobileRelay")
+        .and_then(|relay| relay.get_mut("desktopKey"))
+    else {
+        return false;
+    };
+    let Some(plain) = key
+        .as_str()
+        .filter(|k| is_plaintext_secret(k))
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    match vault.seal(&plain) {
+        Ok(envelope) => {
+            *key = serde_json::Value::String(envelope);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// 同目录临时文件 + rename 的原子写。
@@ -1773,10 +1901,6 @@ mod tests {
             middle_column_visible: false,
             right_drawer_width: Some(400.0),
             projects: vec![ProjectConfig {
-                id: "p1".into(),
-                name: "proj".into(),
-                path: "/tmp".into(),
-                description: None,
                 saved_layout: Some(SavedProjectLayout {
                     tabs: vec![SavedTab {
                         custom_title: None,
@@ -1791,15 +1915,7 @@ mod tests {
                     }],
                     active_tab_index: 0,
                 }),
-                expanded_dirs: vec![],
-                ssh_mcp_enabled: false,
-                ssh_cli_token: None,
-                ssh_connection_ids: None,
-                env_vars: vec![],
-                wsl_sessions_distro: None,
-                ssh_connection_id: None,
-                parent_project_id: None,
-                kind_override: None,
+                ..ProjectConfig::new("p1", "proj", "/tmp")
             }],
             ..Default::default()
         };
@@ -2171,11 +2287,13 @@ mod tests {
             password: None,
             identity_file: Some("/k".into()),
             group: Some("内网".into()),
+            extra: Default::default(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(json.contains(r#""identityFile":"/k""#), "{json}");
         assert!(!json.contains("password"), "None 不应序列化: {json}");
-        // 老配置里残留的 proxyJump 之类未知字段必须被静默忽略
+        // 老配置里残留的 proxyJump 之类未知字段不许拖垮反序列化
+        // (它落进 `extra`,入库前由 `db.rs` 的下线字段表剥掉)
         let parsed: SshConnection = serde_json::from_str(
             r#"{"id":"1","name":"n","host":"h","port":22,"user":"u","proxyJump":"user@bastion"}"#,
         )
@@ -2534,6 +2652,8 @@ mod tests {
                     password: Some("secret".into()),
                     identity_file: None,
                     group: None,
+                    // 新版本写的未知字段:库里原样往返,但不许进投影
+                    extra: serde_json::from_str(r#"{"jumpHost":"bastion"}"#).unwrap(),
                 },
                 SshConnection {
                     id: "c2".into(),
@@ -2544,6 +2664,7 @@ mod tests {
                     password: None,
                     identity_file: None,
                     group: None,
+                    extra: Default::default(),
                 },
             ],
             projects: vec![
@@ -2584,6 +2705,14 @@ mod tests {
             "sidecar 只读打开同目录的密钥文件就能解"
         );
 
+        // 连接上的未知字段只进库、不进投影:投影形状与本版本已知字段逐字一致
+        let projection = fs::read_to_string(&path).unwrap();
+        assert!(
+            !projection.contains("jumpHost"),
+            "未知字段漏进了投影: {projection}"
+        );
+        assert!(scoped[0].extra.is_empty());
+
         // 未知令牌仍 fail closed
         assert!(mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "nope").is_err());
 
@@ -2593,6 +2722,90 @@ mod tests {
         let unscoped = mt_core::read_ssh_connections_for_project_at(Some(path), Some("p2"));
         assert_eq!(unscoped.len(), 2, "没设范围的项目仍是全部可见");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 整条链路(`ConfigStore::load` → 改一项 → `ConfigStore::save`,含密码兜底封存):
+    /// 新版本写进库里的未知键 / 未知字段 / 读不懂的值都活着出来,库也没进只读。
+    #[test]
+    fn 新版本写过的库经完整读写链路不丢东西() {
+        let root = unique_test_root("forward-compat");
+        let path = root.join("config.json");
+        let store = ConfigStore::at(&path);
+        let token = store.load().unwrap().token;
+        let config = AppConfig {
+            projects: vec![ProjectConfig::new("p1", "甲", "D:/a")],
+            ssh_connections: vec![conn_with_plain_password("c1", "pw")],
+            ..Default::default()
+        };
+        store.save(token, &config).unwrap();
+
+        // 模拟更新的版本写过这个库
+        {
+            let db = rusqlite::Connection::open(root.join("config.db")).unwrap();
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES('futureFeature', '{\"on\":true}')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE settings SET value = '{\"px\":13}' WHERE key = 'uiFontSize'",
+                [],
+            )
+            .unwrap();
+            let raw: String = db
+                .query_row("SELECT data FROM projects WHERE id = 'p1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut project: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            project["pinned"] = serde_json::Value::Bool(true);
+            db.execute(
+                "UPDATE projects SET data = ?1 WHERE id = 'p1'",
+                [project.to_string()],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.load().expect("坏值不许让整库加载失败");
+        assert_eq!(loaded.config.ui_font_size, default_ui_font_size());
+        assert_eq!(
+            loaded.config.projects[0].extra.get("pinned"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let mut next = loaded.config;
+        next.theme = "dark".into();
+        store.save(loaded.token, &next).unwrap();
+
+        let db = rusqlite::Connection::open(root.join("config.db")).unwrap();
+        let setting = |key: &str| -> String {
+            db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(setting("futureFeature"), r#"{"on":true}"#);
+        assert_eq!(
+            setting("uiFontSize"),
+            r#"{"px":13}"#,
+            "没改过的坏值原样留着"
+        );
+        assert_eq!(setting("theme"), r#""dark""#);
+        let raw: String = db
+            .query_row("SELECT data FROM projects WHERE id = 'p1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(raw.contains(r#""pinned":true"#), "{raw}");
+        let conn_raw: String = db
+            .query_row(
+                "SELECT data FROM ssh_connections WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(conn_raw.contains("enc:v1:"), "密码仍是信封: {conn_raw}");
+        drop(db);
         fs::remove_dir_all(&root).ok();
     }
 
@@ -2606,6 +2819,7 @@ mod tests {
             password: Some(password.into()),
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }
     }
 
@@ -2726,23 +2940,130 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    fn project_stub() -> ProjectConfig {
-        ProjectConfig {
-            id: String::new(),
-            name: String::new(),
-            path: String::new(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: vec![],
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: vec![],
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
+    fn relay_with_key(key: &str) -> MobileRelayConfig {
+        MobileRelayConfig {
+            relay_url: "wss://relay.example.com".into(),
+            desktop_key: key.into(),
+            ..MobileRelayConfig::default()
         }
+    }
+
+    /// 中转桌面密钥与 SSH 密码**同一时机、同一方式**迁移:旧版本落下的明文在加载时
+    /// 封存,库、备份、存档连字节都不留(投影本来就不带它,顺带钉住);
+    /// 存档其余内容原样,二次加载不重复封存。
+    #[test]
+    fn 存量明文中转密钥加载时封存且各处不留明文() {
+        let root = unique_test_root("seal-relay-on-load");
+        let path = root.join("config.json");
+        const PLAIN: &str = "r3lay-Desktop-K3y";
+        // 直接用库层写一份明文(绕过 ConfigStore::save 的兜底封存,模拟旧版本落下的库)
+        {
+            let db = crate::db::ConfigDb::open_at(&root).unwrap();
+            let config = AppConfig {
+                mobile_relay: Some(relay_with_key(PLAIN)),
+                ..AppConfig::default()
+            };
+            db.save(&config).unwrap();
+        }
+        let archive = root.join("config.json.pre-sqlite");
+        let legacy = serde_json::json!({
+            "uiFontSize": 15.5,
+            "mobileRelay": {"relayUrl": "wss://relay.example.com", "desktopKey": PLAIN}
+        });
+        fs::write(&archive, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let store = ConfigStore::at(&path);
+        let loaded = store.load().unwrap();
+        let relay = loaded.config.mobile_relay.clone().expect("中转配置还在");
+        assert!(
+            mt_secret::is_sealed(&relay.desktop_key),
+            "内存里已是信封: {}",
+            relay.desktop_key
+        );
+        assert_eq!(
+            store.vault().unwrap().reveal(&relay.desktop_key).unwrap(),
+            PLAIN
+        );
+        assert_eq!(relay.relay_url, "wss://relay.example.com", "地址不动");
+
+        for file in [
+            "config.db",
+            "config.db.bak",
+            "config.json",
+            "config.json.pre-sqlite",
+        ] {
+            let bytes = fs::read(root.join(file)).unwrap();
+            assert!(
+                !contains_bytes(&bytes, PLAIN.as_bytes()),
+                "{file} 里不该再有明文"
+            );
+        }
+        if let Ok(wal) = fs::read(root.join("config.db-wal")) {
+            assert!(
+                !contains_bytes(&wal, PLAIN.as_bytes()),
+                "WAL 旧帧里不该有明文"
+            );
+        }
+        let archived: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&archive).unwrap()).unwrap();
+        assert_eq!(archived["uiFontSize"], 15.5);
+        assert_eq!(
+            archived["mobileRelay"]["relayUrl"],
+            "wss://relay.example.com"
+        );
+        assert!(mt_secret::is_sealed(
+            archived["mobileRelay"]["desktopKey"].as_str().unwrap()
+        ));
+
+        let again = store.load().unwrap();
+        assert_eq!(
+            again.config.mobile_relay.unwrap().desktop_key,
+            relay.desktop_key,
+            "二次加载信封不变(不重复封存)"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `save` 兜底:交来明文中转密钥也封成信封再落盘;空串 = 未填,原样存空。
+    #[test]
+    fn 写盘兜底把明文中转密钥封成信封且空串不封() {
+        let root = unique_test_root("seal-relay-on-save");
+        let store = ConfigStore::at(root.join("config.json"));
+        let token = store.load().unwrap().token;
+        const PLAIN: &str = "r3lay-Desktop-K3y";
+        let config = AppConfig {
+            mobile_relay: Some(relay_with_key(PLAIN)),
+            ..AppConfig::default()
+        };
+        store.save(token, &config).unwrap();
+
+        let stored = store.read().mobile_relay.unwrap().desktop_key;
+        assert!(mt_secret::is_sealed(&stored), "库里只能是信封: {stored}");
+        assert_eq!(store.vault().unwrap().reveal(&stored).unwrap(), PLAIN);
+        for file in ["config.db", "config.db-wal"] {
+            if let Ok(bytes) = fs::read(root.join(file)) {
+                assert!(
+                    !contains_bytes(&bytes, PLAIN.as_bytes()),
+                    "{file} 里不该出现明文"
+                );
+            }
+        }
+
+        let cleared = AppConfig {
+            mobile_relay: Some(relay_with_key("")),
+            ..AppConfig::default()
+        };
+        store.save(token, &cleared).unwrap();
+        assert_eq!(
+            store.read().mobile_relay.unwrap().desktop_key,
+            "",
+            "空串是「未填」,不该变成一个信封"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn project_stub() -> ProjectConfig {
+        ProjectConfig::default()
     }
 
     #[test]

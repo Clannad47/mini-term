@@ -7,6 +7,8 @@ authors.workspace = true
 
 [dependencies]
 serde.workspace = true
+# 技术栈探测解析 `package.json` 的依赖表(`project_kind::parse_package_deps`,
+# 随探测逻辑自 mt-app 移入)。工作区里已有,零新增。
 serde_json.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
@@ -24,4 +26,6 @@ pathdiff = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。
-windows-registry = "0.2"
+# 版本跟 gpui-pre-windows 已经在用的那份对齐(此前是 0.2,依赖树里同时编
+# 0.2 / 0.4 / 0.6 三份;0.4 是 zed-reqwest 带进来的,对不齐)。
+windows-registry = "0.6"

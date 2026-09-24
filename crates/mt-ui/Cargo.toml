@@ -13,12 +13,13 @@ mt-terminal.workspace = true
 # 与 mt-terminal 取同一个 workspace 版本,类型才互通。
 alacritty_terminal.workspace = true
 # 主题桥:读 themes/ 下的主题包(ThemePacks)并把配色映射成 TerminalTheme /
-# gpui-component 的 ThemeConfig。mt-config 不依赖 gpui,映射代码只能住在这边。
-mt-config.workspace = true
-# 终端查找条的文案(terminalSearch 命名空间)。mt-i18n 零第三方依赖、
-# 查表是 &'static str,渲染热路径直接调也不心疼。
-mt-i18n.workspace = true
+# gpui-component 的 ThemeConfig。文件层不依赖 gpui,映射代码只能住在这边。
+#
+# ⚠️ 只依赖拆出来的 mt-theme-packs,**不要**再依赖 mt-config / mt-i18n / mt-project:
+# 前两个改得勤(config.rs、生成的 dict.rs),每改一次都会把本 crate 两万多行整个重编;
+# mt-project 带 git2 等重库。查找条文案由宿主注入(`TerminalSearchBar::new` 的
+# labels 参数),技术栈徽标按落盘字符串查表(`TechIcon::new(kind.as_str())`)。
+mt-theme-packs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-parking_lot.workspace = true

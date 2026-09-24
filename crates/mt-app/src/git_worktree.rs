@@ -35,6 +35,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputState};
+use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
 
 use crate::i18n::{t, tr};
@@ -45,15 +46,9 @@ use crate::ui;
 
 // ─── 纯逻辑小件 ───────────────────────────────────────────────
 
-/// `src/utils/projectActions.ts:9-11`。worktree「是否已是项目」的比对全靠它,
-/// **必须逐字移植**。
-pub fn normalize_path(p: &str) -> String {
-    let unified: String = p
-        .chars()
-        .map(|c| if c == '\\' { '/' } else { c })
-        .collect();
-    unified.trim_end_matches('/').to_lowercase()
-}
+// worktree「是否已是项目」与归并的路径比对(`src/utils/projectActions.ts:9-11` 的
+// `normalizePath`:分隔符统一、去尾斜杠、转小写)已收进
+// `mt_core::path_key::windows_eq_key`,口径逐字相同。
 
 /// 分支名 → 目录名片段(`GitWorktreeModal.tsx:45-47`)。
 pub fn sanitize_branch_for_dir(branch: &str) -> String {
@@ -150,7 +145,7 @@ fn intersect_ordered(groups: &[Vec<String>]) -> Vec<String> {
 /// 归并后的一组(`GitWorktreeModal.tsx:31-42`)。
 #[derive(Clone)]
 struct RepoGroup {
-    /// `normalize_path(主仓库路径)`。
+    /// `windows_eq_key(主仓库路径)`。
     key: String,
     /// 主仓库目录名(worktree 目录建议名的前缀)。
     name: String,
@@ -171,7 +166,7 @@ fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<
                     .find(|w| w.is_main)
                     .map(|w| w.path.clone())
                     .unwrap_or_else(|| path.clone());
-                let key = normalize_path(&main_path);
+                let key = windows_eq_key(&main_path);
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
@@ -184,7 +179,7 @@ fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<
                 });
             }
             Err(err) => {
-                let key = normalize_path(&path);
+                let key = windows_eq_key(&path);
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
@@ -722,7 +717,9 @@ fn render_worktree_row(
         .read(cx)
         .projects()
         .iter()
-        .find(|p| p.ssh_connection_id.is_none() && normalize_path(&p.path) == normalize_path(&wt.path))
+        .find(|p| {
+            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
+        })
         .map(|p| p.id.clone());
     let is_project = existing_project.is_some();
 
@@ -1414,7 +1411,9 @@ fn open_remove_confirm(
         .read(cx)
         .projects()
         .iter()
-        .find(|p| p.ssh_connection_id.is_none() && normalize_path(&p.path) == normalize_path(&wt.path))
+        .find(|p| {
+            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
+        })
         .map(|p| (p.id.clone(), p.name.clone()));
     if linked_project
         .as_ref()
@@ -1545,18 +1544,12 @@ fn open_remove_confirm(
                     }
                     form_for_ok.update(cx, |f, cx| {
                         f.removing = true;
+                        f.error = None;
                         cx.notify();
                     });
-                    remove_worktree(
-                        &state,
-                        &group,
-                        &wt,
-                        project_id,
-                        form_for_ok.read(cx).force,
-                        window,
-                        cx,
-                    );
-                    // 结果回来之前不关框(失败要能看见错误)
+                    remove_worktree(&state, &form_for_ok, &group, &wt, project_id, window, cx);
+                    // 结果回来之前不关框:成功由 `remove_worktree` 关,失败把原因写回
+                    // 表单、框留着给用户看(可勾「强制删除」再试)
                     false
                 })
         },
@@ -1566,6 +1559,8 @@ fn open_remove_confirm(
 struct RemoveForm {
     force: bool,
     removing: bool,
+    /// 上一次删除失败的原因(git 的 stderr 原文)。画在「强制删除」下面,
+    /// 再点「删除」时清掉。
     error: Option<String>,
 }
 
@@ -1575,12 +1570,14 @@ impl Render for RemoveForm {
     }
 }
 
+/// 删 worktree(确认框「删除」的落点)。`form` 是确认框的状态实体:成功关框,
+/// 失败把原因写回 `form.error`、复位 `removing`,框留着。
 fn remove_worktree(
     state: &Entity<WorktreeModal>,
+    form: &Entity<RemoveForm>,
     group: &RepoGroup,
     wt: &WorktreeInfo,
     project_id: Option<String>,
-    force: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1588,6 +1585,11 @@ fn remove_worktree(
         .as_deref()
         .is_some_and(|id| crate::workbench_area::project_has_dirty_documents(id, cx))
     {
+        // 调用方已置 `removing`,不复位的话按钮永远卡在「删除中」
+        form.update(cx, |f, cx| {
+            f.removing = false;
+            cx.notify();
+        });
         show_alert(
             t("fileViewer", "unsavedTitle"),
             t("fileViewer", "projectRemovalBlocked"),
@@ -1596,13 +1598,17 @@ fn remove_worktree(
         );
         return;
     }
+    let force = form.read(cx).force;
     let store = state.read(cx).store.clone();
-    // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败
+    // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败。
+    //    ⚠️ 这一步必须在 remove **之前**:删失败时终端也已关掉(项目还在,pane 呈
+    //    断开态、可重开),代价换来的是 Windows 上能删得掉,别为「失败不关终端」调序
     if let Some(id) = &project_id {
         store.update(cx, |store, cx| store.dispose_project_terminals(id, cx));
     }
     let (main_path, wt_path) = (group.main_path.clone(), wt.path.clone());
     let state = state.clone();
+    let form = form.clone();
     window
         .spawn(cx, async move |cx| {
             let result = cx
@@ -1630,13 +1636,36 @@ fn remove_worktree(
                     }
                     Err(err) => {
                         eprintln!("[git] 删除 worktree 失败: {err:#}");
-                        // 失败:框留着显示错误(项目还在,终端呈断开态可重开)
-                        crate::prompt::close_guarded(kind::GIT_WORKTREE_REMOVE, window, cx);
+                        // 失败:**不关框**,原因写回表单就地显示(git 的 stderr 原文,
+                        // 如「contains modified or untracked files, use --force」),
+                        // 按钮复位,用户可勾「强制删除」再点一次。项目还在,终端已在
+                        // ① 关掉,pane 呈断开态可重开。
+                        let message = remove_error_text(&err);
+                        form.update(cx, |f, cx| {
+                            f.removing = false;
+                            f.error = Some(message.clone());
+                            cx.notify();
+                        });
+                        // 等待期间用户按 Esc 把确认框关了:框没了原因也不能丢,
+                        // 退到提示框(叠在 worktree 弹窗之上,toast 会被遮罩挡住)
+                        if !crate::prompt::is_open(kind::GIT_WORKTREE_REMOVE) {
+                            show_alert(t("worktree", "removeConfirmTitle"), message, window, cx);
+                        }
                     }
                 }
             });
         })
         .detach();
+}
+
+/// 删除失败的可展示原因。`run_git_command` 把 git 的 stderr 原样装进错误,
+/// 末尾带换行,这里收掉首尾空白;万一是空的(git 没吭声就非零退出)也别画一行空白。
+fn remove_error_text(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    match text.trim() {
+        "" => "git worktree remove failed".to_string(),
+        trimmed => trimmed.to_string(),
+    }
 }
 
 /// 清理失效条目。**失败静默**(下次打开重试即可)。
@@ -1723,14 +1752,39 @@ mod tests {
         }
     }
 
-    /// `normalizePath`:分隔符统一、去尾斜杠、转小写。三条都不能少 ——
-    /// worktree「是否已是项目」的比对全靠它。
+    /// 删除失败的原因要能直接画出来:git stderr 的尾换行收掉,空的不画空白行。
     #[test]
-    fn 路径归一化() {
-        assert_eq!(normalize_path(r"D:\Git\Repo\"), "d:/git/repo");
-        assert_eq!(normalize_path("/home/U/Proj/"), "/home/u/proj");
-        assert_eq!(normalize_path(r"D:\Git\Repo"), normalize_path("D:/Git/repo"));
-        assert_eq!(normalize_path(""), "");
+    fn 删除失败原因去掉首尾空白且不为空() {
+        let err = anyhow::anyhow!(
+            "fatal: 'D:/repo-wt' contains modified or untracked files, use --force to delete it\n"
+        );
+        assert_eq!(
+            remove_error_text(&err),
+            "fatal: 'D:/repo-wt' contains modified or untracked files, use --force to delete it"
+        );
+        assert!(!remove_error_text(&anyhow::anyhow!("\n")).is_empty());
+    }
+
+    /// 归并键:分隔符统一、去尾斜杠、转小写(`windows_eq_key`)。三条都不能少 ——
+    /// libgit2 给的主工作区路径(`D:/Git/Repo/`)与用户填的(`d:\git\repo`)要合成一组。
+    #[test]
+    fn 归并键容忍分隔符大小写与尾斜杠() {
+        let list = vec![wt("Repo", "D:/Git/Repo/", true, Some("main"))];
+        let groups = merge_groups(vec![
+            (r"D:\Git\Repo".into(), Ok(list)),
+            (
+                r"d:\git\repo\".into(),
+                Err("另一条路径扫到的同一个仓库".into()),
+            ),
+        ]);
+        assert_eq!(groups.len(), 1, "同一仓库的不同写法只留一组");
+        assert_eq!(groups[0].main_path, "D:/Git/Repo/");
+        // 不同仓库不许被合并
+        let groups = merge_groups(vec![
+            (r"D:\Git\Repo".into(), Err("x".into())),
+            (r"D:\Git\Repo2".into(), Err("y".into())),
+        ]);
+        assert_eq!(groups.len(), 2);
     }
 
     /// 分支名 → 目录名片段。

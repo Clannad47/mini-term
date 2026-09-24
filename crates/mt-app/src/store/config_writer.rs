@@ -57,16 +57,94 @@
 //! (gpui 给 await 阶段设了 100ms 上限,但 `block_with_timeout` 是在**当前线程**
 //! 上 poll 的:我们的 future 首次 poll 里就把排干做完再返回 `Ready`,超时无从
 //! 插手 —— 与改造前「退出时同步写完」的行为一致。)
+//!
+//! # 启动那一代库备份也在这条线程上
+//!
+//! `config.db.bak` 是「每启动留一代」的保险:留住的必须是**本次运行改动之前**的
+//! 那一代,否则一次把配置写坏的保存会连备份一起写坏。它原本在
+//! `ConfigStore::load` 里同步做(首帧前主线程上多一次 SQLite backup + fsync),
+//! 现在是写线程起来后的**第一件活**([`ConfigWriter::spawn`] 的 `backup_first`):
+//!
+//! - 启动后 config.db 的写入只有一个入口 —— 本线程的 `ConfigStore::save`
+//!   (`load` 期间的迁移 / 密码封存回写发生在加载那一刻、本就在备份之前,与原来
+//!   同序);单线程顺序执行,排在备份后面的保存不可能先落盘;
+//! - 备份期间入队的保存只是在队列里等着;挂着一个伪代数的 `in_flight`,退出排干
+//!   同样会等备份做完;
+//! - 写线程起不来时退回主线程当场同步备份,仍在任何一次保存之前。
+//!
+//! # 写盘失败要让用户看见
+//!
+//! 搬到后台之后,写失败(盘满 / 权限 / 杀软锁库)原先只在 stderr 留一行 —— 用户
+//! 照常改设置,重启后全没了,事前毫无征兆。现在每次失败都经 channel
+//! ([`ConfigWriter::spawn`] 返回的那一头)交回主线程,由 `AppStore` 推 toast;
+//! **写线程里绝不碰 GPUI**。这类故障往往让之后每一次保存都失败,主线程那头用
+//! [`FailureThrottle`] 去重:同一类 [`FAILURE_NOTICE_INTERVAL`] 内只提示一次。
 
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use mt_config::{AppConfig, ConfigStore, SaveError};
 
 /// 排干的兜底上限。写线程若卡在一次不返回的 fsync 上(网络盘掉线),
 /// 宁可丢这一次保存也不能把退出流程永久吊死。
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// 同一类写盘失败多久只提示一次。
+pub(super) const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 写盘失败的类别 —— 去重的粒度。令牌过期不在其列:那是设计内的跳过
+/// (见 [`write_once`]),不是故障。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum FailureKind {
+    Serialize,
+    Io,
+    Db,
+}
+
+/// 一次写盘失败,由写线程交回主线程。
+#[derive(Debug)]
+pub(super) struct SaveFailure {
+    pub(super) kind: FailureKind,
+    /// 可直接展示的原因(已去掉 `SaveError` 的「配置写盘失败:」前缀,
+    /// toast 正文自己会说)。
+    pub(super) detail: String,
+}
+
+impl SaveFailure {
+    /// 该不该报给用户、报什么。`StaleToken` 返回 `None`。
+    fn from_error(err: &SaveError) -> Option<Self> {
+        let (kind, detail) = match err {
+            SaveError::StaleToken { .. } => return None,
+            SaveError::Serialize(e) => (FailureKind::Serialize, e.to_string()),
+            SaveError::Io(e) => (FailureKind::Io, e.to_string()),
+            SaveError::Db(e) => (FailureKind::Db, format!("{e:#}")),
+        };
+        Some(Self { kind, detail })
+    }
+}
+
+/// 失败提示的去重闸(主线程持有)。**纯状态**,单测直接驱动。
+#[derive(Default)]
+pub(super) struct FailureThrottle {
+    last_shown: HashMap<FailureKind, Instant>,
+}
+
+impl FailureThrottle {
+    /// 这一类失败现在该不该提示。放行即记下时间;窗口内同类再来一律压掉。
+    /// 不同类互不影响 —— 库写失败压不住随后冒出来的另一种故障。
+    pub(super) fn admit(&mut self, kind: FailureKind, now: Instant) -> bool {
+        if let Some(last) = self.last_shown.get(&kind)
+            && now.saturating_duration_since(*last) < FAILURE_NOTICE_INTERVAL
+        {
+            return false;
+        }
+        self.last_shown.insert(kind, now);
+        true
+    }
+}
 
 /// 一份待落盘的完整配置快照。
 struct Snapshot {
@@ -135,6 +213,8 @@ struct Shared {
     queue: Mutex<Queue>,
     /// 两个方向都用它:入队唤醒写线程、写完唤醒排干的人。
     idle_or_work: Condvar,
+    /// 写盘失败的回报口(写线程 → 主线程)。
+    failures: UnboundedSender<SaveFailure>,
 }
 
 impl Shared {
@@ -177,15 +257,32 @@ impl ConfigWriter {
     /// 起写线程。`store` 走 `Arc` 与主线程共用同一个实例 ——
     /// 令牌(`AtomicU64`)与库句柄(`Mutex<Option<Arc<ConfigDb>>>`)都在它身上,
     /// 两侧看到的必须是同一份。
-    pub(super) fn spawn(store: Arc<ConfigStore>) -> Self {
+    ///
+    /// 返回的接收端是写盘失败的回报口(见模块注释「写盘失败要让用户看见」),
+    /// 由主线程泵着推 toast。
+    ///
+    /// `backup_first`:先给 config.db 留这一代备份,再开始处理保存(见模块注释
+    /// 「启动那一代库备份也在这条线程上」)。配置没加载成功时传 `false`。
+    pub(super) fn spawn(
+        store: Arc<ConfigStore>,
+        backup_first: bool,
+    ) -> (Self, UnboundedReceiver<SaveFailure>) {
+        let (failures, failures_rx) = mpsc::unbounded();
+        let mut queue = Queue::new();
+        if backup_first {
+            // 备份占着一个伪代数的「在写」:排干据此等它做完
+            queue.in_flight = Some(BACKUP_GENERATION);
+        }
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue::new()),
+            queue: Mutex::new(queue),
             idle_or_work: Condvar::new(),
+            failures,
         });
         let worker = shared.clone();
+        let worker_store = store.clone();
         let handle = std::thread::Builder::new()
             .name("mt-config-writer".into())
-            .spawn(move || run(&worker, &store))
+            .spawn(move || run(&worker, &worker_store, backup_first))
             .map_err(|err| {
                 // 起不了线程(句柄耗尽)极罕见。此时 `enqueue` 退化成主线程同步写,
                 // 卡顿回到改造前的样子 —— 但绝不能因此不落盘。
@@ -193,7 +290,12 @@ impl ConfigWriter {
                 err
             })
             .ok();
-        Self { shared, handle }
+        if handle.is_none() && backup_first {
+            // 没有写线程:当场同步备份,仍排在任何一次保存之前
+            store.backup_db();
+            shared.lock().finish(BACKUP_GENERATION);
+        }
+        (Self { shared, handle }, failures_rx)
     }
 
     /// 入队一份快照。**不阻塞**(一次加锁 + 一次唤醒)。
@@ -202,7 +304,7 @@ impl ConfigWriter {
     pub(super) fn enqueue(&self, store: &ConfigStore, token: u64, config: AppConfig) {
         let snapshot = Snapshot { token, config };
         if self.handle.is_none() {
-            write_once(store, &snapshot);
+            write_once(store, &snapshot, &self.shared.failures);
             return;
         }
         {
@@ -246,8 +348,21 @@ impl DrainHandle {
     }
 }
 
-/// 写线程主循环。
-fn run(shared: &Arc<Shared>, store: &ConfigStore) {
+/// 启动备份占用的伪代数。真实代数从 1 起(`Queue::push` 先加一),0 不会撞上;
+/// `finish(0)` 也不会把 `written` 往回拉。
+const BACKUP_GENERATION: u64 = 0;
+
+/// 写线程主循环。`backup_first` 时先留这一代库备份,做完才开始取保存。
+fn run(shared: &Arc<Shared>, store: &ConfigStore, backup_first: bool) {
+    if backup_first {
+        store.backup_db();
+        {
+            let mut queue = shared.lock();
+            queue.finish(BACKUP_GENERATION);
+        }
+        // 唤醒可能正在排干的退出钩子
+        shared.idle_or_work.notify_all();
+    }
     loop {
         let job = {
             let mut queue = shared.lock();
@@ -268,7 +383,7 @@ fn run(shared: &Arc<Shared>, store: &ConfigStore) {
         let Some((generation, snapshot)) = job else {
             return;
         };
-        write_once(store, &snapshot);
+        write_once(store, &snapshot, &shared.failures);
         {
             let mut queue = shared.lock();
             queue.finish(generation);
@@ -278,9 +393,10 @@ fn run(shared: &Arc<Shared>, store: &ConfigStore) {
     }
 }
 
-/// 真正碰磁盘的那一下。失败只在 stderr 留痕 —— 与本壳其它每一处配置写入同一
-/// 口径(见 `env_vars.rs` 文件头那条取舍)。
-fn write_once(store: &ConfigStore, snapshot: &Snapshot) {
+/// 真正碰磁盘的那一下。失败在 stderr 留痕,并经 `failures` 交回主线程推 toast
+/// (令牌过期除外,理由见下)。发送失败(主线程那头已经没了,退出排干时)
+/// 无所谓 —— stderr 已经留过痕。
+fn write_once(store: &ConfigStore, snapshot: &Snapshot, failures: &UnboundedSender<SaveFailure>) {
     match store.save(snapshot.token, &snapshot.config) {
         Ok(()) => {}
         Err(SaveError::StaleToken { provided, current }) => {
@@ -288,11 +404,14 @@ fn write_once(store: &ConfigStore, snapshot: &Snapshot) {
             // 手上这份快照是基于旧配置改的。**跳过是唯一正确的处置**:重试会
             // 拿陈旧内容盖掉刚读进来的那份。单进程壳里走不到这条(load 只在
             // 启动与令牌过期重试时发生,两处都在主线程)。
-            eprintln!(
-                "[config] 配置快照已过期(token {provided} != {current}),本次跳过不覆盖"
-            );
+            eprintln!("[config] 配置快照已过期(token {provided} != {current}),本次跳过不覆盖");
         }
-        Err(err) => eprintln!("[store] 配置保存失败: {err}"),
+        Err(err) => {
+            eprintln!("[store] 配置保存失败: {err}");
+            if let Some(failure) = SaveFailure::from_error(&err) {
+                let _ = failures.unbounded_send(failure);
+            }
+        }
     }
 }
 
@@ -395,7 +514,7 @@ mod tests {
         // 令牌只有 load 过才发放 —— 没有它 `save` 一律拒绝(这条红线不能绕)
         let token = store.load().expect("首次 load 建空库").token;
 
-        let writer = ConfigWriter::spawn(store.clone());
+        let (writer, mut failures) = ConfigWriter::spawn(store.clone(), false);
         for size in [14.0_f64, 15.0, 16.0, 17.0] {
             let mut config = AppConfig::default();
             config.ui_font_size = size;
@@ -405,8 +524,158 @@ mod tests {
 
         let back = store.read();
         assert_eq!(back.ui_font_size, 17.0, "落盘的是最后入队的那一份");
+        assert!(
+            failures.try_recv().is_err(),
+            "写成功不该往主线程回报任何失败"
+        );
 
         drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 启动备份挪到写线程之后,「备份留的是本次运行改动之前那一代」这条语义不能丢:
+    /// 写线程一起来就入队的保存,也必须排在备份后面落盘;排干要等备份做完。
+    #[test]
+    fn 启动备份先于任何一次保存() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mt-config-writer-backup-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ConfigStore::at(dir.join("config.json")));
+        // 第一次启动:建库,落一份字号 13 的配置
+        let token = store.load().expect("首次 load 建空库").token;
+        let initial = AppConfig {
+            ui_font_size: 13.0,
+            ..Default::default()
+        };
+        write_once(
+            &store,
+            &Snapshot {
+                token,
+                config: initial,
+            },
+            &mpsc::unbounded().0,
+        );
+        std::fs::remove_file(dir.join("config.db.bak")).ok();
+
+        // 第二次启动:加载不备份,写线程一起来就入队一次保存
+        let store = Arc::new(ConfigStore::at(dir.join("config.json")));
+        let token = store.load_without_backup().expect("第二次 load").token;
+        let (writer, _failures) = ConfigWriter::spawn(store.clone(), true);
+        let changed = AppConfig {
+            ui_font_size: 19.0,
+            ..Default::default()
+        };
+        writer.enqueue(&store, token, changed);
+        writer.drain_handle().drain();
+
+        assert_eq!(store.read().ui_font_size, 19.0, "保存照常落盘");
+        // 备份里必须是改动之前的那一代:拷到另一个目录当主库读回来
+        let bak_dir = dir.join("bak-check");
+        std::fs::create_dir_all(&bak_dir).unwrap();
+        std::fs::copy(dir.join("config.db.bak"), bak_dir.join("config.db"))
+            .expect("排干之后备份必然已经在了");
+        let from_bak = ConfigStore::at(bak_dir.join("config.json")).read();
+        assert_eq!(from_bak.ui_font_size, 13.0, "备份早于本次运行的第一次写入");
+
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 备份在写的时候排干不能放行(退出钩子等它做完)。
+    #[test]
+    fn 排干等启动备份做完() {
+        let mut queue = Queue::new();
+        queue.in_flight = Some(BACKUP_GENERATION);
+        assert!(!queue.is_idle(), "备份还在做");
+        queue.push(snapshot(1));
+        assert!(
+            queue.take().is_some(),
+            "队列本身照常取(写线程保证先做完备份再取)"
+        );
+        queue.finish(1);
+        queue.finish(BACKUP_GENERATION);
+        assert_eq!(queue.written, 1, "伪代数不把水位往回拉");
+    }
+
+    /// 去重:同一类失败在窗口内只放行第一次,窗口一过再放行一次。
+    #[test]
+    fn 同类失败窗口内只提示一次() {
+        let mut throttle = FailureThrottle::default();
+        let t0 = Instant::now();
+        assert!(throttle.admit(FailureKind::Db, t0), "第一次必须提示");
+        assert!(!throttle.admit(FailureKind::Db, t0 + Duration::from_secs(1)));
+        assert!(!throttle.admit(
+            FailureKind::Db,
+            t0 + FAILURE_NOTICE_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(
+            throttle.admit(FailureKind::Db, t0 + FAILURE_NOTICE_INTERVAL),
+            "窗口过了要再提示一次 —— 故障还在,用户得知道"
+        );
+        // 窗口从**上次放行**起算,不是从第一次
+        assert!(!throttle.admit(
+            FailureKind::Db,
+            t0 + FAILURE_NOTICE_INTERVAL + Duration::from_secs(30)
+        ));
+    }
+
+    /// 不同类互不压制:库写失败之后冒出来的写盘故障照样要提示。
+    #[test]
+    fn 不同类失败互不压制() {
+        let mut throttle = FailureThrottle::default();
+        let t0 = Instant::now();
+        assert!(throttle.admit(FailureKind::Db, t0));
+        assert!(throttle.admit(FailureKind::Io, t0));
+        assert!(throttle.admit(FailureKind::Serialize, t0));
+        assert!(!throttle.admit(FailureKind::Io, t0 + Duration::from_secs(5)));
+    }
+
+    /// 令牌过期是设计内的跳过,不是故障 —— 不报给用户;其余三类照实归类,
+    /// 正文去掉 `SaveError` 自带的前缀(toast 正文自己会说「没能写入磁盘」)。
+    #[test]
+    fn 令牌过期不回报且其余失败照实归类() {
+        let stale = SaveError::StaleToken {
+            provided: 1,
+            current: 2,
+        };
+        assert!(SaveFailure::from_error(&stale).is_none());
+
+        let io = SaveFailure::from_error(&SaveError::Io(std::io::Error::other("磁盘已满")))
+            .expect("写盘失败要回报");
+        assert_eq!(io.kind, FailureKind::Io);
+        assert_eq!(io.detail, "磁盘已满");
+
+        let db = SaveFailure::from_error(&SaveError::Db(
+            anyhow::anyhow!("database is locked").context("写 settings 失败"),
+        ))
+        .expect("库写失败要回报");
+        assert_eq!(db.kind, FailureKind::Db);
+        assert!(
+            db.detail.contains("写 settings 失败") && db.detail.contains("database is locked"),
+            "带上整条原因链: {}",
+            db.detail
+        );
+    }
+
+    /// 端到端:令牌对不上的快照被跳过,channel 里什么都没有。
+    #[test]
+    fn 过期快照被跳过且不回报() {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-config-writer-stale-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ConfigStore::at(dir.join("config.json"));
+        let token = store.load().expect("首次 load 建空库").token;
+        let (tx, mut rx) = mpsc::unbounded();
+        write_once(&store, &snapshot(token + 1), &tx);
+        assert!(rx.try_recv().is_err(), "令牌过期不是故障,不该弹给用户");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

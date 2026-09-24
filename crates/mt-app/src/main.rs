@@ -50,6 +50,7 @@
 mod activity_bar;
 mod ai;
 mod branch_family;
+mod cli;
 mod clipboard;
 mod command_library;
 mod date_picker;
@@ -92,15 +93,14 @@ mod pane_actions;
 mod pane_preview;
 mod persist;
 mod pricing;
-mod project_kind;
 mod project_list;
 mod project_switcher;
 mod project_tree;
 mod prompt;
+mod pty_slot;
 mod redraw;
 mod remote_directory_picker;
 mod remote_project;
-mod remote_ssh;
 mod search_modal;
 mod secrets;
 mod session_branch;
@@ -110,7 +110,6 @@ mod shell_ops;
 mod ssh_assoc;
 mod ssh_conn;
 mod ssh_panel;
-mod ssh_registry;
 mod startup_trace;
 mod store;
 mod syntax_languages;
@@ -149,7 +148,7 @@ use crate::focus_nav::Direction;
 use crate::i18n::{t, tr};
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
-use crate::store::{AppStore, DoneScope, PendingAlert};
+use crate::store::{AppStore, DoneScope, PendingAlert, StoreEvent};
 use crate::terminal_area::TerminalArea;
 use crate::title_bar::TitleBar;
 use crate::tray::{Tray, TrayEvent};
@@ -262,7 +261,7 @@ const MOTION_PANEL_SWAP_MS: u64 = 200;
 /// 个隔离出去,与 Tauri 那边靠 `--config` 覆盖 identifier 是同一招。
 ///
 /// 判据本体在 [`mt_config::active_data_dir`](mt_config::paths::active_data_dir)
-/// —— themes/ 也走同一口径(`ThemePacks::open()`),这里只是它的「不返错」版本,
+/// —— themes/ 也走同一口径(`mt_config::themes_dir`),这里只是它的「不返错」版本,
 /// 两处各判一次环境变量的旧写法已收掉。
 pub fn app_data_dir() -> PathBuf {
     mt_config::active_data_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -395,6 +394,7 @@ struct Workspace {
     activity_bar_hover_task: Option<Task<()>>,
     /// 弹窗毛玻璃背板的快照(见 [`frost`] 模块注释)。弹窗/用量面板从无到有的
     /// 第一帧抓一次,期间沿用,全关即弃 —— 开着时再抓会把弹窗自己抓进去。
+    /// 弃的时候连图集纹理一起摘(`drop_image`),光清字段每开一次弹窗漏一张。
     frost: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 后台模糊任务(抓帧在 UI 线程、模糊在后台,见 [`frost::finish`])。
     /// drop 即取消 —— 弹窗在模糊完成前就关掉时,结果直接作废。
@@ -426,14 +426,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // store 的每一次 notify 都顺带刷一遍托盘。**推送时机就这一处** ——
-        // 原版在七个调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 /
-        // 关项目 / 改布局 / 清未读 / 焦点变化 / 托盘配置变化 …),而这些在 GPUI
-        // 侧无一例外都以 `cx.notify()` 收尾,挂观察者等于把七处一次覆盖全。
-        // 代价是会被无关变化(改个字号)带着跑一遍,由 [`Tray::push`] 的签名去重挡住。
-        cx.observe(&store, |this, _, cx| {
-            this.sync_tray(cx);
-            cx.notify();
+        // 根视图的 render 直接读 store(三栏比例、徽标、未读数、背景……),
+        // 任何变化都照旧重画。
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 托盘只在它读的数据变了时才重算快照。**推送时机就这一处** —— 原版在七个
+        // 调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 / 关项目 / 改布局 /
+        // 清未读 / 焦点变化 / 托盘配置变化 …),对应的正是
+        // [`StoreEvent::touches_tray`] 放行的那几类事件。此前挂在 notify 上,AI 工作时
+        // 每个 pane 的 OSC 标题约 4Hz 就把快照白算一遍(再由 [`Tray::push`] 的签名
+        // 去重挡掉);签名去重仍留着,挡的是「事件来了但灯色菜单没变」。
+        cx.subscribe(&store, |this, _, event: &StoreEvent, cx| {
+            if event.touches_tray() {
+                this.sync_tray(cx);
+            }
         })
         .detach();
 
@@ -1331,6 +1336,23 @@ fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> gpui::Vi
     AnyView::from(view.clone()).cached(style)
 }
 
+/// 三栏(`columns_group`)在 body 横排里的宿主。
+///
+/// ⚠️ **`min_w(0)` 不能省**。flex 项的自动最小宽度是内容的 min-content,而叶子 tab 栏
+/// 里的 tab 片是 `flex_none`(72~200px),tab 栏的 `overflow_x_scroll` 挡不住它往上报;
+/// 一路上的 `size_full` / `min_w(0)` 只管各自那一层,这一层是唯一由 flex 定宽、又
+/// 没钉最小宽度的。分屏把每个叶子的宽度砍半、tab 一个不少,几条 tab 就能让
+/// min-content 超过窗口:宿主被撑宽,三栏的 `ResizableState` 按容器比例把中栏也放大
+/// (「左栏被撑宽」),右侧面板竖条与新 pane 被挤出窗口右缘。
+///
+/// 在 gpui 测试平台上按同一嵌套实测(1280 宽窗口):分屏后左叶 5 个 200px 的 tab,
+/// 不加时三栏被撑到 1496、中栏 300 → 352、竖条整条出界;单叶 12 个 tab 同样溢出。
+/// 加上之后各块 bounds 与 tab 少时逐一吻合。pane 套不套 view 级缓存两种写法测出来
+/// 完全相同 —— 与 `terminal_area::cached_terminal` 无关。
+fn columns_host() -> gpui::Div {
+    div().flex_1().min_w(px(0.0)).h_full()
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸变了就让两组分栏重新以持久化的绝对像素做种(见该函数注释)——
@@ -1394,25 +1416,39 @@ impl Render for Workspace {
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
         let frost_wanted = dialog_open || self.usage_open || lightbox_open;
         if frost_wanted {
-            if self.frost.is_none() && self.frost_task.is_none() {
-                if let Some(raw) = frost::capture_raw(window) {
-                    self.frost_task = Some(cx.spawn(async move |this, cx| {
-                        let img = cx
-                            .background_executor()
-                            .spawn(async move { frost::finish(raw) })
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.frost_task = None;
-                            if let Some(img) = img {
-                                this.frost = Some(img);
-                                cx.notify();
+            if self.frost.is_none()
+                && self.frost_task.is_none()
+                && let Some(raw) = frost::capture_raw(window)
+            {
+                self.frost_task = Some(cx.spawn(async move |this, cx| {
+                    let img = cx
+                        .background_executor()
+                        .spawn(async move { frost::finish(raw) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.frost_task = None;
+                        if let Some(img) = img {
+                            // 防御:按上面的门槛这里不该已有旧图,真有也得先把它
+                            // 的纹理摘掉再换。不在任何窗口的更新里,`drop_image`
+                            // 自己遍历得到本窗口;紧跟的 notify 让下一帧先重画再
+                            // 呈现,旧场景不会拿着已摘的图块再呈现一遍
+                            if let Some(old) = this.frost.replace(img) {
+                                cx.drop_image(old, None);
                             }
-                        });
-                    }));
-                }
+                            cx.notify();
+                        }
+                    });
+                }));
             }
         } else if self.frost.is_some() || self.frost_task.is_some() {
-            self.frost = None;
+            // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
+            // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
+            // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
+            // `App.windows`,见 `file_viewer::mermaid::release_mermaid_assets`);本帧不再画它,
+            // 上一帧的场景画完本帧就被替换,摘掉是安全的
+            if let Some(old) = self.frost.take() {
+                cx.drop_image(old, Some(window));
+            }
             self.frost_task = None;
         }
 
@@ -1481,7 +1517,9 @@ impl Render for Workspace {
                                 .min_w(px(0.0))
                                 // ⚠️ 终端区**不套** [`cached_panel`]:它就是每一拍
                                 // 真在变的那块内容,套上等于每帧必然未命中,白付
-                                // 一次 cache_key 比较
+                                // 一次 cache_key 比较。缓存下沉到了**每个 pane**
+                                // (`terminal_area::cached_terminal`):刷屏的那个
+                                // 未命中,闲着的照走缓存
                                 .child(self.workbench_area.clone()),
                         )
                         .when(terminals_visible && terminal_page_active, |el| {
@@ -1939,7 +1977,7 @@ impl Render for Workspace {
             // Activity Bar 的 flex 占位仍是 44px;视觉条本体在 columns 后面以
             // absolute sibling 画,让右伸的标签不被 columns 覆盖。
             .child(div().flex_none().w(px(activity_bar::WIDTH)).h_full())
-            .child(div().flex_1().h_full().child(columns_group))
+            .child(columns_host().child(columns_group))
             .child(toggle_strip)
             .children(drawer_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
@@ -2093,14 +2131,24 @@ impl Render for Workspace {
     }
 }
 
-/// 全局 panic 兜底:在默认 hook 之前补一行带**线程名**的 stderr。
+/// 全局 panic 兜底:在默认 hook 之前补一行带**线程名**的 stderr,再附一份 backtrace。
 ///
 /// 倒下的多半不是主线程 —— PTY reader、hook HTTP、500ms 轮询、mt-relay 的 tokio
 /// 任务都在各自线程里跑,默认 hook 只打消息与位置,事后从用户贴来的日志里认不出
-/// 是哪条线路。原 hook 链式调用在后,backtrace 行为(RUST_BACKTRACE)一个字不改。
+/// 是哪条线路。原 hook 链式调用在后,它自己的 backtrace 行为(RUST_BACKTRACE)不变。
+///
+/// backtrace **不看 RUST_BACKTRACE、无条件抓**(`force_capture`):装机版用户不会去设
+/// 环境变量,而 panic 往往复现不了第二次。按完整格式(`{:#}`)打,每帧带绝对地址:
+/// - 安装目录里有同版本的 `mini_term.pdb`(release 资产里单独下载)时,帧直接解析成
+///   函数名 + file:line(release 编了行号表,见根 Cargo.toml 的 `debug`);
+/// - 没有 PDB 时帧是 `<unknown>`,拿同一行里的模块基址换算成 RVA(地址 − 基址),
+///   事后对着 PDB 离线解析。基址每次启动随 ASLR 变,所以必须和帧地址记在一起。
+///
+/// 抓栈 + 符号化在 panic 线程上同步做,有 PDB 时首次要加载它(一百多 MB),慢一点
+/// 无妨:panic 本身就是稀有事件。
 ///
 /// release 的 Windows GUI 子系统下 stderr 由 [`logfile::install`] 接到
-/// `mini-term.log`(`main` 第一行,早于本钩子安装),装机版的 panic 于是也留档。
+/// `mini-term.log`(早于本钩子安装),装机版的 panic 于是也留档。
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2116,11 +2164,38 @@ fn install_panic_hook() {
             location,
             info.payload_as_str().unwrap_or("<non-string payload>")
         );
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        eprintln!(
+            "[panic] backtrace (thread={name}, module base {}):\n{backtrace:#}",
+            module_base()
+        );
         default_hook(info);
     }));
 }
 
+/// 主程序模块的加载基址(十六进制),给 backtrace 的离线符号化换算 RVA 用。
+#[cfg(windows)]
+fn module_base() -> String {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: 传 None 取的是当前进程 exe 自身的模块句柄,不增引用计数、无需释放。
+    match unsafe { GetModuleHandleW(None) } {
+        Ok(module) => format!("{:#x}", module.0 as usize),
+        Err(_) => "<unknown>".to_string(),
+    }
+}
+
+/// 非 Windows:地址解析靠符号表(release 已剥)或 core dump,不在这条链路上。
+#[cfg(not(windows))]
+fn module_base() -> String {
+    "<n/a>".to_string()
+}
+
 fn main() {
+    // 卸载器调起的无窗口模式(`--unregister-hooks`,见 `cli` 模块注释):排在一切之前,
+    // 做完即退 —— 不接管日志(那会在 AppData 下建数据目录)、不预载 ConPTY、不碰 gpui。
+    if let Some(code) = cli::run_if_requested() {
+        std::process::exit(code);
+    }
     // 装机版没有控制台,stderr 先接到 `mini-term.log`(见 `logfile` 模块注释)。
     // 必须排在埋点之前:`startup_trace::init` 自己就要打第一条 `run() enter`。
     // 有控制台时它是空操作,dev 实例的日志照旧附着当前终端。
@@ -2131,6 +2206,19 @@ fn main() {
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
+    // 便携 ConPTY 预载(exe 旁 `portable-conpty\` 里的 Windows Terminal conpty.dll +
+    // OpenConsole.exe;`MT_DISABLE_PORTABLE_CONPTY=1` 跳过,见 `mt_pty::conpty`)。
+    //
+    // ⚠️ 必须早于任何 PTY spawn:portable-pty 第一次 openpty 时按裸名解析
+    // `conpty.dll`,那一刻已加载的模块才算数,之后再预载不影响已解析的函数表。
+    // 放在这里 —— 主线程上同步做完、在 `application()` 建出平台层**之前** —— 就天然
+    // 满足:PTY 一律在 background executor 上起(`pane` 模块注释「PTY 在后台起」),
+    // 而 executor 的线程与任务都要等平台层建出来、`app.run` 的回调跑起来之后才有;
+    // 最早的一批(`hydrate_project`)还排在首帧之后。
+    // 线程创建本身是 happens-before 边,这里的 LoadLibrary 对它们一定可见。
+    // 代价:读三个文件的 PE 头 + 一次 LoadLibrary,实测不到 1ms(下面的埋点可量)。
+    mt_pty::conpty::initialize_default();
+    startup_trace::mark("conpty bootstrap done");
     // 组件库的图标资产源。gpui 的 `svg()` 一律经 `AssetSource` 取字节,没挂资产源时
     // 上游组件里每一枚 `Icon::new(IconName::..)` 都画成**空白**(只在日志里留一行,
     // 编译期与运行期界面上都毫无提示)—— 0.5.1 时代 crate 包里根本不带 svg,于是
@@ -2227,21 +2315,37 @@ fn main() {
                 }
             }
         };
+        // 配置在首帧前只读**一遍**:这一次严格加载的结果同时交给界面语言、hook 开关
+        // 与 `AppStore`。此前是先 `read()` 整读一遍只为取这两个字段,`AppStore::new`
+        // 里再 `load()` 整读一遍。这一代库备份也不在这里同步做了 —— 挪成配置写线程
+        // 的第一件活,「备份先于本次运行的任何写入」由单写者线程的顺序保证(见
+        // `store::config_writer` 模块注释)。
+        let loaded = config_store.load_without_backup();
+        startup_trace::mark("setup: read_config done");
+        // 加载失败时 `AppStore` 按默认配置以只读模式跑,这两个字段同样取默认值
+        // (与此前 `read()` 失败时回落默认配置的结果一致)
+        let (locale, hook_enabled) = match &loaded {
+            Ok(loaded) => (loaded.config.locale.clone(), loaded.config.hook_enabled),
+            Err(_) => {
+                let fallback = mt_config::AppConfig::default();
+                (fallback.locale, fallback.hook_enabled)
+            }
+        };
         // 界面语言必须在**任何视图建出来之前**定下来:`t()` 读的是进程级全局量,
         // 晚一步的话首帧会以默认中文画出来再被刷成英文(闪一下)。
         // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
         // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
-        let startup_config = config_store.read();
-        startup_trace::mark("setup: read_config done");
-        i18n::install(startup_config.locale.as_deref());
+        i18n::install(locale.as_deref());
 
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
         // 走 mt_config::app_data_dir(),端口文件与装机版落在同一处。
-        let hook_enabled = startup_config.hook_enabled;
         let (ai_bridge, ai_events) = AiBridge::new(hook_enabled);
         let ai_for_quit = ai_bridge.clone();
 
-        AppStore::set_global(cx.new(|cx| AppStore::new(config_store, ai_bridge, cx)), cx);
+        AppStore::set_global(
+            cx.new(|cx| AppStore::new(config_store, loaded, ai_bridge, cx)),
+            cx,
+        );
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
 
@@ -2255,9 +2359,11 @@ fn main() {
         store.update(cx, |store, cx| store.apply_theme_from_config(None, cx));
 
         // 当前项目的终端要补起来(布局是从 layout.db 恢复的,PTY 当然没了),但
-        // **不在这里补** —— 每个 pane 的 openpty + 进程 spawn 都在主线程串行走,
-        // 恢复六七个 pane 就是几百毫秒,放在开窗之前等于让首帧陪着等。挪到首帧
-        // 呈现之后(见下方 `open_window` 之后那段),窗口先出来,终端随后贴上。
+        // **不在这里补** —— 挪到首帧呈现之后(见下方 `open_window` 之后那段),窗口
+        // 先出来,终端随后贴上。当初挪它是因为每个 pane 的 openpty + 进程 spawn 都在
+        // 主线程串行走(实测恢复 6 个 pane 约 110ms,慢机器 / 网络盘上是几百毫秒到
+        // 几秒);现在 spawn 与续接 cwd 反查已进后台(见 `pane` 模块注释「PTY 在后台
+        // 起」),主线程上只剩建视图,这个时机照旧保留。
         let active = store.read(cx).active_project_id.clone();
         startup_trace::mark("setup: config applied (layout restored)");
 
@@ -2268,7 +2374,7 @@ fn main() {
             ai_for_quit.shutdown();
             // SSH 会话池优雅断开(对齐装机版 `RunEvent::Exit` 里的那一调)。
             // 池没建过时是 no-op,不会为此现起 tokio 运行时。
-            remote_ssh::shutdown_on_exit();
+            mt_remote::shutdown_on_exit();
             async {}
         })
         .detach();
@@ -2363,6 +2469,7 @@ fn main() {
         // 常驻驱动,另外两家不一定)。
         //
         // 代价是 PTY 晚一个 vsync 起步(十几毫秒),换来的是窗口不再陪 spawn 干等。
+        // (spawn 本身已在后台跑,这里只是把「建视图 + 派发后台任务」排到首帧之后。)
         if let Some(project_id) = active {
             let store = store.clone();
             let _ = window.update(cx, |_, window, _| {
@@ -2378,10 +2485,46 @@ fn main() {
                                 store.focus_pane(&project_id, &pane_id, window, cx);
                             }
                         });
-                        startup_trace::mark("hydrate: PTYs spawned (after first frame)");
+                        // PTY 此刻只是派发给了后台,真正起好在各 pane 回填时
+                        startup_trace::mark("hydrate: PTY spawns dispatched (after first frame)");
+                    });
+                });
+            });
+        }
+
+        // 持久化降级的告知:配置加载失败 → 本次只读;布局库不可用 → 布局不落盘。
+        // 此前两者都只在 stderr 留一行,用户照常改了一整天、重启后全丢才发现。
+        // 同样排在**首帧呈现之后**(两层 `on_next_frame`,理由同上):弹窗挂在
+        // Root 上,首帧之前开的话会跟着窗口一起闪出来。只有一个「知道了」。
+        if let Some(message) = store.read(cx).read_only_state().dialog_message() {
+            let _ = window.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.refresh();
+                    window.on_next_frame(move |window, cx| {
+                        prompt::show_alert(t("app", "storageIssueTitle"), message, window, cx);
                     });
                 });
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三栏宿主必须能收缩到内容 min-content 以下,理由与实测数据见 [`columns_host`]。
+    /// 布局本身要真窗口才能跑(本 crate 不开 gpui 的 test-support),这里钉的是
+    /// 那条决定性的样式:哪天有人把 `min_w(0)` 当冗余删了,这条先红。
+    #[test]
+    fn 三栏宿主能收缩到内容最小宽度以下() {
+        let mut host = columns_host();
+        let style = host.style();
+        assert_eq!(
+            style.min_size.width,
+            Some(px(0.0).into()),
+            "min_w(0) 不能省"
+        );
+        assert_eq!(style.flex_grow, Some(1.0), "仍然吃满 body 的剩余宽度");
+    }
 }

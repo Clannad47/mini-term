@@ -90,6 +90,10 @@ pub fn active_data_dir() -> Result<PathBuf> {
 }
 
 /// `{active_data_dir}/themes`。
+///
+/// 主题包文件层([`ThemePacks`](crate::ThemePacks),本体在 `mt-theme-packs`)不认
+/// 数据目录口径,宿主拿这条路径交给 `ThemePacks::at` —— 原先的 `ThemePacks::open()`
+/// 就是这一句,随那个 crate 拆出去时收回到调用方。
 pub fn themes_dir() -> Result<PathBuf> {
     Ok(active_data_dir()?.join("themes"))
 }
@@ -221,7 +225,7 @@ mod tests {
 
     /// 皮肤目录挂在**生效中**的数据目录下 —— dev 实例设了 `MT_APP_DATA_DIR`
     /// 就该看见隔离目录里的皮肤包(此前钉死在装机版目录上,
-    /// mt-app 只好自己拼路径绕开 `ThemePacks::open()`)。
+    /// mt-app 只好自己拼路径绕开当时的 `ThemePacks::open()`)。
     #[test]
     fn 皮肤目录跟随生效数据目录() {
         assert_eq!(themes_dir().unwrap(), active_data_dir().unwrap().join("themes"));

@@ -79,6 +79,11 @@ const SLIDE_IN_MS: u64 = 250;
 /// `wsl-info` 那条用的占位项目 id(`App.tsx:369`)。**不参与任何跳转**,
 /// 也不会匹配到真实项目 —— 关项目时的清理因此天然放过它。
 pub const WSL_INFO_PROJECT: &str = "__wsl_info__";
+/// 配置后台写盘失败那条用的占位项目 id。与 [`WSL_INFO_PROJECT`] 同一种用法:
+/// 不跳转、不随关项目清理。
+const CONFIG_SAVE_PROJECT: &str = "__config_save__";
+/// 调外部程序失败那条用的占位项目 id(同上)。
+const OPEN_EXTERNAL_PROJECT: &str = "__open_external__";
 
 /// 队列里的一条。字段与 `types.ts:306-319` 的 `AiCompletionNotification` 对齐
 /// (`timestamp` 没搬:原版留着它也只是排序用,而这里本来就是插入序)。
@@ -284,6 +289,34 @@ pub fn push_wsl_override(distro: &str, unix_path: &str, cx: &mut App) {
     );
 }
 
+/// 配置在后台写盘失败(盘满 / 权限 / 杀软锁库)的告知。
+///
+/// 由 `store::config_writer` 的写线程经 channel 交回主线程后推(写线程里不碰
+/// GPUI)。不属于任何项目:标题是合成的「配置保存失败」,`paste-error` 档 ——
+/// `!` 图标、点击只关闭。**去重在调用方**(同类 60s 只提示一次),这里不再压。
+pub fn push_config_save_failure(detail: &str, cx: &mut App) {
+    push_message(
+        ToastKind::PasteError,
+        CONFIG_SAVE_PROJECT.to_string(),
+        t("app", "configSaveFailed.title").to_string(),
+        crate::i18n::tr!("app", "configSaveFailed.message", detail = detail),
+        cx,
+    );
+}
+
+/// 调外部程序(编辑器 / 默认程序 / 浏览器 / 文件管理器)失败的告知,由
+/// `fs_ops::open_external` 推。不属于任何项目,`paste-error` 档(`!` 图标、点击
+/// 只关闭);**不去重** —— 每次点击都是一次独立的尝试,该有一次回应。
+pub fn push_open_external_failure(title: String, message: String, cx: &mut App) {
+    push_message(
+        ToastKind::PasteError,
+        OPEN_EXTERNAL_PROJECT.to_string(),
+        title,
+        message,
+        cx,
+    );
+}
+
 /// 关项目 → 它的 toast 一并撤掉(`store.ts:859`)。
 pub fn remove_project(project_id: &str, cx: &mut App) {
     layer(cx).update(cx, |layer, cx| {
@@ -348,10 +381,11 @@ impl ToastLayer {
         };
 
         // ⚠️ **必须 defer**:切项目会 `hydrate_project` → 起 PTY,而起 PTY 有一条
-        // 支路会推 WSL 提示 toast(见 `TerminalPane::new`)。此刻我们正身处
+        // 支路会推 WSL 提示 toast(见 `TerminalPane::finish_spawn`)。此刻我们正身处
         // `ToastLayer` 自己的 update 里,那一推就是同一实体的嵌套 update ——
         // gpui 当场 panic。`window.defer` 把整段挪到本轮 effect 之后,
-        // 那时 ToastLayer 的借用早已释放。
+        // 那时 ToastLayer 的借用早已释放。(PTY 挪后台之后那一推已是回填时异步
+        // 发生的,这条路眼下撞不上;defer 照留 —— 切项目链路上别的同步推送同样适用。)
         window.defer(cx, move |window, cx| {
             let store = AppStore::global(cx);
             // 队列是异步消失的,点下去时那个项目可能已经被删了

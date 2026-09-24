@@ -7,6 +7,18 @@
 //! 3. **退出上报**:子进程退出 → 发 [`PaneEvent::Exited`],由 store 落成 `error`
 //!    状态(与旧版 `pty-exit` → `updatePaneStatusByPty('error')` 同语义)。
 //!
+//! # PTY 在后台起
+//!
+//! [`TerminalPane::new`] 只在主线程上建 emulator 与视图、分好 `pty_id`,**立即返回**;
+//! 「定启动参数(远程预检 / 续接 cwd 反查)→ spawn → (SSH 远程项目)arm 自动填充」
+//! 整段丢到 `background_executor`,完成后回主线程回填([`TerminalPane::finish_spawn`])。
+//! 起 PTY 在 Windows 上要逐个 PATH 目录 × PATHEXT 去 stat 裸名、`is_dir(cwd)`、建
+//! ConPTY、起子进程,本机一次十几毫秒、偶发几百毫秒,cwd 或 PATH 里挂着断开的网络盘
+//! 时能冻结好几秒 —— 恢复六个 pane 就是整窗卡一下。
+//!
+//! 回填前的写入 / resize / 退出通知怎么攒、回填时按什么顺序交出去,全在
+//! [`crate::pty_slot`](与 GPUI 无关,有单测)。
+//!
 //! # 渲染/键盘/IME 归 [`mt_ui::TerminalView`]
 //!
 //! 本模块**不**处理按键:`TerminalView` 自己 `track_focus` + `key_context("Terminal")`
@@ -43,7 +55,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
@@ -68,6 +80,7 @@ use crate::markers::{self, MarkerBatch, MarkerSubmit};
 use crate::menu::{self, MenuItem};
 use crate::notify::ToastKind;
 use crate::overlay;
+use crate::pty_slot::{PtyPhase, PtySlot};
 use crate::redraw;
 use crate::store::AppStore;
 use crate::toast;
@@ -91,6 +104,16 @@ pub enum PaneEvent {
     /// **已按 [`OSC_TITLE_PERIOD`] 合并过**:发上来的是一个窗口内的最新值,
     /// 不是每次 OSC 序列都发一条。清洗与去重在 store 侧。
     Title(Option<String>),
+    /// 启动恢复时后台反查到的会话 cwd(见 [`PreparedLaunch::resume_cwd`]),
+    /// 回填完成后交还 store 随身份写回并落盘,下次重启免查。
+    ResumeCwd(ResumeCwd),
+}
+
+/// 续接反查所得的会话启动目录,连同它属于哪个会话。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeCwd {
+    pub session_id: String,
+    pub cwd: String,
 }
 
 /// reader / watcher 线程 → 主线程的信号。
@@ -103,7 +126,16 @@ pub struct TerminalPane {
     /// 后端 pane 编号,见模块注释。
     pty_id: u32,
     emulator: Arc<TerminalEmulator>,
-    pty: Option<PtySession>,
+    /// PTY 会话。**建 pane 时还不存在**(后台在起),见模块注释「PTY 在后台起」与
+    /// [`crate::pty_slot`]。
+    pty: PtySlot<PtySession>,
+    /// 后台起 PTY 的那条前台任务(等后台结果、回主线程回填)。实体释放时随字段一起
+    /// 丢掉 —— 后台还没开跑就连 spawn 都不做;已经在跑的,产出的会话随之被丢弃
+    /// (= kill)。`shutdown` 不动它,理由见那边。
+    _spawn: Task<()>,
+    /// 等「PTY 起没起来」定局的人(移动端发起会话的回执)。定局即逐个回 `true/false`,
+    /// pane 没了则 sender 随之丢弃,接收端拿到 `Canceled` 按失败算。
+    spawn_waiters: Vec<oneshot::Sender<bool>>,
     focus: FocusHandle,
     /// 渲染 + 键盘 + IME 全在这一层([`mt_ui::TerminalView`])。
     ///
@@ -118,7 +150,8 @@ pub struct TerminalPane {
     ai: AiBridge,
     /// 子进程已退出。
     exited: bool,
-    /// PTY 起不来时的错误文本(直接显示给用户,不吞)。
+    /// PTY 起不来时的错误文本(直接显示给用户,不吞)。后台起完之前是 `None` ——
+    /// 「还在起」与「起失败」要看 [`Self::spawn_settled`],不能拿它当判据。
     spawn_error: Option<String>,
     /// 「已复制」气泡的落点(**元素相对**坐标)。`None` = 不显示。
     /// 1s 后由自撤任务清掉,与旧版 `tipTimer` 同语义。
@@ -189,52 +222,108 @@ const OSC_TITLE_PERIOD: Duration = Duration::from_millis(250);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
-/// 起 pane 时的 SSH 远程附加项(本地 pane 传 [`Default::default()`])。
+/// 起 pane 的「启动预案」:在**后台线程**上兑现成真正要 spawn 的东西。
 ///
-/// 单独一个结构体是为了不让 [`TerminalPane::new`] 的参数列表再长两格 ——
-/// 两项都只在「项目是 SSH 远程项目」时才非空。
-#[derive(Default)]
-pub struct RemoteLaunchExtras {
-    /// SSH 登录密码。spawn 成功后**立刻**注册 autofill。
+/// 为什么是闭包而不是现成的 [`PtySpawn`]:有两条支路光是定 spec 本身就要碰盘 ——
+/// SSH 远程项目的预检(PATH 里找 ssh 客户端、复制私钥并起 `icacls` 收紧权限、
+/// 解开已存密码)与启动恢复的续接 cwd 反查(翻 `~/.claude/projects`)。它们与
+/// spawn 进同一个后台任务,按「先定 spec、再 spawn」的顺序跑,主线程一步都不等。
+///
+/// 返回 `Err(文本)` = 预检失败(断链 / 本机缺 ssh 客户端):**不 spawn**,直接把
+/// 这条错误画在 pane 里 —— 与装机版 `create_pty` 返回 `Err` 后前端落 `spawnErrors`
+/// 同样效果,不留半开的会话。
+pub type PaneLaunch = Box<dyn FnOnce() -> Result<PreparedLaunch, String> + Send>;
+
+/// [`PaneLaunch`] 兑现后的产物。
+pub struct PreparedLaunch {
+    pub spec: PtySpawn,
+    /// SSH 登录密码(远程项目)。spawn 成功后**在同一个后台任务里立刻**注册
+    /// autofill,不等回主线程。
     ///
     /// ⚠️ 装机版是在 `openpty` 之后、`spawn_command` 之前 arm 的(那里 PTY 与
     /// reader 是两步)。GPUI 侧 `PtySession::spawn` 一步就把 reader 线程起了,
     /// 只能事后 arm —— 窗口是「spawn 返回」到「下一行」的几微秒,而 ssh 的密码
     /// 提示要等 TCP 连接 + 版本协商 + 密钥交换(最快也几十毫秒),够不着。
-    /// 真要彻底消除得给 `mt_pty::PtyOptions` 加一个 autofill 字段,那是改
-    /// mt-pty 公开 API,本批不做(记档见 BB-a 报告)。
+    /// **不能**挪到主线程回填时再 arm:那要排到主线程下一次空闲,窗口一下子放大
+    /// 到不可控。真要彻底消除得给 `mt_pty::PtyOptions` 加一个 autofill 字段,
+    /// 那是改 mt-pty 公开 API,本批不做(记档见 BB-a 报告)。
     pub ssh_password: Option<String>,
-    /// 预检失败(断链 / 本机缺 ssh 客户端):**不 spawn**,直接把这条错误画在
-    /// pane 里 —— 与装机版 `create_pty` 返回 `Err` 后前端落 `spawnErrors` 同样效果。
-    pub preflight_error: Option<String>,
+    /// 续接反查所得的会话 cwd(只有启动恢复的续接 pane 才有)。回填后经
+    /// [`PaneEvent::ResumeCwd`] 交还 store 写回。
+    pub resume_cwd: Option<ResumeCwd>,
+}
+
+/// 后台任务交回主线程的结果。
+struct SpawnOutcome {
+    session: anyhow::Result<PtySession>,
+    resume_cwd: Option<ResumeCwd>,
+}
+
+/// 后台线程上的那一段:兑现启动预案 → spawn →(远程)紧贴 spawn arm 自动填充。
+fn spawn_in_background<F>(
+    launch: PaneLaunch,
+    options: mt_pty::PtyOptions,
+    on_output: F,
+) -> SpawnOutcome
+where
+    F: FnMut(&[u8]) + Send + 'static,
+{
+    let prepared = match launch() {
+        Ok(prepared) => prepared,
+        // 预检失败:根本不 spawn。`options` / `on_output` 随之丢弃,它们手里的
+        // 信号 sender 一没,pane 的唤醒循环自然收摊(与此前起失败同)。
+        Err(err) => {
+            return SpawnOutcome {
+                session: Err(anyhow::anyhow!(err)),
+                resume_cwd: None,
+            };
+        }
+    };
+    let session = PtySession::spawn_with_options(prepared.spec, options, on_output);
+    // SSH 远程 pane:密码自动填充**紧贴 spawn** 注册(见 `PreparedLaunch` 的字段
+    // 注释)。`disarm_on_input = true`:远程项目 pane 起来之后不再写任何命令,首个
+    // `write` 即用户交互 —— 一打字就解除,避免 SSH 登录密码被灌进后续 `su` /
+    // `mysql -p` / `passwd` 的提示里。回填前用户抢先敲的字节在队列里,冲刷时照样
+    // 经 `write` 解除,口径不变。
+    if let (Ok(session), Some(password)) = (session.as_ref(), prepared.ssh_password) {
+        session.arm_ssh_autofill(password, true);
+    }
+    SpawnOutcome {
+        session,
+        resume_cwd: prepared.resume_cwd,
+    }
 }
 
 impl TerminalPane {
+    /// 建 emulator 与视图、登记 AI 感知后**立即返回**;PTY 由 `launch` 在后台起,
+    /// 完成后回主线程回填(见模块注释「PTY 在后台起」)。
+    ///
     /// `user_env` 是项目级环境变量:走 [`mt_pty::PtyOptions::user_env`] 而不是
     /// `spec.env`,因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改配置
     /// (现在是 `config.db`)也覆盖不掉内部协议变量。
-    ///
-    /// `remote` 见 [`RemoteLaunchExtras`];本地 pane 传 `Default::default()`。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pty_id: u32,
-        spec: PtySpawn,
+        launch: PaneLaunch,
         user_env: Vec<(String, String)>,
         style: TerminalStyle,
         theme: TerminalTheme,
         dwell: DwellConfig,
         scrollback: usize,
         ai: AiBridge,
-        remote: RemoteLaunchExtras,
         cx: &mut Context<Self>,
     ) -> Self {
         // 首帧还没量过字体,先给个能跑的初值;真正的尺寸在元素 prepaint 里量出来
-        // 之后通过 on_grid_resize 回来纠正。
+        // 之后通过 on_grid_resize 回来纠正(PTY 还没回填时记在 `PtySlot` 上,
+        // 回填时补下发)。
         //
         // 回滚行数(`config.terminalScrollback`)必须在这一刻喂进 alacritty 的
         // `term::Config`:它决定 grid 的历史容量,建完再改只能靠 `set_options`。
         let emulator = Arc::new(TerminalEmulator::with_scrollback(
-            TermSize::new(spec.cols as usize, spec.rows as usize),
+            TermSize::new(
+                mt_pty::INITIAL_PTY_COLS as usize,
+                mt_pty::INITIAL_PTY_ROWS as usize,
+            ),
             scrollback,
         ));
 
@@ -245,15 +334,10 @@ impl TerminalPane {
             .on_exit(move |code| {
                 let _ = exit_tx.unbounded_send(PaneSignal::Exit(code));
             });
-
-        // 远程预检失败:根本不 spawn(装机版是 `create_pty` 直接返回 Err,
-        // 连 PTY 都不开 —— 这里同样不留半开的会话)。
-        let pty = if let Some(err) = remote.preflight_error.clone() {
-            Err(anyhow::anyhow!(err))
-        } else {
+        let on_output = {
             let emulator = emulator.clone();
             let ai = ai.clone();
-            PtySession::spawn_with_options(spec, options, move |bytes| {
+            move |bytes: &[u8]| {
                 // reader 线程:直接推进状态机,没有 IPC、没有批缓冲、没有序列化。
                 emulator.advance(bytes);
                 // AI 感知的输出旁路(命令 echo 回扫 + 输出活跃度)
@@ -264,35 +348,26 @@ impl TerminalPane {
                 // 详见 `git_watch` 模块注释(后续 Y 批的 git 着色与本条共用)。
                 crate::git_watch::observe_output(pty_id, bytes);
                 let _ = tx.unbounded_send(PaneSignal::Output);
-            })
-        };
-
-        let (pty, spawn_error) = match pty {
-            Ok(pty) => (Some(pty), None),
-            Err(err) => {
-                let msg = format!("{err:#}");
-                eprintln!("[pane {pty_id}] PTY 启动失败: {msg}");
-                (None, Some(msg))
             }
         };
 
-        // SSH 远程 pane:密码自动填充**紧贴 spawn** 注册(见 `RemoteLaunchExtras`
-        // 的字段注释)。`disarm_on_input = true`:远程项目 pane 起来之后不再写
-        // 任何命令,首个 `write` 即用户交互 —— 一打字就解除,避免 SSH 登录密码
-        // 被灌进后续 `su` / `mysql -p` / `passwd` 的提示里。
-        if let (Some(session), Some(password)) = (pty.as_ref(), remote.ssh_password) {
-            session.arm_ssh_autofill(password, true);
-        }
-
-        // WSL 启动器重写的一次性告知(`App.tsx:367-379`)。判定与重写早在
-        // `mt_pty::launch::plan` 里做完了,结论挂在会话上 —— 这里只是**唯一的
-        // 读取方**(此前全仓零调用,提示因此一直缺着)。
+        // 起 PTY:整段在后台跑,回主线程回填。
         //
-        // 「一次性」= 每个新 PTY 各推一次,不去重(原版同款):同一个项目开两个
-        // 终端就该看到两条,那正是「这两个都被改用 wsl.exe 启动了」的意思。
-        if let Some(wsl) = pty.as_ref().and_then(|p| p.wsl_override()) {
-            toast::push_wsl_override(&wsl.distro, &wsl.unix_path, cx);
-        }
+        // 回填前 pane 没了有两种形态,都不留孤儿进程:
+        // - **实体已释放**(或应用在退出):`this.update` 返回 Err,闭包连同捕获的
+        //   outcome 一起被丢弃,`PtySession::drop` 当场杀子进程;实体释放时这条任务
+        //   本身也随 `_spawn` 字段一起被丢掉,后台还没开跑的话连 spawn 都不做;
+        // - **只是关掉了**(`shutdown`,实体还在):`PtySlot` 已是 Closed,
+        //   `finish_spawn` 里 `backfill` 把会话退回来丢弃。
+        let spawn = cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { spawn_in_background(launch, options, on_output) })
+                .await;
+            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                pane.finish_spawn(outcome, cx)
+            });
+        });
 
         let wake = cx.spawn(async move |this, cx| {
             while let Some(signal) = rx.next().await {
@@ -310,11 +385,10 @@ impl TerminalPane {
                 if this
                     .update(cx, |pane, cx| {
                         pane.drain_term_events(cx);
-                        if let Some(code) = exit {
-                            pane.exited = true;
-                            cx.emit(PaneEvent::Exited(code));
-                            // 退出是一次性事件:不进节拍器,当场画完收工
-                            cx.notify();
+                        // 子进程快到回填之前就退了:先挂着,回填完成后再报
+                        // (`PtySlot::note_exit`)—— 退出永远排在回填之后
+                        if let Some(code) = exit.and_then(|code| pane.pty.note_exit(code)) {
+                            pane.emit_exit(code, cx);
                         }
                     })
                     .is_err()
@@ -359,9 +433,12 @@ impl TerminalPane {
                 .on_grid_resize(move |size: TermSize, _window, cx| {
                     // grid 尺寸是渲染侧量出来的(可用像素 ÷ cell 尺寸),PTY 必须跟着改,
                     // 否则 shell 换行位置与画面对不上。
+                    // PTY 还在后台起时只记下最新尺寸,回填时补下发(`PtySlot::resize`)。
                     let _ = this.update(cx, |pane: &mut TerminalPane, _cx| {
-                        let Some(pty) = pane.pty.as_ref() else { return };
-                        match pty.resize_if_changed(size.screen_lines as u16, size.columns as u16) {
+                        match pane
+                            .pty
+                            .resize(size.screen_lines as u16, size.columns as u16)
+                        {
                             // 只有**真实下发**的 resize 才开重绘冷却窗口:同尺寸的
                             // resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃
                             Ok(true) => pane.ai.perception().note_resize(pane.pty_id),
@@ -415,14 +492,16 @@ impl TerminalPane {
         Self {
             pty_id,
             emulator,
-            pty,
+            pty: PtySlot::starting(),
+            _spawn: spawn,
+            spawn_waiters: Vec::new(),
             focus,
             view,
             style,
             theme,
             ai,
             exited: false,
-            spawn_error,
+            spawn_error: None,
             copied_tip: None,
             _tip_timer: None,
             search,
@@ -436,14 +515,101 @@ impl TerminalPane {
         }
     }
 
-    /// PTY 起不来时的错误原文;`None` = 起来了。
+    /// 后台起 PTY 的结果回到主线程(只由 `new` 里那条前台任务调用)。
     ///
-    /// 视图里已经把它画成一行红字(见 `Render` 实现),这个访问器是给**回执**用的:
-    /// 移动端发起会话要区分「pane 建出来了」与「PTY 真的起来了」——
-    /// [`Self::write`] 在没有 PTY 时是静默丢弃的,不看这一条就会把「终端起不来」
-    /// 报成成功,手机侧只能干等 15s 超时。
-    pub fn spawn_error(&self) -> Option<&str> {
-        self.spawn_error.as_deref()
+    /// 成功:回填(补 resize → 按序冲刷空窗期的写入,见 [`PtySlot::backfill`])→
+    /// WSL 提示 → 答复等回执的人 → 交还续接反查所得的 cwd → 补报空窗期挂着的退出。
+    /// 失败:落 `spawn_error` 画一行红字(与此前同步起失败同一效果)。
+    /// 回填前 pane 已关闭(`shutdown` 过):会话退回来当场丢弃(= kill),什么都不报。
+    fn finish_spawn(&mut self, outcome: SpawnOutcome, cx: &mut Context<Self>) {
+        let SpawnOutcome {
+            session,
+            resume_cwd,
+        } = outcome;
+        let exit = match session {
+            Ok(session) => {
+                let wsl = session.wsl_override().cloned();
+                let filled = match self.pty.backfill(session) {
+                    Ok(filled) => filled,
+                    Err(session) => {
+                        // `PtySession::drop`:先 kill 子进程,再把 master 丢到后台销毁
+                        drop(session);
+                        return;
+                    }
+                };
+                match filled.resized {
+                    Some(Ok(true)) => self.ai.perception().note_resize(self.pty_id),
+                    Some(Err(err)) => eprintln!("[pane {}] resize 失败: {err:#}", self.pty_id),
+                    Some(Ok(false)) | None => {}
+                }
+                for err in &filled.write_errors {
+                    eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+                }
+                // WSL 启动器重写的一次性告知(`App.tsx:367-379`)。判定与重写早在
+                // `mt_pty::launch::plan` 里做完了,结论挂在会话上 —— 这里只是**唯一的
+                // 读取方**(此前全仓零调用,提示因此一直缺着)。
+                //
+                // 「一次性」= 每个新 PTY 各推一次,不去重(原版同款):同一个项目开两个
+                // 终端就该看到两条,那正是「这两个都被改用 wsl.exe 启动了」的意思。
+                if let Some(wsl) = wsl {
+                    toast::push_wsl_override(&wsl.distro, &wsl.unix_path, cx);
+                }
+                self.settle_spawn_waiters(true);
+                filled.exit
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                eprintln!("[pane {}] PTY 启动失败: {msg}", self.pty_id);
+                // 已关闭的 pane 不必再画错误
+                if !self.pty.fail() {
+                    return;
+                }
+                self.spawn_error = Some(msg);
+                self.settle_spawn_waiters(false);
+                None
+            }
+        };
+        // 反查结果与起没起来无关(挪后台之前也是起失败照样写回),交还即可
+        if let Some(found) = resume_cwd {
+            cx.emit(PaneEvent::ResumeCwd(found));
+        }
+        if let Some(code) = exit {
+            self.emit_exit(code, cx);
+        }
+        cx.notify();
+    }
+
+    /// 子进程退出:角标 + 上报。只从「回填之后」的路径进来(见 `PtySlot::note_exit`)。
+    fn emit_exit(&mut self, code: Option<u32>, cx: &mut Context<Self>) {
+        self.exited = true;
+        cx.emit(PaneEvent::Exited(code));
+        // 退出是一次性事件:不进节拍器,当场画完收工
+        cx.notify();
+    }
+
+    /// PTY 起没起来,定局后答复(`true` = 起来了)。
+    ///
+    /// 给**回执**用的:移动端发起会话要区分「pane 建出来了」与「PTY 真的起来了」——
+    /// [`Self::write`] 在起失败后是静默丢弃的,不看这一条就会把「终端起不来」报成
+    /// 成功,手机侧只能干等 15s 超时。PTY 在后台起,pane 建完那一刻还没有结论,
+    /// 所以这是个等待口而不是同步查询:已定局则接收端立刻就绪;还在起就排队,
+    /// 定局时统一答复;pane 在定局前没了,sender 随之丢弃,接收端拿到 `Canceled`
+    /// —— 调用方按失败算。
+    pub fn spawn_settled(&mut self) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        match self.pty.phase() {
+            PtyPhase::Starting => self.spawn_waiters.push(tx),
+            phase => {
+                let _ = tx.send(phase == PtyPhase::Running);
+            }
+        }
+        rx
+    }
+
+    fn settle_spawn_waiters(&mut self, alive: bool) {
+        for tx in self.spawn_waiters.drain(..) {
+            let _ = tx.send(alive);
+        }
     }
 
     /// grid 的只读句柄。给悬停缩略图([`crate::pane_preview`])用 ——
@@ -486,11 +652,15 @@ impl TerminalPane {
         let emulator = self.emulator.clone();
         let this = cx.weak_entity();
         let bar = cx.new(|cx| {
-            TerminalSearchBar::new(search, emulator, window, cx).on_close(move |window, cx| {
-                let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
-                    pane.dismiss_search(window, cx);
-                });
-            })
+            // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效
+            let labels = crate::i18n::terminal_search_labels;
+            TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
+                move |window, cx| {
+                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.dismiss_search(window, cx);
+                    });
+                },
+            )
         });
         // 开引擎 + 按已有关键词搜一遍 + 聚焦全选
         bar.update(cx, |bar, cx| bar.open(window, cx));
@@ -516,7 +686,41 @@ impl TerminalPane {
     ///
     /// **`observe_input` 必须在字节交给 PTY 之前调** —— 焦点冷却窗口要早于 TUI 对
     /// 焦点事件的重绘响应抵达,否则那波重绘会被当成 AI 活跃(与原 `write_pty` 同序)。
+    ///
+    /// PTY 还在后台起时字节进队列,回填时按到达顺序冲刷(旁路照旧**当场**跑,
+    /// AI 输入识别看到的时刻不变);起失败 / 已关闭时静默丢弃(与此前没有 PTY 时同)。
     pub fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.observe_user_write(bytes, cx);
+        if let Err(err) = self.pty.write(bytes) {
+            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+        }
+    }
+
+    /// 终端右键「SSH 连接」:写入 `ssh …\r` 命令行,带密码时**写完再**注册自动填充
+    /// (`disarm_on_input = true`,时序论证见
+    /// [`mt_pty::PtySession::write_then_arm_ssh_autofill`])。输入旁路与 [`write`](Self::write) 一致。
+    ///
+    /// PTY 还在后台起时,「写入 + 注册」作为**一个**队列元素排队,回填冲刷时整体交给
+    /// 那个原子方法,前后的写入插不进它中间(见 [`crate::pty_slot`])。
+    /// 起失败 / 已关闭时静默不做。
+    pub fn write_ssh_command(
+        &mut self,
+        line: &[u8],
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(password) = password else {
+            self.write(line, cx);
+            return;
+        };
+        self.observe_user_write(line, cx);
+        if let Err(err) = self.pty.write_then_arm_ssh_autofill(line, password) {
+            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+        }
+    }
+
+    /// 用户写入交给 PTY **之前**的旁路:AI 输入识别、`UserInput` 事件、AI 任务标记。
+    fn observe_user_write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
         // 只能在回车前抓一份当前可见行补判(见 observe_input_with_line_snapshot)。
         let snapshot = if bytes.contains(&b'\r') {
@@ -535,12 +739,6 @@ impl TerminalPane {
         // **锚点则必须延后**,理由见 [`mt_terminal::TerminalEmulator::arm_cursor_floor`]。
         if let Some(submits) = self.take_submits() {
             self.arm_marks(submits, cx);
-        }
-
-        if let Some(pty) = self.pty.as_ref()
-            && let Err(err) = pty.write(bytes)
-        {
-            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
@@ -719,6 +917,9 @@ impl TerminalPane {
             line
         });
         self.flash_line(line, cx);
+        // 闪烁那一行没变时 `set_flash` 不 notify(同一条标记 300ms 内连跳两次),
+        // 回看位置却可能刚被滚过 —— pane 套着 view 级缓存,这里自己 notify
+        cx.notify();
         true
     }
 
@@ -820,31 +1021,22 @@ impl TerminalPane {
     }
 
     /// 不经 AI 输入旁路的写入(终端应答 / 内部序列)。
-    fn write_raw(&self, bytes: &[u8]) {
-        if let Some(pty) = self.pty.as_ref()
-            && let Err(err) = pty.write(bytes)
-        {
+    ///
+    /// 走 [`mt_pty::PtySession::write_reply`] 而不是 `write`:应答不是用户按键,
+    /// 不能把 SSH 密码自动填充解掉(「SSH 连接」菜单路径里,本地 shell 与 ConPTY
+    /// 在 ssh 起来前后都可能发 DA / DSR 查询),也不经过 mt-pty 的输入观察器。
+    ///
+    /// 回填前也可能走到这里:reader 线程在后台 spawn 一返回就开始交输出,唤醒循环
+    /// 可能抢在回填之前处理到 shell 的开场查询 —— 应答与用户输入进同一条队列,
+    /// 相对顺序不变。
+    fn write_raw(&mut self, bytes: &[u8]) {
+        if let Err(err) = self.pty.write_reply(bytes) {
             eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.focus, cx);
-    }
-
-    /// 注册 SSH 密码自动填充(原版的 `arm_ssh_autofill` command)。
-    ///
-    /// 两个调用点、两种 `disarm_on_input`:
-    /// - 远程项目起 pane 时(`RemoteLaunchExtras`)传 `true` —— 那条链路 ssh 是
-    ///   PTY 的子进程本身,用户一打字就说明认证已经过去了;
-    /// - 终端右键「SSH 连接」传 `false`(与原版 command 同参)—— 那是往一个
-    ///   活着的 shell 里敲 `ssh …`,写命令这个动作本身会经过输入观察器。
-    ///
-    /// PTY 已经没了(pane 起失败 / 已退出)时静默不做。
-    pub fn arm_ssh_autofill(&self, password: String, disarm_on_input: bool) {
-        if let Some(session) = self.pty.as_ref() {
-            session.arm_ssh_autofill(password, disarm_on_input);
-        }
     }
 
     /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后「复制」该是灰的)。
@@ -888,9 +1080,11 @@ impl TerminalPane {
 
     /// 换回滚行数。调小时 alacritty 当场裁历史并释放内存。
     ///
-    /// **不碰视图**:grid 的容量变化不改任何渲染参数,下一帧照常读当前 grid。
-    pub fn set_scrollback(&mut self, lines: usize) {
+    /// 不改任何渲染参数,但裁掉历史会改滚动条的长度与位置 —— pane 套着 view 级
+    /// 缓存(`terminal_area::cached_terminal`),不 notify 就要等下一次输出才重画。
+    pub fn set_scrollback(&mut self, lines: usize, cx: &mut Context<Self>) {
         self.emulator.set_scrollback(lines);
+        cx.notify();
     }
 
     /// 丢弃组合中的预编辑串。切 tab / 关 pane 之前调,免得残影留在画面上。
@@ -899,13 +1093,18 @@ impl TerminalPane {
     }
 
     /// 关闭 pane:杀子进程 + 清掉 AI 感知里的一切痕迹 + 收掉查找条。
+    ///
+    /// PTY 还在后台起时:槽位落成 Closed,排队的写入作废;后台之后交回来的会话由
+    /// `finish_spawn` 退回丢弃(= kill),不会双开也不会漏关。**这里不丢 `_spawn`**
+    /// —— 关 pane 可能正好发生在那条任务自己回填时派发的事件里,从运行中的任务里
+    /// 丢掉自己的句柄是在给自己拆脚手架;实体释放时它随字段一起走。
     pub fn shutdown(&mut self) {
-        if let Some(pty) = self.pty.as_mut()
+        if let Some(mut pty) = self.pty.close()
             && let Err(err) = pty.kill()
         {
             eprintln!("[pane {}] kill 失败: {err:#}", self.pty_id);
         }
-        self.pty = None;
+        self.settle_spawn_waiters(false);
         self.ai.remove_pane(self.pty_id);
         self.close_search_state();
     }
@@ -934,6 +1133,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            extra: Default::default(),
         }
     }
 
@@ -1042,8 +1242,9 @@ mod tests {
 impl Drop for TerminalPane {
     fn drop(&mut self) {
         // pane 实体被丢弃(项目移除 / 应用退出)时同样要回收 —— 否则后端留一个
-        // 谁也看不见、谁也杀不掉的孤儿子进程。
-        if self.pty.is_some() {
+        // 谁也看不见、谁也杀不掉的孤儿子进程。还在后台起的也算:`_spawn` 随字段
+        // 一起丢弃,后台已产出的会话随之被丢弃(= kill)。
+        if self.pty.is_live() {
             self.shutdown();
         }
         // shutdown 走过就已经摘干净了;这一条兜住「PTY 起失败的 pane 被丢弃」
@@ -1363,25 +1564,32 @@ fn build_ssh_command(conn: &SshConnection, identity_path: Option<&str>) -> Strin
     parts.join(" ")
 }
 
-/// 在指定终端里连 SSH:有密码先注册自动填充,再写入 `ssh` 命令并回车。
+/// 在指定终端里连 SSH:写入 `ssh` 命令并回车,有密码则**写完再**注册自动填充。
 ///
 /// 私钥那一步(`mt_core::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
 /// OpenSSH 的 `UNPROTECTED PRIVATE KEY FILE` 拒绝)是**阻塞文件 IO**,丢后台;
 /// 失败**回退原始路径**让 ssh 自己报错(原版 `console.error` 后照走)。
+///
+/// 自动填充的注册因此也挪进了后台任务、紧跟在那次命令写入之后
+/// ([`TerminalPane::write_ssh_command`]):以 `disarm_on_input = true` 注册,用户
+/// 此后一打字即解除 —— 公钥 / agent 先认证成功时不会有 SSH 密码提示,旧做法
+/// (先注册、`false`)会让它一直待命,把密码灌进之后任何以 "password:" 结尾的输出。
 fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut App) {
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
     // 已存密码是 `mt-secret` 信封,交给 autofill 前在这里解开;解不开就提示并不填
     // (终端里照常出现密码提示,用户手输即可)。
-    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
-        match crate::secrets::reveal_password(stored) {
-            // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
-            // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
-            Ok(password) => terminal.read(cx).arm_ssh_autofill(password, false),
-            Err(err) => crate::secrets::toast_password_error(err, cx),
-        }
-    }
+    let password = match conn.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(stored) => match crate::secrets::reveal_password(stored) {
+            Ok(password) => Some(password),
+            Err(err) => {
+                crate::secrets::toast_password_error(err, cx);
+                None
+            }
+        },
+        None => None,
+    };
     let identity = conn
         .identity_file
         .clone()
@@ -1409,7 +1617,9 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
             let command = build_ssh_command(&conn, identity.as_deref());
             let _ = cx.update(|window, cx| {
                 let line = format!("{command}\r");
-                terminal.update(cx, |pane, cx| pane.write(line.as_bytes(), cx));
+                terminal.update(cx, |pane, cx| {
+                    pane.write_ssh_command(line.as_bytes(), password, cx)
+                });
                 // 写完把键盘还给终端(原版 `term.focus()`)
                 terminal.update(cx, |pane, cx| pane.focus(window, cx));
             });

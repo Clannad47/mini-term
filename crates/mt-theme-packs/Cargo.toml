@@ -1,0 +1,18 @@
+[package]
+name = "mt-theme-packs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "mini-term 外置主题包的文件层:themes/ 目录的列举 / 导入 / 删除 / 资源读取"
+
+# 自 mt-config 拆出(原 `mt-config::theme_packs`),理由见 src/lib.rs 的模块注释。
+# ⚠️ 依赖表保持这一级:**不许**引 rusqlite / mt-config / gpui —— mt-ui 依赖本 crate,
+# 这里一重,mt-ui 的两万多行就又要跟着重编。
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# 主题包导入:zip 解包 + manifest.json 的 sha256 校验。版本收在工作区(与 mt-relay 共用)。
+sha2.workspace = true
+zip = "8.6.0"

@@ -7,7 +7,7 @@
 //! 其后才轮到技术栈徽标([`mt_ui::icons::TechIcon`])与通用目录图标。
 //!
 //! 技术栈取值走 [`resolve_project_kind`]:手动 `kindOverride` 优先,没设过就用
-//! [`crate::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
+//! [`mt_project::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
 //! 探测本身丢后台)。
 //!
 //! # 键盘与悬停(清尾批)
@@ -49,10 +49,9 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
+use mt_project::project_kind::{ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, ProjectKind};
 use mt_ui::icons::vector::VectorIcon;
-use mt_ui::icons::{
-    ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
-};
+use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, TechIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::{
@@ -64,7 +63,7 @@ use crate::menu::{self, MenuEntry, MenuItem};
 use crate::modal;
 use crate::pane_preview::{self, MiniLayout};
 use crate::project_tree::{self, MAX_DEPTH, OrderedItem};
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::tree::PaneStatus;
 use crate::ui;
 
@@ -138,7 +137,9 @@ fn project_icon(kind: Option<ProjectKind>, remote: Option<RemoteBadge>) -> AnyEl
             .into_any_element();
     }
     match kind {
-        Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
+        Some(kind) => TechIcon::new(kind.as_str())
+            .size(px(14.0))
+            .into_any_element(),
         None => FileIcon::folder(false)
             .size(px(14.0))
             .color(ui::color_file())
@@ -838,15 +839,8 @@ fn project_menu(
             ProjectMenuAction::OpenInFolder => {
                 let path = PathBuf::from(&row.path);
                 menu::item(t("projectList", "menu.openInFolder"), move |_window, cx| {
-                    let path = path.clone();
-                    // spawn 外部进程会卡(网络盘 / 杀软),丢后台
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(err) = fs_ops::reveal_in_file_manager(&path) {
-                                eprintln!("[projects] 打开文件夹失败: {err}");
-                            }
-                        })
-                        .detach();
+                    // spawn 外部进程会卡(网络盘 / 杀软),`open_external` 丢后台
+                    fs_ops::open_external(fs_ops::ExternalOpen::Reveal, path.clone(), cx);
                 })
             }
             ProjectMenuAction::CopyAbsolutePath => {
@@ -1108,7 +1102,15 @@ pub struct ProjectList {
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |this: &mut Self, _, cx| {
+        // 本视图套了 view 级缓存(`main.rs::cached_panel`),render 读的状态灯 / 名字 /
+        // 完成标全靠这条 notify 重画
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 三道后台探测的闸只在项目表 / 技术栈缓存 / 窗口聚焦变了时过
+        // (`StoreEvent::touches_project_probes`),不再被 OSC 标题 / AI 状态叫醒
+        cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+            if !event.touches_project_probes() {
+                return;
+            }
             // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章
             this.probe_worktrees(false, cx);
             // 技术栈探测(原版 `useProjectKinds` 那个 effect):列表变了就补探,
@@ -1122,7 +1124,6 @@ impl ProjectList {
                 this.reconcile_worktrees(cx);
             }
             this.was_focused = focused;
-            cx.notify();
         })
         .detach();
         let mut this = Self {
@@ -1157,10 +1158,11 @@ impl ProjectList {
     /// 「探过就不再探」的判据在 store 那边(`dir_kinds`),这里只负责**不去白喂**
     /// ——见下面那道与 [`Self::probe_worktrees`] 同款的去重闸。
     fn ensure_project_kinds(&mut self, cx: &mut Context<Self>) {
-        // 去重闸,与 [`Self::probe_worktrees`] 同款:这个方法挂在 store 观察者上,
-        // 每次 notify 都会走一遍(AI 状态跳一下就有一次),此前每次都要把全部
-        // 项目路径克隆成一个 `Vec<String>` 再喂给一个只会全部命中缓存的去重表。
-        // 先只拼一条比较用的键,确定有新东西要探了才真去收集路径。
+        // 去重闸,与 [`Self::probe_worktrees`] 同款:这个方法挂在 store 事件上,
+        // 项目表 / 技术栈缓存 / 窗口聚焦任一变化都会走一遍(每探完一个目录就有
+        // 一次),此前每次都要把全部项目路径克隆成一个 `Vec<String>` 再喂给一个
+        // 只会全部命中缓存的去重表。先只拼一条比较用的键,确定有新东西要探了
+        // 才真去收集路径。
         //
         // ⚠️ **键只统计「还没探过」的路径**,不是全部路径。缓存被
         // `remove_dir_kind` 失效(项目根的标记文件变动)之后,那条路径会重新
@@ -1511,7 +1513,7 @@ impl ProjectList {
     ///
     /// `get_worktree_branches` 逐个 `Repository::open`,**阻塞**,必须丢后台。
     fn probe_worktrees(&mut self, force: bool, cx: &mut Context<Self>) {
-        // 这个方法挂在 store 观察者上、每次 notify 都会走一遍(AI 状态变化就有一次),
+        // 这个方法挂在 store 事件上、项目表 / 技术栈缓存 / 聚焦变化都会走一遍,
         // 所以先只拼一条比较用的键,确定要探了才真去收集路径
         let mut key = String::new();
         for p in self
@@ -2191,7 +2193,9 @@ impl ProjectList {
                         id: p.id.clone(),
                         name: p.name.clone(),
                         path: p.path.clone(),
-                        status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
+                        status: state
+                            .map(|s| s.highest_status())
+                            .unwrap_or(PaneStatus::Idle),
                         needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
                         kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
                         detected_kind,
@@ -2760,6 +2764,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            extra: Default::default(),
         }];
         let mut p = project("p1", "/home/u/proj", None);
         assert!(remote_badge(&p, &conns).is_none(), "本地项目没有徽章");
@@ -2891,6 +2896,22 @@ mod tests {
         );
     }
 
+    /// 技术栈枚举(mt-project)与徽标形状表(mt-ui)逐项对账。
+    ///
+    /// 两边出自 `gen_tech_icons.mjs` 的同一张 CATALOG,但分住两个 crate、按落盘字符串
+    /// 衔接(`TechIcon::new(kind.as_str())`)——mt-ui 不依赖 mt-project,编译期没有穷尽
+    /// 检查兜底。本 crate 是唯一同时看得见两边的地方:种类、字符串、顺序必须一一对上,
+    /// 否则某个类型的领位徽标会画成空白。
+    #[test]
+    fn 每种技术栈都有徽标且与形状表逐项对上() {
+        let kinds: Vec<&str> = ALL_PROJECT_KINDS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            mt_ui::icons::TECH_ART_KINDS,
+            "枚举与徽标表对不上:有人手改了生成物,改 CATALOG 后重跑生成器"
+        );
+    }
+
     // ─── 缩进(`ProjectList.tsx:660-666` 的两条公式) ─────────
 
     /// 两条公式不能合并:组内项目对齐父级分组的倒三角区域,
@@ -2970,20 +2991,8 @@ mod tests {
 
     fn project(id: &str, path: &str, parent: Option<&str>) -> ProjectConfig {
         ProjectConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            path: path.to_string(),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
             parent_project_id: parent.map(str::to_string),
-            kind_override: None,
+            ..ProjectConfig::new(id, id, path)
         }
     }
 

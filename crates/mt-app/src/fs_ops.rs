@@ -13,31 +13,23 @@
 //! 文件),**没有** reveal 语义(打开父目录并选中该项)—— 原版走的是
 //! `tauri-plugin-opener` 的 `revealItemInDir`。mt-project 本批只读,所以先在壳里
 //! 落一份;缺口已记入交付说明。
+//!
+//! # 调外部程序一律走 [`open_external`]
+//!
+//! 编辑器 / 系统默认程序 / 浏览器 / 文件管理器,都是「后台 spawn,失败推 toast」
+//! 这一套:spawn 外部进程在网络盘 / 杀软环境下会卡住调用线程,而失败(编辑器路径
+//! 写错、文件已被删)只打日志的话,用户看到的就是「点了没反应」。
+//! ⚠️ 弹窗里的入口别走它 —— toast 层在弹窗遮罩之下看不见,那种得自己丢后台、
+//! 把错误就地显示(设置页「打开主题目录」就是这样)。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 归一化路径分隔符:`[\\/]+` 折成单个 `/`,再去掉结尾那一个。
-/// 逐条对应 TS 侧的 `value.replace(/[\\/]+/g, '/').replace(/\/$/, '')`。
-fn normalize_sep(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut prev_sep = false;
-    for ch in value.chars() {
-        let is_sep = ch == '/' || ch == '\\';
-        if is_sep {
-            if !prev_sep {
-                out.push('/');
-            }
-        } else {
-            out.push(ch);
-        }
-        prev_sep = is_sep;
-    }
-    if out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
+use gpui::App;
+use mt_core::path_key::collapse_separators;
+use mt_project::editor::Editor;
+
+use crate::i18n::t;
 
 /// 该用哪种分隔符:根路径里出现过 `\` 就用 `\`,否则 `/`。
 fn sep_of(root: &str) -> char {
@@ -50,8 +42,13 @@ fn sep_of(root: &str) -> char {
 /// - 不在根下面 → 原样返回(与原版一致:不猜、不报错);
 /// - 否则 → 去掉根前缀,分隔符换回根用的那一种。
 pub fn relative_path(target: &str, root: &str) -> String {
-    let normalized_root = normalize_sep(root);
-    let normalized_target = normalize_sep(target);
+    // 分隔符归一逐条对应 TS 侧的 `value.replace(/[\\/]+/g, '/').replace(/\/$/, '')`
+    // —— 那一句连根 `/` 也会去掉(折成空串),`collapse_separators` 留根,所以再
+    // 剥一次尾 `/`:否则根是 `/` 时下面会拼出 `//` 前缀,一个都匹配不上
+    let normalized_root = collapse_separators(root);
+    let normalized_root = normalized_root.trim_end_matches('/');
+    let normalized_target = collapse_separators(target);
+    let normalized_target = normalized_target.trim_end_matches('/');
     let sep = sep_of(root);
 
     if normalized_target == normalized_root {
@@ -108,11 +105,11 @@ pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
 ///
 /// 纯函数,不碰 `App` —— 调用点普遍是「先 `store.read(cx)` 拿配置、再拿
 /// `&mut App` 丢后台」,两次借用必须分开两句写才过得了借用检查。
-pub fn configured_editor(config: &mt_config::AppConfig) -> Option<mt_project::editor::Editor> {
-    let editors: Vec<mt_project::editor::Editor> = config
+pub fn configured_editor(config: &mt_config::AppConfig) -> Option<Editor> {
+    let editors: Vec<Editor> = config
         .editors
         .iter()
-        .map(|e| mt_project::editor::Editor {
+        .map(|e| Editor {
             name: e.name.clone(),
             command: e.command.clone(),
         })
@@ -120,25 +117,71 @@ pub fn configured_editor(config: &mt_config::AppConfig) -> Option<mt_project::ed
     mt_project::editor::select_editor(&editors, config.default_editor.as_deref(), None).cloned()
 }
 
-/// 用挑好的编辑器打开路径(`None` = 系统默认程序)。**丢后台**跑 ——
-/// spawn 外部进程在网络盘 / 杀软环境下同样会卡住调用线程。
-pub fn open_path_with(
-    editor: Option<mt_project::editor::Editor>,
-    path: std::path::PathBuf,
-    cx: &mut gpui::App,
-) {
-    cx.background_executor()
-        .spawn(async move {
-            let result = match editor {
-                Some(_) => mt_project::editor::open_in_editor(editor.as_ref(), &path),
-                // 没配编辑器就用系统默认程序打开,别只给一句报错
-                None => mt_project::editor::open_path_with_default_app(&path),
-            };
-            if let Err(err) = result {
-                eprintln!("[files] 打开失败: {err:#}");
+/// 「交给外部程序」的几种方式。
+pub enum ExternalOpen {
+    /// 外部编辑器;`None` = 没配 → 退到系统默认程序打开,别只给一句报错。
+    Editor(Option<Editor>),
+    /// 系统默认程序(文件按关联程序开,目录开文件管理器)。
+    DefaultApp,
+    /// 浏览器(走协议关联,见 `mt_project::editor::open_path_in_browser`)。
+    Browser,
+    /// 在文件管理器里显示(打开父目录并选中该项)。
+    Reveal,
+}
+
+impl ExternalOpen {
+    /// 阻塞执行。
+    fn run(&self, path: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::Editor(Some(editor)) => mt_project::editor::open_in_editor(Some(editor), path),
+            Self::Editor(None) | Self::DefaultApp => {
+                mt_project::editor::open_path_with_default_app(path)
             }
-        })
-        .detach();
+            Self::Browser => mt_project::editor::open_path_in_browser(path),
+            Self::Reveal => reveal_in_file_manager(path).map_err(Into::into),
+        }
+    }
+
+    /// 失败 toast 的 (标题, 正文)。`detail` 是底层错误原文。
+    ///
+    /// 没配编辑器、退到默认程序又失败的那一档,顺带提示去设置里加编辑器 ——
+    /// 用户要的本来就是「用编辑器打开」,光说「打开失败」没有下一步。
+    fn failure_text(&self, detail: String) -> (String, String) {
+        match self {
+            Self::Editor(Some(_)) => (
+                t("fileTree", "dialog.openEditorFailedTitle").to_string(),
+                detail,
+            ),
+            Self::Editor(None) => (
+                t("fileTree", "dialog.noEditorTitle").to_string(),
+                format!("{}\n{detail}", t("fileTree", "dialog.noEditorMessage")),
+            ),
+            Self::DefaultApp | Self::Browser | Self::Reveal => (
+                t("fileTree", "dialog.openExternalFailedTitle").to_string(),
+                detail,
+            ),
+        }
+    }
+}
+
+/// 把 `path` 交给外部程序。**丢后台**跑,失败打日志并推一条 toast。
+///
+/// 只给非弹窗的入口用(理由见模块注释)。
+pub fn open_external(how: ExternalOpen, path: PathBuf, cx: &mut App) {
+    let task = cx.background_executor().spawn(async move {
+        let result = how.run(&path);
+        (how, path, result)
+    });
+    cx.spawn(async move |cx| {
+        let (how, path, result) = task.await;
+        let Err(err) = result else {
+            return;
+        };
+        eprintln!("[files] 外部程序打开 {} 失败: {err:#}", path.display());
+        let (title, message) = how.failure_text(format!("{err:#}"));
+        cx.update(|cx| crate::toast::push_open_external_failure(title, message, cx));
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -170,6 +213,19 @@ mod tests {
             relative_path("D:\\Git\\proj2\\a.rs", "D:\\Git\\proj"),
             "D:\\Git\\proj2\\a.rs"
         );
+        // 重复分隔符折叠后再比
+        assert_eq!(
+            relative_path("D:\\\\Git\\proj\\\\src\\a.rs", "D:\\Git\\proj"),
+            "src\\a.rs"
+        );
+    }
+
+    /// 远程项目根就是 `/`:前缀不能拼成 `//`(与 TS 侧把根也折成空串同效)。
+    #[test]
+    fn 根为斜杠时照样算相对段() {
+        assert_eq!(relative_path("/home/u/a.rs", "/"), "home/u/a.rs");
+        assert_eq!(relative_path("/", "/"), ".");
+        assert_eq!(relative_path("//", "/"), ".");
     }
 
     #[test]

@@ -1,7 +1,11 @@
 //! 会话分支树的**纯逻辑**层。对应 `src/utils/sessionBranch.ts`。
 //!
-//! 平铺会话列表 + 分支边 → 森林 → 带连线前缀的行,外加各 agent 的**分支能力位**。
+//! 平铺会话列表 + 分支边 → 森林 → 带连线前缀的行,外加 pane 右键菜单的**分支段**判据。
 //! 不碰 gpui、不碰磁盘,全部可单测 —— 与 TS 侧 `node --test` 直测同一个取舍。
+//!
+//! 各 agent 的分支能力位(fork / resume 模板、会话 id 白名单、opencode / pi 整表缺席)
+//! 原先是这里的一张 `AgentBranchCaps` 表,与历史面板、启动续接各写一份、口径已分叉;
+//! 现在统一住在 [`mt_ai::agent`],这里只按表出菜单。
 //!
 //! # 两道磁盘数据防御(不是异常处理,是常态)
 //!
@@ -12,108 +16,10 @@
 //! - **悬空父**(边指向的父不在列表里)与**环**(沿父链回到自身)一律按根处理,
 //!   不该让子节点凭空消失。
 
+use mt_ai::AgentKind;
 use mt_ai::sessions::LineageEdge;
 
-// ─── 分支能力位 ───────────────────────────────────────────────
-
-/// 一个 agent 的分支能力位。对应 `sessionBranch.ts` 的 `AgentBranchCaps`。
-///
-/// 模板里的 `{id}` 由 [`AgentBranchCaps::fork_command`] / [`resume_command`] 替换,
-/// 替换前先过 [`session_id_ok`] 白名单 —— 识别不了的一律**不产出命令**
-/// (与 `aiResume` 的「宁可不续也不敲错」同则)。
-///
-/// [`resume_command`]: AgentBranchCaps::resume_command
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgentBranchCaps {
-    /// 在新 PTY 里把会话 fork 成新会话的命令模板;
-    /// `None` = 该 agent 无 CLI 级 fork(grok:`--resume` 是**接管**原会话而非复制)。
-    pub fork_template: Option<&'static str>,
-    /// 在新 PTY 里恢复(接管)会话的命令模板。
-    pub resume_template: &'static str,
-}
-
-impl AgentBranchCaps {
-    /// **能力位本身**:该 agent 有没有 CLI 级 fork。
-    ///
-    /// 与 [`fork_command`] 有意分开 —— 菜单的「未获会话身份」置灰提示锚在这一位上
-    /// (那时压根没有 session id 可校验),原版 `!!caps?.forkCommand` 同义。
-    ///
-    /// [`fork_command`]: AgentBranchCaps::fork_command
-    pub fn can_fork(&self) -> bool {
-        self.fork_template.is_some()
-    }
-
-    pub fn fork_command(&self, session_id: &str) -> Option<String> {
-        let template = self.fork_template?;
-        session_id_ok(session_id).then(|| template.replace("{id}", session_id))
-    }
-
-    /// **能力表的完整性所需,当前没有生产调用点**:GPUI 侧的 resume 链路早于本表
-    /// 落地,走的是 [`crate::session_panel::build_resume_command`]。表照原版逐字搬
-    /// (少一位就等于把「grok 只有 resume 位」这条信息弄丢了),两处不许漂 ——
-    /// 单测 `resume_命令与既有实现一致` 把它们钉在一起。
-    #[allow(dead_code)]
-    pub fn resume_command(&self, session_id: &str) -> Option<String> {
-        session_id_ok(session_id).then(|| self.resume_template.replace("{id}", session_id))
-    }
-}
-
-/// 会话 id 白名单。与 [`crate::session_panel::build_resume_command`] 同一口径:
-/// 非空、不超长、只含字母数字与 `-` `_`(Claude UUID / Codex rollout id /
-/// Grok UUIDv7 的实际形态)。
-///
-/// id 会被原样拼进写进 PTY 的命令行,两个来源(持久化布局、会话记录文件内容)
-/// 都不是可信输入 —— 空格/引号/管道/换行等 shell 元字符在此拦截。
-fn session_id_ok(session_id: &str) -> bool {
-    !session_id.is_empty()
-        && session_id.len() <= 128
-        && session_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-const CLAUDE_CAPS: AgentBranchCaps = AgentBranchCaps {
-    fork_template: Some("claude --resume {id} --fork-session"),
-    resume_template: "claude --resume {id}",
-};
-
-const CODEX_CAPS: AgentBranchCaps = AgentBranchCaps {
-    fork_template: Some("codex fork {id}"),
-    // grok 虽按 cwd 分桶,但列表只捞「解码目录名全等于项目根」的会话,
-    // 新终端默认目录即正确目录
-    resume_template: "codex resume {id}",
-};
-
-const GROK_CAPS: AgentBranchCaps = AgentBranchCaps {
-    // 无 CLI 级 fork:`--resume` 是接管原会话而非复制 → 菜单不出分支入口
-    fork_template: None,
-    resume_template: "grok --resume {id}",
-};
-
-const OMP_CAPS: AgentBranchCaps = AgentBranchCaps {
-    // omp 有 `--fork <id>`,但分支树要靠会话记录解析画节点,而 omp 的记录格式
-    // 尚未接进来 —— 此时开放 fork 只会得到一棵只有自记账边、没有节点的空树。
-    // 与 grok 一样只留 resume 位(启动续接走它);等记录解析补上再开 fork。
-    fork_template: None,
-    resume_template: "omp --resume {id}",
-};
-
-/// agent 标识 → 能力表。归一化口径与 [`crate::session_panel::build_resume_command`]
-/// 一致:codex / grok / omp 显式分流,**其余一律按 Claude**(hook 上报的标识是
-/// `claude-code` 而不是 `claude`;`AiSessionRef` 的约定即「agent 缺省按 Claude」)。
-///
-/// **opencode / pi 显式排除**:它们没有可解析的会话记录(`agent_has_session_log`),
-/// 既 fork 不了也 resume 不了,整表缺席 → 菜单里连置灰提示都不出。
-pub fn branch_caps_for_agent(agent: Option<&str>) -> Option<AgentBranchCaps> {
-    let a = agent.unwrap_or("claude").to_ascii_lowercase();
-    match a.as_str() {
-        "codex" => Some(CODEX_CAPS),
-        "grok" => Some(GROK_CAPS),
-        "omp" => Some(OMP_CAPS),
-        "opencode" | "pi" => None,
-        _ => Some(CLAUDE_CAPS),
-    }
-}
+// ─── 菜单分支段 ───────────────────────────────────────────────
 
 /// pane 右键菜单里**分支那一段**该出什么。
 ///
@@ -133,26 +39,31 @@ pub enum BranchMenuSegment {
         agent: String,
     },
     /// 输入检测认出 AI 在跑、但**没拿到 hook 身份**(hook 未注册 / 身份还没到) →
-    /// 一条置灰提示说明原因。不再静默消失让人以为功能坏了;锚定 fork 位,
-    /// 所以仅有 resume 位的 grok 不提示。
+    /// 一条置灰提示说明原因。不再静默消失让人以为功能坏了;锚定 fork 能力位
+    /// ([`AgentKind::can_fork`]),所以仅有 resume 位的 grok / omp 不提示。
     NeedsIdentity,
-    /// 什么都不出(没有 AI、或该 agent 整表缺席)。
+    /// 什么都不出(没有 AI、或该 agent 没有 fork 能力 / 认不出)。
     None,
 }
 
+/// fork 命令由 [`mt_ai::agent::fork_command`] 按表生成(识别口径、agent 缺省按
+/// Claude、id 白名单都在那边);opencode / pi / 认不出的 agent 没有 fork 能力位,
+/// 菜单里连置灰提示都不出。
 pub fn branch_menu_segment(
     session: Option<&crate::tree::AiSessionRef>,
     detected_agent: Option<&str>,
 ) -> BranchMenuSegment {
     if let Some(session) = session {
-        let agent = session
-            .agent
-            .as_deref()
-            .unwrap_or("claude")
-            .to_ascii_lowercase();
         if let Some(command) =
-            branch_caps_for_agent(Some(&agent)).and_then(|c| c.fork_command(&session.session_id))
+            mt_ai::agent::fork_command(session.agent.as_deref(), &session.session_id)
         {
+            // 登记自记账用的 agent 串:会话身份原文小写(hook 上报的 `claude-code`
+            // 原样保留)—— 与新身份到手时 `resolve_fork_edge` 的比对同口径
+            let agent = session
+                .agent
+                .as_deref()
+                .unwrap_or(AgentKind::Claude.key())
+                .to_ascii_lowercase();
             return BranchMenuSegment::Fork {
                 command,
                 session_id: session.session_id.clone(),
@@ -163,10 +74,8 @@ pub fn branch_menu_segment(
         // ——「未获会话身份」的提示锚在「没有 session」那一支上
         return BranchMenuSegment::None;
     }
-    match detected_agent {
-        Some(agent) if branch_caps_for_agent(Some(agent)).is_some_and(|c| c.can_fork()) => {
-            BranchMenuSegment::NeedsIdentity
-        }
+    match detected_agent.and_then(AgentKind::parse) {
+        Some(kind) if kind.can_fork() => BranchMenuSegment::NeedsIdentity,
         _ => BranchMenuSegment::None,
     }
 }
@@ -475,124 +384,10 @@ mod tests {
         assert_eq!(rows.len(), 3);
     }
 
-    // ---- 分支能力位 ----
-
-    /// 能力表逐条对照 `sessionBranch.ts::AGENT_BRANCH_CAPS`(命令文本一字不差)。
-    #[test]
-    fn 能力位表命令文本照抄原版() {
-        let id = "0199a1b2-c3d4-7e8f-9012-3456789abcde";
-        let claude = branch_caps_for_agent(Some("claude")).unwrap();
-        assert_eq!(
-            claude.fork_command(id).as_deref(),
-            Some(format!("claude --resume {id} --fork-session").as_str())
-        );
-        assert_eq!(
-            claude.resume_command(id).as_deref(),
-            Some(format!("claude --resume {id}").as_str())
-        );
-
-        let codex = branch_caps_for_agent(Some("codex")).unwrap();
-        assert_eq!(
-            codex.fork_command(id).as_deref(),
-            Some(format!("codex fork {id}").as_str())
-        );
-        assert_eq!(
-            codex.resume_command(id).as_deref(),
-            Some(format!("codex resume {id}").as_str())
-        );
-
-        let grok = branch_caps_for_agent(Some("grok")).unwrap();
-        assert!(!grok.can_fork(), "grok 无 CLI 级 fork(--resume 是接管不是复制)");
-        assert_eq!(grok.fork_command(id), None);
-        assert_eq!(
-            grok.resume_command(id).as_deref(),
-            Some(format!("grok --resume {id}").as_str())
-        );
-
-        // omp 已接移动镜像的记录解析，但会话谱系尚未扫描，分支树仍不开 fork。
-        let omp = branch_caps_for_agent(Some("omp")).unwrap();
-        assert!(!omp.can_fork(), "omp 的记录解析未接入,不开 fork");
-        assert_eq!(
-            omp.resume_command(id).as_deref(),
-            Some(format!("omp --resume {id}").as_str())
-        );
-    }
-
-    /// 归一化:codex / grok / omp 显式分流,opencode / pi 整表缺席,其余一律按 Claude。
-    /// hook 上报的是 `claude-code` 而不是 `claude` —— 这条落在「其余」里。
-    #[test]
-    fn 能力位表按_agent_归一化() {
-        for agent in ["claude", "Claude", "claude-code", "CLAUDE-CODE", "什么鬼"] {
-            assert_eq!(
-                branch_caps_for_agent(Some(agent)),
-                Some(CLAUDE_CAPS),
-                "{agent} 该按 Claude 处理"
-            );
-        }
-        assert_eq!(branch_caps_for_agent(None), Some(CLAUDE_CAPS), "缺省按 Claude");
-        assert_eq!(branch_caps_for_agent(Some("CoDeX")), Some(CODEX_CAPS));
-        assert_eq!(branch_caps_for_agent(Some("Grok")), Some(GROK_CAPS));
-        assert_eq!(branch_caps_for_agent(Some("OMP")), Some(OMP_CAPS));
-        // 没有可解析会话记录的两家:连置灰提示都不出
-        assert_eq!(branch_caps_for_agent(Some("opencode")), None);
-        assert_eq!(branch_caps_for_agent(Some("pi")), None);
-        assert_eq!(branch_caps_for_agent(Some("PI")), None);
-    }
-
-    /// 能力位(`can_fork`)只看表、不看 id —— 置灰提示锚在这一位上,
-    /// 那时压根没有会话身份可校验。
-    #[test]
-    fn 能力位与命令产出是两件事() {
-        let claude = branch_caps_for_agent(Some("claude")).unwrap();
-        assert!(claude.can_fork(), "有能力位");
-        assert_eq!(claude.fork_command("坏 id"), None, "但坏 id 不产出命令");
-        assert!(branch_caps_for_agent(Some("codex")).unwrap().can_fork());
-    }
-
-    /// id 白名单:shell 元字符一律拦下(id 会被原样拼进写进 PTY 的命令行)。
-    #[test]
-    fn 会话_id_白名单拦壳元字符() {
-        let claude = branch_caps_for_agent(Some("claude")).unwrap();
-        for bad in [
-            "",
-            "a b",
-            "a;rm -rf /",
-            "a|b",
-            "a`b`",
-            "a$(b)",
-            "a\nb",
-            "a\"b",
-            "a'b",
-            "../../etc/passwd",
-        ] {
-            assert_eq!(claude.fork_command(bad), None, "{bad:?} 该被拦下");
-            assert_eq!(claude.resume_command(bad), None, "{bad:?} 该被拦下");
-        }
-        // 合法形态照过:Claude UUID / Codex rollout id / 下划线
-        for ok in ["0199a1b2-c3d4-7e8f-9012-3456789abcde", "abc_DEF-123", "a"] {
-            assert!(claude.fork_command(ok).is_some(), "{ok} 该放行");
-        }
-        // 超长(>128)按坏 id 处理
-        assert_eq!(claude.fork_command(&"a".repeat(129)), None);
-        assert!(claude.fork_command(&"a".repeat(128)).is_some());
-    }
-
-    /// resume 那一半必须与 [`crate::session_panel::build_resume_command`] 同源 ——
-    /// 两处各写一份模板,漂了就会出现「菜单能 fork、续接却敲错命令」。
-    #[test]
-    fn resume_命令与既有实现一致() {
-        let id = "0199a1b2-c3d4-7e8f-9012-3456789abcde";
-        for agent in ["claude", "claude-code", "codex", "grok"] {
-            assert_eq!(
-                branch_caps_for_agent(Some(agent))
-                    .and_then(|c| c.resume_command(id)),
-                crate::session_panel::build_resume_command(agent, id),
-                "{agent}"
-            );
-        }
-    }
-
     // ---- 菜单分支段 ----
+    //
+    // fork / resume 模板、识别口径与 id 白名单的逐条用例在 `mt_ai::agent`;
+    // 这里只钉「菜单出什么」。
 
     fn session(agent: Option<&str>, id: &str) -> crate::tree::AiSessionRef {
         crate::tree::AiSessionRef {
@@ -631,6 +426,34 @@ mod tests {
             branch_menu_segment(Some(&session(None, id)), None),
             BranchMenuSegment::Fork { .. }
         ));
+        // 大小写不敏感;登记用的 agent 串是身份原文的小写
+        assert_eq!(
+            branch_menu_segment(Some(&session(Some("CoDeX"), id)), None),
+            BranchMenuSegment::Fork {
+                command: format!("codex fork {id}"),
+                session_id: id.to_string(),
+                agent: "codex".to_string(),
+            }
+        );
+    }
+
+    /// 认不出的 agent 不再按 Claude 兜底:旧口径会给一个 gemini 会话敲出
+    /// `claude --resume … --fork-session`。
+    #[test]
+    fn 菜单段认不出的_agent_不出分支() {
+        let id = "0199a1b2-c3d4-7e8f-9012-3456789abcde";
+        for agent in ["什么鬼", "gemini", "pi", "PI", "opencode"] {
+            assert_eq!(
+                branch_menu_segment(Some(&session(Some(agent), id)), None),
+                BranchMenuSegment::None,
+                "{agent}"
+            );
+        }
+        // 参数注入形态的 id 同样不出
+        assert_eq!(
+            branch_menu_segment(Some(&session(Some("claude"), "--help")), None),
+            BranchMenuSegment::None
+        );
     }
 
     /// 有身份但无 fork 能力位(grok)/ id 认不出 → 两项都不出,
@@ -642,6 +465,11 @@ mod tests {
             branch_menu_segment(Some(&session(Some("grok"), id)), None),
             BranchMenuSegment::None,
             "grok 只有 resume 位"
+        );
+        assert_eq!(
+            branch_menu_segment(Some(&session(Some("omp"), id)), None),
+            BranchMenuSegment::None,
+            "omp 谱系未接,不开 fork"
         );
         assert_eq!(
             branch_menu_segment(Some(&session(Some("opencode"), id)), None),
@@ -675,7 +503,7 @@ mod tests {
             BranchMenuSegment::None,
             "grok 无 fork 位,不提示"
         );
-        for agent in ["opencode", "pi"] {
+        for agent in ["opencode", "pi", "omp"] {
             assert_eq!(
                 branch_menu_segment(None, Some(agent)),
                 BranchMenuSegment::None,

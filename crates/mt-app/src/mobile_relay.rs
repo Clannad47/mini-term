@@ -9,7 +9,7 @@
 //!                  ▼
 //!        RelayBridge 的前台泵(主线程)──► AppStore / Window
 //!
-//!  AppStore ──cx.observe──► 150ms 去抖 ──► 内容去重 ──► update_sessions
+//!  AppStore ──StoreEvent──► 150ms 去抖 ──► 内容去重 ──► update_sessions
 //!                                   └──► 镜像快照(启动器 / 项目 / 活 PTY)
 //!                                        ▲
 //!                            RelayHost 在 tokio 线程上只读它
@@ -56,15 +56,18 @@ use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
 use crate::i18n::tr;
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::tree::PaneStatus;
 
 /// 结构同步的去抖(原版 `mobileSessionSync.ts:101` 的 150ms)。
 ///
-/// **两道闸一个都不能省**(坑 9):`cx.observe(&store)` 在每次 `cx.notify()` 时
-/// 都会触发,而 store 的 notify 频率远高于 zustand 的 `subscribe`(终端状态、
-/// 焦点、布局全在同一个 entity 上)。去掉去抖或内容去重,WebSocket 上就会出现
-/// 每秒几十条 `SessionsDelta`。
+/// **两道闸一个都不能省**(坑 9):store 的变化频率远高于 zustand 的 `subscribe`
+/// (终端状态、焦点、布局全在同一个 entity 上)。去掉去抖或内容去重,WebSocket
+/// 上就会出现每秒几十条 `SessionsDelta`。
+///
+/// 触发源已从 `cx.observe(&store)`(每次 notify 都醒)收窄为订阅 [`StoreEvent`]
+/// 里快照真正读的那几类(OSC 标题、焦点、主题字号这些不再触发),但 AI 状态本身
+/// 就可能每秒反复上报,两道闸照旧保留。
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(150);
 
 // ─── 跨线程信号 ───────────────────────────────────────────────
@@ -561,7 +564,8 @@ pub struct RelayBridge {
     sync_generation: u64,
     _sync_task: Option<Task<()>>,
     _pump: Task<()>,
-    _observer: Subscription,
+    /// store 事件订阅(结构同步的触发源)。
+    _store_events: Subscription,
 }
 
 impl RelayBridge {
@@ -578,12 +582,17 @@ impl RelayBridge {
     ///
     /// 顺序与原版 `applyRelaySettings` 一致:**先落盘再 apply**
     /// (`set_mobile_relay_endpoint` 内部走 `save_config_now`)。
-    pub fn apply_settings(&self, url: &str, key: &str, cx: &mut App) {
+    ///
+    /// `key` 是面板里的明文:落盘前在 store 那边封存,建连用的仍是这份明文。
+    /// 封存失败时密钥没存下来,但**这一次照样建连**(用户刚填的值就在手上),
+    /// 原因经 `Err` 交回面板就地提示。
+    pub fn apply_settings(&self, url: &str, key: &str, cx: &mut App) -> Result<(), String> {
         let (url, key) = (url.trim().to_string(), key.trim().to_string());
-        self.store.update(cx, |store, cx| {
+        let saved = self.store.update(cx, |store, cx| {
             store.set_mobile_relay_endpoint(&url, &key, cx)
         });
         self.manager.apply(&url, &key);
+        saved
     }
 
     /// 启动器名单变化后:落盘 + 让中转重发一次全量快照
@@ -614,6 +623,12 @@ impl RelayBridge {
     }
 
     /// 移动端发起会话:**外层统一回执**,结构上杜绝漏回执(坑 5)。
+    ///
+    /// 成功那一支的回执要等 PTY 定局:PTY 在后台起(见 `pane` 模块注释),
+    /// 建完 pane、写完命令那一刻还不知道终端到底起没起来。等待口
+    /// ([`TerminalPane::spawn_settled`](crate::pane::TerminalPane::spawn_settled))
+    /// 保证必有答复 —— 定局即答,pane 先没了就是 `Canceled`,都按各自结论回执一次。
+    /// 回执走 `manager` 的克隆,不依赖桥实体还在。
     fn start_session(
         &mut self,
         payload: StartSessionPayload,
@@ -622,9 +637,43 @@ impl RelayBridge {
     ) {
         let request_id = payload.request_id.clone();
         match self.try_start_session(&payload, window, cx) {
-            Ok(pane_id) => self
-                .manager
-                .start_session_result(request_id, true, Some(pane_id), None),
+            Ok((pane_id, spawned)) => {
+                let manager = self.manager.clone();
+                let project_id = payload.project_id.clone();
+                let launcher_name = payload.launcher_name.clone();
+                cx.spawn(async move |_, cx| {
+                    if !spawned.await.unwrap_or(false) {
+                        manager.start_session_result(
+                            request_id,
+                            false,
+                            None,
+                            Some(StartSessionFailReason::SpawnFailed),
+                        );
+                        return;
+                    }
+                    // 桌面端 toast。凭证被盗时这是唯一的审计迹象,所以即便不切过去
+                    // 也要弹。走自建 toast 层的 `mobile-session` 档:info 图标 + 点击切
+                    // 项目(原版 `mobileStartSession.ts:122-127` 就是这一档)。**不去重**
+                    // —— 连开两个会话该看到两条,原版这条也是裸 `pushNotification`。
+                    // 项目名由标题行展示,正文只补启动器名。
+                    cx.update(|cx| {
+                        let project_name = AppStore::global(cx)
+                            .read(cx)
+                            .project(&project_id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        crate::toast::push_message(
+                            crate::notify::ToastKind::MobileSession,
+                            project_id,
+                            project_name,
+                            tr!("app", "mobileStartSession", launcher = launcher_name),
+                            cx,
+                        );
+                    });
+                    manager.start_session_result(request_id, true, Some(pane_id), None);
+                })
+                .detach();
+            }
             Err(reason) => self
                 .manager
                 .start_session_result(request_id, false, None, Some(reason)),
@@ -636,12 +685,15 @@ impl RelayBridge {
     /// `Result` 的每一条 `?` 早退都由调用方兜住回执 —— 这正是把它拆成内层函数
     /// 的原因(原版 5 处失败分支 + 1 处成功**全都**手动调了 `reportResult`,
     /// GPUI 侧用 `?` 极容易漏)。
+    ///
+    /// `Ok` 带回「PTY 起没起来」的等待口,成功回执与审计 toast 都要等它定局
+    /// (见 [`Self::start_session`])。
     fn try_start_session(
         &mut self,
         payload: &StartSessionPayload,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<String, StartSessionFailReason> {
+    ) -> Result<(String, futures::channel::oneshot::Receiver<bool>), StartSessionFailReason> {
         // 1. 项目还在吗。mt-relay 侧已经校验过一遍,但从校验到执行之间用户
         //    可能刚好把项目移除了,所以 ProjectNotFound 这一档必须保留
         let shell = {
@@ -674,48 +726,30 @@ impl RelayBridge {
 
         // 8. 写启动命令 + 回车。AI 会话身份靠输入检测建立,只有「往 shell 里敲进
         //    启动命令并回车」这条路能让 pane 进入 AI 会话状态。
-        //    写不进去时**保留 pane**:用户回桌面能看到它卡在哪。
+        //    写不进去时**保留 pane**:用户回桌面能看到它卡在哪。PTY 还在后台起时
+        //    命令进 pane 的写入队列,回填时按序冲刷。
         //
-        //    ⚠️ `TerminalPane::write` 没有 PTY 时是**静默丢弃**的(返回值只说明
+        //    ⚠️ `TerminalPane::write` 在起失败后是**静默丢弃**的(返回值只说明
         //    「找到了那个终端实体」),所以还要单独问一句 PTY 起来了没 ——
-        //    否则 shell 路径失效时手机会拿到成功回执然后干等 15s 超时。
+        //    否则 shell 路径失效时手机会拿到成功回执然后干等 15s 超时。PTY 在后台起,
+        //    这一问的答案要等定局,交给调用方 await。
         let data = format!("{}\r", payload.command);
-        let (written, alive) = self.store.update(cx, |store, cx| {
+        let (written, spawned) = self.store.update(cx, |store, cx| {
             let written = store.write_to_pane(&payload.project_id, &pane_id, &data, cx);
-            let alive = store
+            let pty_id = store
                 .project_state(&payload.project_id)
                 .and_then(|s| s.pane(&pane_id))
-                .and_then(|p| p.pty_id)
-                .is_some_and(|pty_id| store.pane_pty_alive(pty_id, cx));
-            (written, alive)
+                .and_then(|p| p.pty_id);
+            (
+                written,
+                pty_id.map(|pty_id| store.pane_spawn_settled(pty_id, cx)),
+            )
         });
-        if !written || !alive {
+        let Some(spawned) = spawned.filter(|_| written) else {
             return Err(StartSessionFailReason::SpawnFailed);
-        }
-
-        // 9. 桌面端 toast。凭证被盗时这是唯一的审计迹象,所以即便不切过去也要弹。
-        //    走自建 toast 层的 `mobile-session` 档:info 图标 + 点击切项目
-        //    (原版 `mobileStartSession.ts:122-127` 就是这一档)。**不去重** ——
-        //    连开两个会话该看到两条,原版这条也是裸 `pushNotification`。
-        //    项目名由标题行展示,正文只补启动器名。
-        let project_name = self
-            .store
-            .read(cx)
-            .project(&payload.project_id)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        crate::toast::push_message(
-            crate::notify::ToastKind::MobileSession,
-            payload.project_id.clone(),
-            project_name,
-            tr!(
-                "app",
-                "mobileStartSession",
-                launcher = payload.launcher_name.clone()
-            ),
-            cx,
-        );
-        Ok(pane_id)
+        };
+        // 9. 审计 toast 与成功回执在调用方等到 PTY 起来之后再发
+        Ok((pane_id, spawned))
     }
 
     fn apply_signal(&mut self, signal: RelaySignal, window: &mut Window, cx: &mut Context<Self>) {
@@ -843,7 +877,18 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
     let manager = Arc::new(MobileRelayManager::new(host, events));
 
     let entity = cx.new(|cx: &mut Context<RelayBridge>| {
-        let observer = cx.observe(&store, |this: &mut RelayBridge, _, cx| this.schedule_sync(cx));
+        // 只订阅快照真正读的那几类变化(见 `StoreEvent::touches_relay_sync`)。
+        // 此前挂在 notify 上,多个 pane 的 OSC 标题(约 4Hz/pane)会把 150ms 去抖
+        // 一直往后推 —— 四个 pane 交错改标题时间隔常在 100ms 以内,AI 状态变化
+        // 反而迟迟推不出去。
+        let store_events = cx.subscribe(
+            &store,
+            |this: &mut RelayBridge, _, event: &StoreEvent, cx| {
+                if event.touches_relay_sync() {
+                    this.schedule_sync(cx);
+                }
+            },
+        );
         // 泵要 `spawn_in`:发起会话得建 pane(要 `&mut Window`)、弹 toast
         // (`window.push_notification`)也得有窗口
         let pump = cx.spawn_in(window, async move |this, cx| {
@@ -868,7 +913,7 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
             sync_generation: 0,
             _sync_task: None,
             _pump: pump,
-            _observer: observer,
+            _store_events: store_events,
         }
     });
     cx.set_global(GlobalRelay(entity.clone()));
@@ -878,7 +923,14 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
     entity.update(cx, |this, cx| this.sync_now(cx));
     let relay = store.read(cx).mobile_relay();
     if !relay.relay_url.trim().is_empty() {
-        manager.apply(&relay.relay_url, &relay.desktop_key);
+        // 库里是信封,建连前在这里解开。解不开(换机器 / 密钥文件丢了)就按
+        // 「未填密钥」建连:中转回「密钥不正确」后连接循环停在那个状态上,
+        // 不重试不刷屏;面板打开时再就地提示重填(`mobile_panel::open`)。
+        let key = crate::secrets::reveal_relay_key(&relay.desktop_key).unwrap_or_else(|err| {
+            eprintln!("[mobile-relay] 已存桌面密钥无法解密,按未填写处理: {err}");
+            String::new()
+        });
+        manager.apply(&relay.relay_url, &key);
     }
     entity
 }
@@ -889,22 +941,7 @@ mod tests {
     use mt_config::{ProjectGroup, ProjectTreeItem};
 
     fn project(id: &str, name: &str) -> ProjectConfig {
-        ProjectConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            path: format!("D:/{name}"),
-            description: None,
-            saved_layout: None,
-            expanded_dirs: Vec::new(),
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: Vec::new(),
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        }
+        ProjectConfig::new(id, name, format!("D:/{name}"))
     }
 
     fn pane(id: &str, status: PaneStatus, pty: Option<u32>) -> PaneFacet {

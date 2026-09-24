@@ -44,7 +44,10 @@ fn shell_spec(size: TermSize) -> PtySpawn {
         program: "/bin/sh".into(),
         args: vec![],
         cwd: None,
-        env: vec![("TERM".into(), "xterm-256color".into()), ("PS1".into(), "$ ".into())],
+        env: vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("PS1".into(), "$ ".into()),
+        ],
         rows: size.screen_lines as u16,
         cols: size.columns as u16,
     }
@@ -83,10 +86,7 @@ fn pty_回显能从_grid_读回来() {
 
     // 回显 + 命令输出,两次出现;至少要看到「不是命令行本身」的那一次。
     let hit = wait_for(&emulator, Duration::from_secs(20), |lines| {
-        let count = lines
-            .iter()
-            .filter(|l| l.contains("MT_SMOKE_9F3A"))
-            .count();
+        let count = lines.iter().filter(|l| l.contains("MT_SMOKE_9F3A")).count();
         (count >= 2).then_some(count)
     });
     assert!(
@@ -105,11 +105,7 @@ fn 中英混排的列位置对得上() {
     emulator.advance("你好abc世界\r\n".as_bytes());
 
     let rows = emulator.visible_columns();
-    let first: Vec<(usize, char)> = rows[0]
-        .iter()
-        .copied()
-        .filter(|(_, c)| *c != ' ')
-        .collect();
+    let first: Vec<(usize, char)> = rows[0].iter().copied().filter(|(_, c)| *c != ' ').collect();
 
     // 你(0-1) 好(2-3) a(4) b(5) c(6) 世(7-8) 界(9-10)
     assert_eq!(

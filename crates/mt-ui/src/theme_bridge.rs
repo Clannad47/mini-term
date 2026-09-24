@@ -5,7 +5,7 @@
 //! ```text
 //!                        ┌── TerminalTheme ─────→ TerminalElement（16 色/前后景/光标/选择）
 //! themes/<id>/theme.json ┤
-//!  (mt_config::ThemePacks)└── gpui_component::ThemeConfig → Theme 全局（面板/按钮/边框/tab）
+//!  (mt_theme_packs::ThemePacks)└── gpui_component::ThemeConfig → Theme 全局（面板/按钮/边框/tab）
 //! ```
 //!
 //! **内置明暗两套走同一份映射**：mt-app 把 `ui::Palette`（`styles.css` 那份唯一
@@ -18,11 +18,11 @@
 //! [`TerminalTheme`]。**语义映射逐条对齐 `src/utils/themePackManager.ts`** ——
 //! 同一个皮肤包在新旧两版里必须长得一样，否则用户会以为是自己的包坏了。
 //!
-//! # 为什么解析放在 mt-ui 而不是 mt-config
+//! # 为什么解析放在 mt-ui 而不是 mt-theme-packs
 //!
-//! `mt-config` 明确不依赖 gpui（它的文件层测试要能脱离 GPUI 跑）。而映射的产物
-//! 全是 gpui 类型（`Hsla` / `ThemeConfig`），所以校验与映射整块归 mt-ui，
-//! mt-config 只管「目录里有哪些包、原文是什么」。这条分界是 `theme_packs.rs`
+//! 文件层（`mt-theme-packs`，自 mt-config 拆出）明确不依赖 gpui（它的测试要能脱离
+//! GPUI 跑）。而映射的产物全是 gpui 类型（`Hsla` / `ThemeConfig`），所以校验与映射
+//! 整块归 mt-ui，文件层只管「目录里有哪些包、原文是什么」。这条分界是该 crate
 //! 模块注释里就写好的。
 //!
 //! # 背景图
@@ -442,7 +442,7 @@ pub struct AppliedThemePack {
     /// 主题包身份 = **themes/ 下的目录名**（`config.custom_theme_id` 存的就是它）。
     ///
     /// 不是 theme.json 里的 `id` 字段：两者允许不一致（用户改过目录名），
-    /// 一致性口径见 [`mt_config::ThemePackEntry::theme_id`]。目录未知时
+    /// 一致性口径见 [`mt_theme_packs::ThemePackEntry::theme_id`]。目录未知时
     /// （单测直接喂 `def`）才退回 `def.id`。
     pub theme_id: String,
     pub name: String,
@@ -916,7 +916,7 @@ fn install_theme_config(
 /// **「按主题包 id 切换」的入口**（mt-app 接线点）。
 ///
 /// ```ignore
-/// let packs = mt_config::ThemePacks::open()?;
+/// let packs = mt_theme_packs::ThemePacks::at(mt_config::themes_dir()?); // 目录口径归宿主
 /// let applied = mt_ui::theme_bridge::switch_to_theme_pack(&packs, "dracula", Some(window), cx)?;
 /// store.set_terminal_theme(applied.terminal.clone(), cx); // 逐 pane 下发
 /// ```
@@ -924,7 +924,7 @@ fn install_theme_config(
 /// 只做「读包 → 校验 → 应用」。**不写 config.json**：持久化归 mt-app
 /// （它才知道要不要连带改 `theme` 字段）。
 pub fn switch_to_theme_pack(
-    packs: &mt_config::ThemePacks,
+    packs: &mt_theme_packs::ThemePacks,
     theme_id: &str,
     window: Option<&mut Window>,
     cx: &mut App,
@@ -1019,7 +1019,7 @@ pub struct ThemePackListing {
 /// 扫一遍 themes/ 目录，返回能用的包（坏包跳过并打日志，不阻塞列表）。
 ///
 /// 设置页的皮肤列表用这个：一个坏包不该让整张列表打不开。
-pub fn list_theme_packs(packs: &mt_config::ThemePacks) -> Result<Vec<ThemePackListing>> {
+pub fn list_theme_packs(packs: &mt_theme_packs::ThemePacks) -> Result<Vec<ThemePackListing>> {
     let mut out = Vec::new();
     for entry in packs.list()? {
         match parse_theme_pack(&entry.theme_id, &entry.theme_json) {
@@ -1046,7 +1046,7 @@ pub fn list_theme_packs(packs: &mt_config::ThemePacks) -> Result<Vec<ThemePackLi
 mod tests {
     use super::*;
 
-    /// 用 mt-config 的示例主题包生成函数造数据 —— 文档模板与这里共用同一份文件，
+    /// 用 mt-theme-packs 的示例主题包生成函数造数据 —— 文档模板与这里共用同一份文件，
     /// 模板改了这个测试立刻会知道。
     fn example_pack() -> (ThemePackDef, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -1056,7 +1056,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let packs = mt_config::ThemePacks::at(root.join("themes"));
+        let packs = mt_theme_packs::ThemePacks::at(root.join("themes"));
         let id = packs.create_example().unwrap();
         let data = packs.read(&id).unwrap();
         let def = parse_theme_pack(&id, &data.theme_json).unwrap();
@@ -1093,7 +1093,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 
-    /// 仓库 `theme/` 下分发的成品皮肤要经得起**语义**校验。mt-config 那侧只管
+    /// 仓库 `theme/` 下分发的成品皮肤要经得起**语义**校验。mt-theme-packs 那侧只管
     /// 文件层（能不能导入、manifest 对不对）；色值合不合法、`image` 是不是包内
     /// 文件名、背景图最终能不能真解析成氛围层，只有走完这条路才知道。
     #[test]
@@ -1355,7 +1355,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let packs = mt_config::ThemePacks::at(root.join("themes"));
+        let packs = mt_theme_packs::ThemePacks::at(root.join("themes"));
         let dir = packs.root().join("ember-new");
         std::fs::create_dir_all(&dir).unwrap();
         let json = minimal_json("").replace(r#""id": "t""#, r#""id": "ember-dusk""#);

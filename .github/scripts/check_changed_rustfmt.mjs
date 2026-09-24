@@ -57,6 +57,29 @@ function intersects(left, right) {
   return left.start <= right.end && right.start <= left.end;
 }
 
+// 按文件所属 crate 的 edition 跑 rustfmt:主工作区是 2024,relay-server 还是 2021,
+// 两种 edition 的格式口径不同(`use` 里的排序等)。沿目录向上找最近的 Cargo.toml,
+// 取它的 `edition = "…"`;写成 `edition.workspace = true` 或没写的按工作区的 2024。
+const editionCache = new Map();
+function editionOf(file) {
+  let dir = path.dirname(path.resolve(file));
+  const root = path.resolve(".");
+  while (true) {
+    if (editionCache.has(dir)) return editionCache.get(dir);
+    const manifest = path.join(dir, "Cargo.toml");
+    if (fs.existsSync(manifest)) {
+      const text = fs.readFileSync(manifest, "utf8");
+      const match = text.match(/^\s*edition\s*=\s*"(\d{4})"/m);
+      const edition = match ? match[1] : "2024";
+      editionCache.set(dir, edition);
+      return edition;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir || !dir.startsWith(root)) return "2024";
+    dir = parent;
+  }
+}
+
 const changed = run("git", [
   "diff",
   "--name-only",
@@ -100,7 +123,7 @@ try {
     fs.writeFileSync(formattedPath, original);
     const formatted = run("rustfmt", [
       "--edition",
-      "2024",
+      editionOf(file),
       "--config",
       "skip_children=true",
       formattedPath,

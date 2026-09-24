@@ -13,15 +13,39 @@
 //! [`initialize`] **必须早于本 crate 的任何 [`crate::PtySession::spawn`]**
 //! (即任何 `openpty`)。一旦 portable-pty 先用系统 ConPTY 建过 pty,
 //! 后续预载就不再影响已解析的模块,便携后端形同虚设。
-//! 惯例是在 `main()` 里创建窗口之前调用一次。
+//! mt-app 在 `main()` 里、gpui 平台层建出来之前同步调用一次(时序依据见那里的注释)。
 //!
 //! 预检失败(文件缺失 / PE 架构不匹配 / 缺导出符号)一律回落系统 ConPTY,
 //! 只打日志不报错 —— 便携后端是增强项,不是启动前置条件。
+//!
+//! # 开关
+//!
+//! 环境变量 [`DISABLE_ENV`]`=1` 时 [`initialize_default`] 跳过预载、直接回落系统
+//! ConPTY(决策照常打日志)。给真机开 / 关对比和用户排障用:怀疑显示问题出在便携
+//! 后端时,不必删文件就能换回系统 conhost。
+//!
+//! # ⚠️ 便携后端要求终端应答 DA1
+//!
+//! 便携 ConPTY(Windows Terminal 1.24)一起来就发 `ESC [ c`(Primary Device Attributes
+//! 查询),**收到应答之前后续输出会卡住**(实测:不应答时 `ping -n 3` 只出来头两行,
+//! 应答后全部到齐;系统 conhost 不发这个查询)。mini-term 里由 alacritty 的 `PtyWrite`
+//! 事件自动应答(mt-app `pane.rs` 的 `drain_term_events`)。任何绕开 VT 状态机直接消费
+//! PTY 输出的新调用方都得自己回 `ESC [ ? 6 c` 一类的应答,否则只看得到开头几行。
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const PORTABLE_CONPTY_DIR: &str = "portable-conpty";
+
+/// 跳过便携预载、回落系统 ConPTY 的环境变量。取值 `1` 生效,其它一律按未设处理
+/// (与 `MT_LOG_FILE` 同一口径)。
+pub const DISABLE_ENV: &str = "MT_DISABLE_PORTABLE_CONPTY";
+
+/// [`DISABLE_ENV`] 的取值是否要求跳过预载(纯函数,便于单测)。
+fn disabled_by_env(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
 const PE_MACHINE_X64: u16 = 0x8664;
 const PE_MACHINE_ARM64: u16 = 0xaa64;
 
@@ -46,22 +70,23 @@ fn system_decision(reason: impl Into<String>) -> ConptyBootstrapDecision {
     }
 }
 
+/// 读 PE 头里的 machine 字段。只读 DOS 头与 PE 签名那几个字节:这一步跑在启动
+/// 关键路径上(主线程、窗口出来之前),三个文件合计几 MB,整份读进来纯属浪费。
 fn read_pe_machine(path: &Path) -> Result<u16, String> {
-    let bytes = fs::read(path).map_err(|error| format!("读取失败：{error}"))?;
-    if bytes.len() < 0x40 || u16::from_le_bytes([bytes[0], bytes[1]]) != 0x5a4d {
+    let mut file = fs::File::open(path).map_err(|error| format!("读取失败：{error}"))?;
+    let mut dos = [0_u8; 0x40];
+    if file.read_exact(&mut dos).is_err() || u16::from_le_bytes([dos[0], dos[1]]) != 0x5a4d {
         return Err("不是合法 PE 文件（缺少 MZ）".to_string());
     }
-    let pe_offset =
-        u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
-    if pe_offset.checked_add(6).is_none_or(|end| end > bytes.len())
-        || bytes[pe_offset..pe_offset + 4] != *b"PE\0\0"
+    let pe_offset = u32::from_le_bytes([dos[0x3c], dos[0x3d], dos[0x3e], dos[0x3f]]);
+    let mut header = [0_u8; 6];
+    if file.seek(SeekFrom::Start(u64::from(pe_offset))).is_err()
+        || file.read_exact(&mut header).is_err()
+        || header[..4] != *b"PE\0\0"
     {
         return Err("不是合法 PE 文件（缺少 PE header）".to_string());
     }
-    Ok(u16::from_le_bytes([
-        bytes[pe_offset + 4],
-        bytes[pe_offset + 5],
-    ]))
+    Ok(u16::from_le_bytes([header[4], header[5]]))
 }
 
 fn validate_x64_resource_tree(portable_dir: &Path) -> Result<(), String> {
@@ -225,7 +250,13 @@ pub fn initialize(_resource_dir: &Path) -> ConptyBootstrapDecision {
 }
 
 /// [`initialize`] + [`default_resource_dir`] 的组合:应用启动处一行调用。
+/// [`DISABLE_ENV`]`=1` 时不预载,直接回落系统 ConPTY。
 pub fn initialize_default() -> ConptyBootstrapDecision {
+    if disabled_by_env(std::env::var_os(DISABLE_ENV).as_deref()) {
+        let decision = system_decision(format!("{DISABLE_ENV}=1，按要求跳过便携预载"));
+        log_decision(&decision);
+        return decision;
+    }
     match default_resource_dir() {
         Some(dir) => initialize(&dir),
         None => {
@@ -362,6 +393,36 @@ mod tests {
         });
 
         assert_system(decision, "CreatePseudoConsole");
+    }
+
+    /// PE 头只读前几个字节:文件短于 DOS 头、或 PE 偏移指到文件尾之外,都要按
+    /// 「不是合法 PE」回落,而不是越界 / panic。
+    #[test]
+    fn truncated_pe_headers_choose_system() {
+        let temp = complete_resources();
+        let dll = temp.path().join("portable-conpty/conpty.dll");
+
+        fs::write(&dll, b"MZ").unwrap();
+        let decision = choose_conpty_bootstrap(temp.path(), "x86_64", |_| Ok(()));
+        assert_system(decision, "缺少 MZ");
+
+        let mut bytes = vec![0_u8; 0x40];
+        bytes[0..2].copy_from_slice(&0x5a4d_u16.to_le_bytes());
+        bytes[0x3c..0x40].copy_from_slice(&0x1000_u32.to_le_bytes());
+        fs::write(&dll, bytes).unwrap();
+        let decision = choose_conpty_bootstrap(temp.path(), "x86_64", |_| Ok(()));
+        assert_system(decision, "缺少 PE header");
+    }
+
+    /// 开关只认 `1`:别的写法一律当没设,免得 `=0` 反而把便携后端关掉。
+    #[test]
+    fn disable_env_only_accepts_one() {
+        use std::ffi::OsStr;
+        assert!(disabled_by_env(Some(OsStr::new("1"))));
+        for value in ["0", "", "true", " 1"] {
+            assert!(!disabled_by_env(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(!disabled_by_env(None));
     }
 
     #[test]

@@ -1273,6 +1273,27 @@ fn arm_dwell(
     })
 }
 
+/// 查找的兜底重绘:`delay` 之后 notify 一次本视图,让下一帧的 prepaint 再 sync
+/// 一次(见 [`TerminalSearch::take_trailing_rescan`])。
+///
+/// 任务直接 `detach`:防重靠引擎里的「已排」标记,不靠持有句柄;pane 先关掉了,
+/// 到点时 notify 一个已经不在的视图是空操作。
+fn schedule_search_rescan(
+    search: Rc<RefCell<TerminalSearch>>,
+    delay: Duration,
+    view_id: EntityId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(delay).await;
+            search.borrow_mut().trailing_rescan_fired();
+            let _ = cx.update(|_, cx| cx.notify(view_id));
+        })
+        .detach();
+}
+
 /// gpui 的按键 → 协议按键。没有对应编码的一律丢弃。
 fn map_button(button: MouseButton) -> Option<MouseBtn> {
     match button {
@@ -1369,11 +1390,24 @@ impl Element for TerminalElement {
         let focused = self.focus.is_focused(window);
 
         // ── 查找命中:在拿 grid 锁**之前**同步(引擎内部自己会短暂持锁)。
-        //    引擎有去抖 + 内容指纹两道闸,这一句在空闲帧几乎是零成本。
+        //    引擎有去抖 + 变化检测两道闸,这一句在空闲帧几乎是零成本。
         let highlights: Option<Rc<SearchHighlights>> = self.search.as_ref().map(|search| {
-            let mut search = search.borrow_mut();
-            search.sync(&self.emulator);
-            search.highlights()
+            let mut engine = search.borrow_mut();
+            let frame = engine.frame_sync(&self.emulator, Instant::now());
+            // 结果集这一帧变了:高亮本帧就画对了,但查找条的「n/总数」在同一帧的
+            // render 阶段已经读过(扫描之前的数)。再要一帧 —— notify 的是本视图,
+            // 沿 view 路径标脏到宿主 pane,查找条(pane 的子视图)随之重画。
+            // pane 套着 view 级缓存,不要这一帧的话窗口别处的重绘碰不到它,
+            // 输出一停计数就停在旧值,直到滚一下滚轮
+            if frame.repaint {
+                window.request_animation_frame();
+            }
+            // 这一帧因为没到去抖点被挡下了:排一发延后重绘兜底。输出恰好停在去抖
+            // 窗口里时,没有它就要等别的事碰巧触发一帧,命中与计数才会跟上
+            if let Some(delay) = frame.rescan_after {
+                schedule_search_rescan(search.clone(), delay, window.current_view(), window, cx);
+            }
+            engine.highlights()
         });
         let highlights = highlights.filter(|h| !h.is_empty());
 

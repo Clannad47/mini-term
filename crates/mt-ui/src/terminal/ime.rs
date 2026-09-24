@@ -257,8 +257,11 @@ mod tests {
         ime.set_marked(None, "你好世界", None);
         assert_eq!(ime.text_for_range_utf16(0..2).as_deref(), Some("你好"));
         assert_eq!(ime.text_for_range_utf16(2..4).as_deref(), Some("世界"));
-        // 倒序区间不 panic
-        assert_eq!(ime.text_for_range_utf16(3..1).as_deref(), Some(""));
+        // 倒序区间不 panic（`text_for_range_utf16` 专门把 end 钳到 start，测的就是这条）。
+        // 字面量倒序区间会撞 deny 级的 clippy::reversed_empty_ranges，这里是有意为之
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = 3..1;
+        assert_eq!(ime.text_for_range_utf16(reversed).as_deref(), Some(""));
         ime.clear();
         assert_eq!(ime.text_for_range_utf16(0..1), None);
     }

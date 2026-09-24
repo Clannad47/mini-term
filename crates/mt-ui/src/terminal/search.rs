@@ -40,17 +40,45 @@
 //! # 重搜策略(为什么不是每帧全量重搜)
 //!
 //! 一次全 buffer 扫描是 O(scrollback × 列数)。本项目 scrollback 默认一万行,
-//! 用户还能开到十万 —— 每帧扫一遍是不可能的。三道闸按顺序拦:
+//! 用户还能开到十万 —— 每帧扫一遍是不可能的(实测 5 万行 × 120 列搜一个稀有词
+//! 全扫一次 55ms,期间 grid 锁一直攥着:UI 线程与 PTY reader 线程一起停)。
+//! 四道闸按顺序拦:
 //!
-//! 1. **脏标记**:关键词 / 选项变了 → 立刻重搜(用户在等结果,不能拖)。
+//! 1. **脏标记**:关键词 / 选项变了 → 立刻**全扫**(用户在等结果,不能拖)。
 //! 2. **去抖**:内容变化引起的重搜最快 200ms 一次(与 xterm SearchAddon
-//!    `_updateMatches` 的 200ms 完全一致)。
-//! 3. **内容指纹**:去抖到期后先算一遍屏幕内容的哈希([`content_fingerprint`]),
-//!    与上次相同就直接跳过 —— 空闲时(最常见)一次扫描都不会发生。
+//!    `_updateMatches` 的 200ms 完全一致);上一次扫描越贵,间隔按比例放大
+//!    (封顶 2s,见 `TerminalSearch::debounce`)。被挡下、且内容确实动过的那次
+//!    由宿主排一发延后重绘兜底([`TerminalSearch::take_trailing_rescan`]),输出停在
+//!    去抖窗口里也不会让结果永远停在旧样子。
+//! 3. **变化检测**:去抖到期后先比内容代数(`TerminalEmulator::generation`,
+//!    每批输出 +1)与屏幕内容哈希([`content_fingerprint`]),都没变就直接跳过 ——
+//!    空闲时(最常见)一次扫描都不会发生。代数补的是指纹的盲区:周期性输出恰好
+//!    滚过整数个周期时屏幕逐字相同、历史满了总行数也不变,光看指纹会漏掉新内容。
+//! 4. **增量重扫**:内容变化引起的重扫**只扫变了的行**,见下一节。
 //!
-//! 指纹只哈屏幕区(不含 scrollback)+ 总行数:任何新输出都必然先经过屏幕,
-//! 所以「内容变了而指纹不变」需要恰好滚过整数屏且内容逐字相同,可以忽略。
 //! 指纹**不含 display_offset**,用户滚动回看不会白白触发重搜。
+//!
+//! # 增量重扫与它为什么是对的
+//!
+//! alacritty 的正则迭代在「非折行的行尾」一定会重置 DFA(`regex_search_internal`
+//! 的 linebreak 分支),命中不跨逻辑行(= 被 WRAPLINE 连起来的若干物理行);
+//! 整词判定只看同一行的邻格。所以**一条逻辑行上的命中只取决于这条逻辑行自己的
+//! 内容**,与它上面扫过什么无关 —— 从逻辑行首单独扫它,和全扫走到这里得到的
+//! 结果逐条相同。增量重扫就建在这条性质上:
+//!
+//! - 每次扫描都给整个 grid 记一份**逐行内容哈希**(`ScanSnapshot`:字符 + 影响
+//!   匹配的格标志,含行尾 WRAPLINE);
+//! - 下次先算出新 grid 的逐行哈希,按「新第 i 行 = 旧第 i + dropped 行」对齐
+//!   (`dropped` = 回滚区满了之后顶部被挤掉的行数,见 `plan_rescan`),从顶部往下
+//!   **逐行核对**到第一处不一致为止;
+//! - 核对一致的那一段整段沿用旧命中(行号整体平移),从第一处不一致所在逻辑行的
+//!   行首一直重扫到底部;顶部挤掉过行时,首条逻辑行可能被截了头,也单独重扫。
+//!
+//! 对不齐的一律退回全扫:列数 / 屏幕行数变了(resize 会 reflow,行结构整个变了)、
+//! 进出 alt screen、历史变少(清屏 `ESC[3J` / RIS / 回滚上限调小)、上次结果已经
+//! 封顶(被截掉的那部分命中不在手上)、限定了 `max_scan_lines`、找不到对齐点。
+//! 就算对齐点找错了(内容高度重复时可能),核对是逐行比内容的 —— 错的对齐只会让
+//! 核对早早失配、重扫范围变大,不会留下错的命中。
 //!
 //! 命中条数上限 [`SearchLimits::max_matches`] 默认 1000,同样照抄 xterm 的
 //! `_highlightLimit` —— `grep -o` 式的关键词(比如一个空格)不会把内存与绘制打爆。
@@ -67,6 +95,11 @@
 //! [`TerminalSearchBar`](super::TerminalSearchBar)(改关键词/翻页)。
 //! 两边共用同一份状态,计数与高亮天然同步,不需要任何回调对账。
 //! 完整接线清单见 [`super::search_bar`] 的模块注释。
+//!
+//! 渲染层每帧(prepaint)调 [`TerminalSearch::frame_sync`],按返回值办两件事:
+//! 结果变了就再要一帧(查找条的计数在同一帧的 render 里已经读过、是扫描前的),
+//! 被去抖挡下就排一发兜底重扫。两件都不能省 —— pane 套着 view 级缓存,
+//! 窗口别处的重绘不会顺手替它补上(见 [`FrameSync`])。
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -76,8 +109,9 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point};
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
+use alacritty_terminal::term::{Term, TermMode};
 use mt_terminal::TerminalEmulator;
 
 // ---------------------------------------------------------------------------
@@ -124,6 +158,28 @@ impl Default for SearchLimits {
         }
     }
 }
+
+/// 渲染层一帧 sync 完该做的事([`TerminalSearch::frame_sync`] 的返回值)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameSync {
+    /// 结果集(命中 / 当前命中)这一帧变了,宿主要**再画一帧**。
+    ///
+    /// 内容变化引起的重扫发生在终端元素的 prepaint 里,而查找条的「n/总数」早在
+    /// 同一帧的 render 阶段就读过了 —— 这一帧画出去的计数是扫描**之前**的。
+    /// 不再要一帧的话,计数要等别的事碰巧重画这个 pane 才跟上;pane 套着 view 级
+    /// 缓存时,窗口别处的重绘碰不到它(输出停了,计数就一直停在旧值)。
+    pub repaint: bool,
+    /// 被去抖挡下、内容确实动过:这么久之后要再 sync 一次(兜底重扫,
+    /// 见 [`TerminalSearch::take_trailing_rescan`])。
+    pub rescan_after: Option<Duration>,
+}
+
+/// 自适应去抖:内容变化引起的重搜间隔至少是上一次扫描耗时的这么多倍 ——
+/// 把「持锁扫描」压在 UI 线程时间的 1/8 以内。
+const ADAPTIVE_DEBOUNCE_FACTOR: u32 = 8;
+
+/// 自适应去抖的上限。再长命中高亮就会明显跟不上滚动的输出了。
+const ADAPTIVE_DEBOUNCE_CAP: Duration = Duration::from_secs(2);
 
 /// 一条命中:grid 坐标上的闭区间。
 ///
@@ -320,6 +376,18 @@ pub struct TerminalSearch {
     dirty: bool,
     last_scan: Option<Instant>,
     last_fingerprint: u64,
+    /// 上次扫描时的内容代数(`TerminalEmulator::generation`)。
+    last_generation: u64,
+    /// 上次扫描时 grid 的逐行快照,增量重扫靠它。`None` = 下一次只能全扫。
+    snapshot: Option<ScanSnapshot>,
+    /// 上次扫描(全扫或增量)持锁的耗时 —— 自适应去抖按它放大间隔。
+    last_cost: Duration,
+    /// 最近一次 sync 因为没到去抖点被挡下(内容可能变了、还没扫)。
+    deferred: bool,
+    /// 兜底重绘已经排上了、还没到点(防止每帧都排一发)。
+    trailing_armed: bool,
+    /// 走了增量路径的扫描次数(诊断 / 单测确认增量真的被走到)。
+    incremental_scans: u64,
     /// 上次扫描时的列数,拆行高亮段要用。
     columns: usize,
     /// 查找条是否开着。**关掉只停高亮与计数,关键词与选项原样留着** ——
@@ -353,6 +421,12 @@ impl TerminalSearch {
             dirty: false,
             last_scan: None,
             last_fingerprint: 0,
+            last_generation: 0,
+            snapshot: None,
+            last_cost: Duration::ZERO,
+            deferred: false,
+            trailing_armed: false,
+            incremental_scans: 0,
             columns: 0,
             enabled: true,
         }
@@ -375,6 +449,8 @@ impl TerminalSearch {
         } else {
             self.dirty = false;
             self.last_scan = None;
+            self.snapshot = None;
+            self.deferred = false;
             self.commit(Vec::new(), None);
         }
     }
@@ -386,6 +462,7 @@ impl TerminalSearch {
     pub fn set_limits(&mut self, limits: SearchLimits) {
         self.limits = limits;
         self.dirty = true;
+        self.snapshot = None;
     }
 
     pub fn query(&self) -> &str {
@@ -470,6 +547,8 @@ impl TerminalSearch {
         self.dirty = false;
         self.last_scan = None;
         self.last_fingerprint = 0;
+        self.snapshot = None;
+        self.deferred = false;
         self.commit(Vec::new(), None);
     }
 
@@ -480,9 +559,20 @@ impl TerminalSearch {
         self.sync_at(emulator, Instant::now())
     }
 
+    /// 渲染层每帧(prepaint)的入口:[`Self::sync`] 一次,再把宿主要做的两件事
+    /// 一并交代出来,见 [`FrameSync`]。
+    pub fn frame_sync(&mut self, emulator: &TerminalEmulator, now: Instant) -> FrameSync {
+        let repaint = self.sync_at(emulator, now);
+        FrameSync {
+            repaint,
+            rescan_after: self.take_trailing_rescan(now),
+        }
+    }
+
     /// [`Self::sync`] 的可注入时钟版本,单测用。
     pub fn sync_at(&mut self, emulator: &TerminalEmulator, now: Instant) -> bool {
         if !self.is_active() {
+            self.deferred = false;
             return if self.matches.is_empty() {
                 false
             } else {
@@ -491,23 +581,30 @@ impl TerminalSearch {
             };
         }
         if self.dirty {
-            return self.scan(emulator, now);
+            return self.scan(emulator, now, false);
         }
-        // 去抖:内容变化引起的重搜最快 200ms 一次
+        // 去抖:内容变化引起的重搜最快 200ms 一次(上次扫描贵的话更久)
         let due = self
             .last_scan
-            .map(|t| now.saturating_duration_since(t) >= self.limits.debounce)
+            .map(|t| now.saturating_duration_since(t) >= self.debounce())
             .unwrap_or(true);
         if !due {
+            // 只有内容真动过(代数变了)才算欠一次重扫。不这么判的话,扫完紧跟着的
+            // 那一帧(结果变了要求的重画、滚轮、键入回显)都会白排一发兜底重绘。
+            // 代数是原子量,不拿 term 锁;所有改内容的路径(推进字节 / resize /
+            // 改回滚行数)都会推进它,`with_term_mut` 只动回看位置与选区
+            self.deferred = emulator.generation() != self.last_generation;
             return false;
         }
-        let fingerprint = emulator.with_term(content_fingerprint);
-        if fingerprint == self.last_fingerprint {
+        self.deferred = false;
+        let (fingerprint, generation) =
+            emulator.with_term(|term| (content_fingerprint(term), emulator.generation()));
+        if fingerprint == self.last_fingerprint && generation == self.last_generation {
             // 内容一个字没变:把计时重置掉,下一轮 200ms 后再问一次
             self.last_scan = Some(now);
             return false;
         }
-        self.scan(emulator, now)
+        self.scan(emulator, now, true)
     }
 
     /// 无条件立刻重搜(关键词 / 选项刚改完时用)。返回结果集是否变化。
@@ -516,12 +613,51 @@ impl TerminalSearch {
         self.sync_at(emulator, Instant::now())
     }
 
-    fn scan(&mut self, emulator: &TerminalEmulator, now: Instant) -> bool {
+    /// 内容变化引起的重搜的实际间隔:至少 [`SearchLimits::debounce`];上一次扫描
+    /// 越贵间隔越长(耗时 × [`ADAPTIVE_DEBOUNCE_FACTOR`],封顶
+    /// [`ADAPTIVE_DEBOUNCE_CAP`])—— 退回全扫的那些场合(结果已封顶、刚 resize)
+    /// 一次几十毫秒,输出不停时按 200ms 一轮追着扫就是把 UI 线程让出去一大半。
+    fn debounce(&self) -> Duration {
+        let adaptive = self
+            .last_cost
+            .saturating_mul(ADAPTIVE_DEBOUNCE_FACTOR)
+            .min(ADAPTIVE_DEBOUNCE_CAP);
+        self.limits.debounce.max(adaptive)
+    }
+
+    /// 最近一次 [`Self::sync`] 因为没到去抖点被挡下、而兜底重绘还没排:返回距
+    /// 去抖点还有多久,并记下「已排」。宿主(渲染层)据此排一发延后重绘,到点再
+    /// sync 一次 —— 否则输出恰好停在去抖窗口里时,最后那批内容要等到别的事碰巧
+    /// 触发一帧才会被扫到(命中与计数一直停在旧样子)。
+    ///
+    /// 到点后宿主调 [`Self::trailing_rescan_fired`] 解除「已排」。
+    pub fn take_trailing_rescan(&mut self, now: Instant) -> Option<Duration> {
+        if !self.deferred || self.trailing_armed || !self.is_active() {
+            return None;
+        }
+        let last = self.last_scan?;
+        self.trailing_armed = true;
+        Some((last + self.debounce()).saturating_duration_since(now))
+    }
+
+    /// 兜底重绘的定时器到点了。见 [`Self::take_trailing_rescan`]。
+    pub fn trailing_rescan_fired(&mut self) {
+        self.trailing_armed = false;
+    }
+
+    /// 扫一遍。`incremental` = 允许按上次的快照只扫变了的行(内容变化引起的
+    /// 重搜);关键词 / 选项变了必须全扫。
+    fn scan(&mut self, emulator: &TerminalEmulator, now: Instant, incremental: bool) -> bool {
         self.dirty = false;
         self.last_scan = Some(now);
+        self.deferred = false;
 
         if !self.ensure_compiled() {
-            self.last_fingerprint = emulator.with_term(content_fingerprint);
+            let (fingerprint, generation) =
+                emulator.with_term(|term| (content_fingerprint(term), emulator.generation()));
+            self.last_fingerprint = fingerprint;
+            self.last_generation = generation;
+            self.snapshot = None;
             let changed = !self.matches.is_empty();
             self.commit(Vec::new(), None);
             return changed;
@@ -532,22 +668,68 @@ impl TerminalSearch {
         let options = self.options;
         let limits = self.limits;
         let previous = self.current_match().map(|m| m.start);
+        // 增量的前提:上次是完整结果(没封顶 —— 截掉的那部分命中不在手上)、
+        // 没限定扫描窗口(窗口下沿随输出移动,旧命中会从窗口顶部漏出去)
+        let windowed = limits.max_scan_lines.is_some();
+        let existing = self.snapshot.take();
+        let can_increment = incremental && !windowed && self.matches.len() < limits.max_matches;
+        let scrollback = emulator.scrollback();
+        let old_matches = &self.matches;
 
         let Some((_, dfa)) = self.compiled.as_mut() else {
             return false;
         };
-        let (found, fingerprint, columns, anchor) = emulator.with_term(|term| {
-            let found = collect_matches(term, dfa, options, &limits);
-            let anchor = -(term.grid().display_offset() as i32);
-            (
-                found,
-                content_fingerprint(term),
-                term.columns(),
-                anchor,
-            )
-        });
+        let started = Instant::now();
+        let (found, used_plan, snapshot, fingerprint, generation, columns, anchor) = emulator
+            .with_term(|term| {
+                let generation = emulator.generation();
+                let fingerprint = content_fingerprint(term);
+                // 内容没动过(只是关键词 / 选项变了)的快照原样留用:逐行哈希只描述内容、
+                // 与关键词无关,打字时每敲一个字母都重算一遍是白花(5 万行十几毫秒)
+                let (prior, reusable) = match existing {
+                    Some(old) if old.generation == generation && old.fingerprint == fingerprint => {
+                        (None, Some(old))
+                    }
+                    other => (other.filter(|_| can_increment), None),
+                };
+                // 限定了扫描窗口就用不上快照,省掉逐行哈希
+                let snapshot = if windowed {
+                    None
+                } else {
+                    reusable.or_else(|| Some(ScanSnapshot::capture(term, generation, fingerprint)))
+                };
+                let plan = match (prior.as_ref(), snapshot.as_ref()) {
+                    (Some(old), Some(new)) => {
+                        plan_rescan(old, new, scrollback, |i| row_wrapped(term, new, i))
+                    }
+                    _ => None,
+                };
+                let used_plan = plan.is_some();
+                let found = match plan {
+                    Some(plan) => {
+                        rescan_matches(term, dfa, options, limits.max_matches, &plan, old_matches)
+                    }
+                    None => collect_matches(term, dfa, options, &limits),
+                };
+                let anchor = -(term.grid().display_offset() as i32);
+                (
+                    found,
+                    used_plan,
+                    snapshot,
+                    fingerprint,
+                    generation,
+                    term.columns(),
+                    anchor,
+                )
+            });
+        self.last_cost = started.elapsed();
+        if used_plan {
+            self.incremental_scans += 1;
+        }
 
+        self.snapshot = snapshot;
         self.last_fingerprint = fingerprint;
+        self.last_generation = generation;
         self.columns = columns;
 
         // 当前命中的接续:老位置还在就留着,否则挑视口顶部往下的第一条
@@ -695,6 +877,27 @@ fn collect_matches<T>(
     let end = Point::new(bottom, term.last_column());
 
     let mut out = Vec::new();
+    collect_range(term, dfa, options, start, end, limits.max_matches, &mut out);
+    out
+}
+
+/// 在 `[start, end]` 里顺序枚举命中追加进 `out`,`out` 攒够 `max` 条就停。
+///
+/// 增量重扫时 `start` 一定落在逻辑行首、`end` 一定落在非折行的行尾(或 grid 底部)
+/// —— 这两处 alacritty 的迭代都从干净的 DFA 状态起步 / 收尾,所以区间内的结果与
+/// 全扫走到这一段时逐条相同(见模块注释「增量重扫与它为什么是对的」)。
+fn collect_range<T>(
+    term: &Term<T>,
+    dfa: &mut RegexSearch,
+    options: SearchOptions,
+    start: Point,
+    end: Point,
+    max: usize,
+    out: &mut Vec<SearchMatch>,
+) {
+    if out.len() >= max {
+        return;
+    }
     for found in RegexIter::new(start, end, Direction::Right, term, dfa) {
         let candidate = SearchMatch {
             start: *found.start(),
@@ -709,9 +912,241 @@ fn collect_matches<T>(
             continue;
         }
         out.push(candidate);
-        if out.len() >= limits.max_matches {
+        if out.len() >= max {
             break;
         }
+    }
+}
+
+/// 一次扫描时 grid 的样子:逐行内容哈希 + 几个决定「行结构还能不能对上」的维度。
+struct ScanSnapshot {
+    /// 自 topmost 往下每一行的内容哈希(见 [`row_hash`])。下标 i ↔ `Line(i - history)`。
+    rows: Vec<u64>,
+    columns: usize,
+    screen_lines: usize,
+    history: usize,
+    alt_screen: bool,
+    /// 抓快照时的内容代数与屏幕指纹:两者都没变 = 内容没动过,快照可以原样留用。
+    generation: u64,
+    fingerprint: u64,
+}
+
+impl ScanSnapshot {
+    fn capture<T>(term: &Term<T>, generation: u64, fingerprint: u64) -> Self {
+        let grid = term.grid();
+        let rows = (term.topmost_line().0..=term.bottommost_line().0)
+            .map(|line| row_hash(&grid[Line(line)][..]))
+            .collect();
+        Self {
+            rows,
+            columns: term.columns(),
+            screen_lines: term.screen_lines(),
+            history: term.history_size(),
+            alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
+            generation,
+            fingerprint,
+        }
+    }
+
+    /// 下标 → grid 行号。
+    fn line(&self, index: usize) -> Line {
+        Line(index as i32 - self.history as i32)
+    }
+}
+
+/// 影响匹配的格标志:宽字符与它的占位格会被正则跳过、行尾 WRAPLINE 决定命中能不能
+/// 跨到下一行。颜色 / 粗体之类变了不影响命中,不收 —— 免得一次重新着色让整段被当成变了。
+const MATCH_FLAGS: u16 = Flags::WRAPLINE.bits()
+    | Flags::WIDE_CHAR.bits()
+    | Flags::WIDE_CHAR_SPACER.bits()
+    | Flags::LEADING_WIDE_CHAR_SPACER.bits();
+
+/// 一行的内容哈希:逐格的字符 + [`MATCH_FLAGS`]。
+///
+/// 用 128 位乘法折叠做混合(wyhash 的 mum 手法),分布足够好 —— 两行内容不同而
+/// 哈希相同的概率在 2^-64 量级。四条互相独立的累加链交错吃格子(第 i 格进第
+/// i % 4 条),最后按固定次序折叠:乘法的延迟被四路摊开,每次增量重扫都要把整个
+/// 回看缓冲过一遍,这一步的快慢直接就是重扫的快慢。
+fn row_hash(cells: &[Cell]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    #[inline(always)]
+    fn mum(h: u64, v: u64) -> u64 {
+        let x = u128::from(h ^ v) * u128::from(K);
+        (x as u64) ^ ((x >> 64) as u64)
+    }
+    #[inline(always)]
+    fn word(cell: &Cell) -> u64 {
+        cell.c as u64 | (u64::from(cell.flags.bits() & MATCH_FLAGS) << 32)
+    }
+    let mut lanes: [u64; 4] = [
+        0xA076_1D64_78BD_642F,
+        0xE703_7ED1_A0B4_28DB,
+        0x8EBC_6AF0_9C88_C6E3,
+        0x5899_65CC_7537_4CC3,
+    ];
+    let (chunks, remainder) = cells.as_chunks::<4>();
+    for chunk in chunks {
+        for (lane, cell) in lanes.iter_mut().zip(chunk) {
+            *lane = mum(*lane, word(cell));
+        }
+    }
+    let mut h = mum(mum(mum(lanes[0], lanes[1]), lanes[2]), lanes[3]);
+    for cell in remainder {
+        h = mum(h, word(cell));
+    }
+    mum(h, cells.len() as u64)
+}
+
+/// 新 grid 第 `index` 行的行尾是不是折行(= 与下一行同属一条逻辑行)。
+fn row_wrapped<T>(term: &Term<T>, snapshot: &ScanSnapshot, index: usize) -> bool {
+    term.grid()[snapshot.line(index)][term.last_column()]
+        .flags
+        .contains(Flags::WRAPLINE)
+}
+
+/// 增量重扫的计划。行号都是 grid 行号。
+#[derive(Debug, PartialEq, Eq)]
+struct RescanPlan {
+    /// 旧命中挪到新坐标:新行号 = 旧行号 - `shift`。
+    shift: i32,
+    /// 顶部被挤掉过行时,首条逻辑行可能被截了头,要从 topmost 重扫到这一行(含,
+    /// 新坐标,非折行的行尾)。`None` = 首行原样沿用。
+    head_end: Option<Line>,
+    /// 沿用旧命中的区间,**旧**坐标 `[start, end)`,只看命中的起点行。
+    keep_old: (i32, i32),
+    /// 从这一行(新坐标,逻辑行首)一直重扫到底部。`None` = 底部没有变化。
+    tail_start: Option<Line>,
+}
+
+/// 旧快照 → 新快照能不能增量、怎么增量。`None` = 退回全扫。
+///
+/// `scrollback` 是回滚上限:历史没到上限时顶部不会挤掉任何行(alacritty 只在历史
+/// 满了之后才把最老的行转去复用),`dropped` 恒为 0;满了才去找对齐点。`wrapped`
+/// 问的是**新** grid 某一行的行尾是否折行。
+fn plan_rescan(
+    old: &ScanSnapshot,
+    new: &ScanSnapshot,
+    scrollback: usize,
+    wrapped: impl Fn(usize) -> bool,
+) -> Option<RescanPlan> {
+    // 列数 / 屏幕行数变了 = resize 过(reflow 把行结构整个改了);进出 alt screen =
+    // 换了一块 grid;历史变少 = 清过历史或回滚上限调小。都没有对齐的意义
+    if old.columns != new.columns
+        || old.screen_lines != new.screen_lines
+        || old.alt_screen != new.alt_screen
+        || new.history < old.history
+    {
+        return None;
+    }
+    let dropped = if new.history < scrollback {
+        0
+    } else {
+        find_dropped(old, new)?
+    };
+    // 新第 i 行 ↔ 旧第 i + dropped 行,自顶向下逐行核对到第一处不一致
+    let mut verified = 0;
+    while verified < new.rows.len()
+        && verified + dropped < old.rows.len()
+        && new.rows[verified] == old.rows[verified + dropped]
+    {
+        verified += 1;
+    }
+    // 顶部挤掉过行:首条逻辑行可能被截了头(它的前半截已经不在了),单独重扫;
+    // 沿用区从它的下一行(逻辑行首)开始
+    let (head_end, keep_start) = if dropped == 0 {
+        (None, 0)
+    } else {
+        let end = (0..new.rows.len()).find(|&i| !wrapped(i))?;
+        (Some(end), end + 1)
+    };
+    // 重扫区从第一处不一致所在逻辑行的行首开始。往上走过的行都在核对一致的范围里,
+    // 新旧两边的折行标志相同(标志进了行哈希)
+    let mut tail_start = verified;
+    while tail_start > keep_start && wrapped(tail_start - 1) {
+        tail_start -= 1;
+    }
+    if tail_start <= keep_start {
+        return None;
+    }
+    let shift = (new.history - old.history + dropped) as i32;
+    Some(RescanPlan {
+        shift,
+        head_end: head_end.map(|end| new.line(end)),
+        keep_old: (
+            old.line(keep_start + dropped).0,
+            old.line(tail_start + dropped).0,
+        ),
+        tail_start: (tail_start < new.rows.len()).then(|| new.line(tail_start)),
+    })
+}
+
+/// 历史满了之后顶部挤掉了多少行:拿旧历史最末几行当锚,在新 grid 里找它们挪到
+/// 了哪儿。找不到(挤掉的比整个历史还多、或旧快照没有历史)返回 `None`。
+///
+/// 内容高度重复时锚可能对错位置 —— 没关系,[`plan_rescan`] 随后是逐行核对内容的,
+/// 错位只会让核对早早失配、重扫范围变大。
+fn find_dropped(old: &ScanSnapshot, new: &ScanSnapshot) -> Option<usize> {
+    const ANCHOR_ROWS: usize = 8;
+    let anchor = old.history.checked_sub(1)?;
+    let window = ANCHOR_ROWS.min(anchor + 1);
+    (0..=anchor).find(|&dropped| {
+        // 锚窗里已经被挤掉的那几行(下标 < dropped)无从核对,跳过;锚行自己
+        // (t = 0)一定在
+        (0..window).all(|t| {
+            let old_index = anchor - t;
+            old_index < dropped || new.rows.get(old_index - dropped) == Some(&old.rows[old_index])
+        })
+    })
+}
+
+/// 按计划拼出新结果:重扫首条逻辑行 + 沿用中段旧命中(平移行号)+ 重扫尾段。
+/// 三段在 grid 上首尾相接、互不重叠,按顺序拼起来就是 grid 顺序;攒够 `max`
+/// 条即停,与全扫「从顶部数前 `max` 条」同口径。
+fn rescan_matches<T>(
+    term: &Term<T>,
+    dfa: &mut RegexSearch,
+    options: SearchOptions,
+    max: usize,
+    plan: &RescanPlan,
+    old_matches: &[SearchMatch],
+) -> Vec<SearchMatch> {
+    let mut out = Vec::new();
+    let last = term.last_column();
+    if let Some(end) = plan.head_end {
+        let start = Point::new(term.topmost_line(), Column(0));
+        collect_range(
+            term,
+            dfa,
+            options,
+            start,
+            Point::new(end, last),
+            max,
+            &mut out,
+        );
+    }
+    let (keep_start, keep_end) = plan.keep_old;
+    let shift = |p: Point| Point::new(Line(p.line.0 - plan.shift), p.column);
+    out.extend(
+        old_matches
+            .iter()
+            .filter(|m| m.start.line.0 >= keep_start && m.start.line.0 < keep_end)
+            .map(|m| SearchMatch {
+                start: shift(m.start),
+                end: shift(m.end),
+            })
+            .take(max.saturating_sub(out.len())),
+    );
+    if let Some(start) = plan.tail_start {
+        let end = Point::new(term.bottommost_line(), last);
+        collect_range(
+            term,
+            dfa,
+            options,
+            Point::new(start, Column(0)),
+            end,
+            max,
+            &mut out,
+        );
     }
     out
 }
@@ -1255,5 +1690,581 @@ mod tests {
         assert_eq!(s.count(), 0);
         assert!(s.highlights().is_empty());
         assert!(!s.sync(&e), "已经清干净了就不该再报变化");
+    }
+
+    // -- 增量重扫 -------------------------------------------------------
+
+    /// 同一个 emulator 上拿全新引擎全扫一遍,作对照。
+    fn fresh_matches(
+        e: &TerminalEmulator,
+        query: &str,
+        options: SearchOptions,
+    ) -> Vec<SearchMatch> {
+        let mut s = TerminalSearch::new();
+        s.set_options(options);
+        s.set_query(query);
+        s.refresh(e);
+        s.matches().to_vec()
+    }
+
+    /// 内容变化触发的重搜(`now` 远超去抖点)。
+    fn sync_later(s: &mut TerminalSearch, e: &TerminalEmulator, step: u64) {
+        let base = Instant::now();
+        s.sync_at(e, base + Duration::from_secs(10 * step));
+    }
+
+    /// 回滚区满了之后旧行被挤掉、行号整体平移:增量结果与全扫逐条相同,
+    /// 且真的走了增量(没退回全扫)。
+    #[test]
+    fn 回滚区挤出后增量结果与全扫一致() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(30, 6), 40);
+        for i in 0..80 {
+            let tag = if i % 7 == 0 { "needle" } else { "filler" };
+            e.advance(format!("{tag} {i}\r\n").as_bytes());
+        }
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        s.refresh(&e);
+        let before = s.incremental_scans;
+        for step in 1..=30u64 {
+            let tag = if step % 3 == 0 { "needle" } else { "other" };
+            e.advance(format!("{tag} new {step}\r\nplain\r\n").as_bytes());
+            sync_later(&mut s, &e, step);
+            assert_eq!(
+                s.matches(),
+                fresh_matches(&e, "needle", SearchOptions::default()).as_slice(),
+                "第 {step} 步"
+            );
+        }
+        assert!(
+            s.incremental_scans - before >= 25,
+            "挤出场景应该绝大多数走增量,实际 {}",
+            s.incremental_scans - before
+        );
+    }
+
+    /// 周期性输出恰好滚过整数个周期:屏幕逐字相同、历史已满、总行数不变 ——
+    /// 光看指纹会漏掉。内容代数兜住它。
+    #[test]
+    fn 周期性输出不漏重扫() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(30, 6), 20);
+        for i in 0..40 {
+            e.advance(format!("filler {i}\r\n").as_bytes());
+        }
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        s.refresh(&e);
+        for step in 1..=8u64 {
+            // 周期 3 行、每轮正好 3 行:填满屏幕之后屏幕内容逐轮相同
+            e.advance(b"needle\r\nx\r\ny\r\n");
+            sync_later(&mut s, &e, step);
+        }
+        assert_eq!(
+            s.matches(),
+            fresh_matches(&e, "needle", SearchOptions::default()).as_slice()
+        );
+        assert_eq!(s.count(), 8);
+    }
+
+    /// resize(reflow)、清屏、清历史、进出 alt screen:都得与全扫一致。
+    #[test]
+    fn 重排与清屏后结果与全扫一致() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(24, 5), 30);
+        for i in 0..20 {
+            e.advance(format!("row {i} needle and some long text that wraps\r\n").as_bytes());
+        }
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        s.refresh(&e);
+        let check = |s: &TerminalSearch, what: &str| {
+            assert_eq!(
+                s.matches(),
+                fresh_matches(&e, "needle", SearchOptions::default()).as_slice(),
+                "{what}"
+            );
+        };
+        e.resize(TermSize::new(17, 5));
+        sync_later(&mut s, &e, 1);
+        check(&s, "列数变了(reflow)");
+        e.resize(TermSize::new(17, 8));
+        sync_later(&mut s, &e, 2);
+        check(&s, "行数变了");
+        e.advance(b"\x1b[2J\x1b[H");
+        sync_later(&mut s, &e, 3);
+        check(&s, "ESC[2J(整屏顶进历史)");
+        e.advance(b"needle after clear\r\n\x1b[3J");
+        sync_later(&mut s, &e, 4);
+        check(&s, "ESC[3J(清历史)");
+        e.advance(b"\x1b[?1049hneedle in alt\r\n");
+        sync_later(&mut s, &e, 5);
+        check(&s, "进 alt screen");
+        e.advance(b"\x1b[?1049l");
+        sync_later(&mut s, &e, 6);
+        check(&s, "出 alt screen");
+        // 就地逐行擦除(Claude Code 的清屏手法),不产生滚动
+        e.advance(b"\x1b[H\x1b[2K\x1b[1B\x1b[2K\x1b[1B\x1b[2Kneedle here\r\n");
+        sync_later(&mut s, &e, 7);
+        check(&s, "原地擦除改写");
+    }
+
+    /// 极简的确定性伪随机(xorshift64*),免得为一条测试引依赖。
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// 一段随机输出:大多是若干行随机词(可能折行、可能不换行、带宽字符),
+    /// 偶尔是清屏 / 清历史 / 原地改写 / 进出 alt screen。
+    fn random_output(rng: &mut Rng) -> String {
+        const WORDS: &[&str] = &[
+            "ab",
+            "a b",
+            "axb",
+            "needle",
+            "need",
+            "le",
+            "xx",
+            "xxy",
+            "y",
+            "中文字",
+            "字",
+            "ab_c",
+            " ",
+            "  ",
+            "b",
+            "AB",
+            "aab",
+        ];
+        match rng.below(20) {
+            0 => "\x1b[2J\x1b[H".into(),
+            1 => "\x1b[3J".into(),
+            2 => format!("\x1b[{};1H\x1b[2Kab needle 改写", 1 + rng.below(6)),
+            3 => "\x1b[?1049hab needle\r\nxxy\x1b[?1049l".into(),
+            4 => "\x1b[H\x1b[2K\x1b[1B\x1b[2K".into(),
+            _ => {
+                let mut out = String::new();
+                for _ in 0..1 + rng.below(5) {
+                    for _ in 0..rng.below(14) {
+                        out.push_str(WORDS[rng.below(WORDS.len() as u64) as usize]);
+                    }
+                    if rng.below(8) != 0 {
+                        out.push_str("\r\n");
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// 差分测试:随机输出流 + 偶发 resize,每一步都拿增量结果对照全新全扫。
+    /// 覆盖挤出、折行、宽字符、清屏、清历史、alt screen、原地改写与命中封顶。
+    #[test]
+    fn 随机输出流下增量结果恒与全扫一致() {
+        let queries: [(&str, SearchOptions, usize); 7] = [
+            ("ab", SearchOptions::default(), 1000),
+            (
+                "needle",
+                SearchOptions {
+                    whole_word: true,
+                    ..Default::default()
+                },
+                1000,
+            ),
+            (
+                "a.b",
+                SearchOptions {
+                    regex: true,
+                    ..Default::default()
+                },
+                1000,
+            ),
+            (
+                "x+y",
+                SearchOptions {
+                    regex: true,
+                    ..Default::default()
+                },
+                1000,
+            ),
+            ("中文字", SearchOptions::default(), 1000),
+            (
+                "AB",
+                SearchOptions {
+                    case_sensitive: true,
+                    ..Default::default()
+                },
+                1000,
+            ),
+            // 小上限:经常封顶,走「封顶退回全扫」那条
+            ("b", SearchOptions::default(), 25),
+        ];
+        let mut incremental = 0;
+        let mut rescans = 0;
+        for seed in 1..=24u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut cols = 16 + rng.below(20) as usize;
+            let mut rows = 4 + rng.below(5) as usize;
+            let e = TerminalEmulator::with_scrollback(
+                TermSize::new(cols, rows),
+                10 + rng.below(40) as usize,
+            );
+            let mut engines: Vec<TerminalSearch> = queries
+                .iter()
+                .map(|(q, options, max)| {
+                    let mut s = TerminalSearch::with_limits(SearchLimits {
+                        max_matches: *max,
+                        ..Default::default()
+                    });
+                    s.set_options(*options);
+                    s.set_query(*q);
+                    s.refresh(&e);
+                    s
+                })
+                .collect();
+            for step in 1..=60u64 {
+                if rng.below(15) == 0 {
+                    cols = 12 + rng.below(24) as usize;
+                    rows = 3 + rng.below(6) as usize;
+                    e.resize(TermSize::new(cols, rows));
+                } else {
+                    e.advance(random_output(&mut rng).as_bytes());
+                }
+                for (s, (q, options, max)) in engines.iter_mut().zip(queries.iter()) {
+                    let before = s.incremental_scans;
+                    sync_later(s, &e, step);
+                    incremental += s.incremental_scans - before;
+                    rescans += 1;
+                    let mut expected = fresh_matches(&e, q, *options);
+                    expected.truncate(*max);
+                    assert_eq!(
+                        s.matches(),
+                        expected.as_slice(),
+                        "seed {seed} step {step} query {q:?}"
+                    );
+                }
+            }
+        }
+        // 不只是「都退回了全扫所以一致」:增量路径必须被大量走到
+        assert!(
+            incremental * 3 > rescans,
+            "增量路径走得太少:{incremental}/{rescans}"
+        );
+    }
+
+    #[test]
+    fn 行对齐计划的退回条件() {
+        let snap = |rows: &[u64], history: usize| ScanSnapshot {
+            rows: rows.to_vec(),
+            columns: 10,
+            screen_lines: 3,
+            history,
+            alt_screen: false,
+            generation: 0,
+            fingerprint: 0,
+        };
+        let no_wrap = |_: usize| false;
+        let old = snap(&[1, 2, 3, 4, 5], 2);
+        // 只是屏幕最后一行变了:保留前四行,从第五行重扫
+        let plan = plan_rescan(&old, &snap(&[1, 2, 3, 4, 9], 2), 100, no_wrap).unwrap();
+        assert_eq!(plan.shift, 0);
+        assert_eq!(plan.head_end, None);
+        assert_eq!(plan.keep_old, (-2, 2));
+        assert_eq!(plan.tail_start, Some(Line(2)));
+        // 历史长了 2 行(没满):不挤出,行号整体上移 2
+        let plan = plan_rescan(&old, &snap(&[1, 2, 3, 4, 5, 6, 7], 4), 100, no_wrap).unwrap();
+        assert_eq!(plan.shift, 2);
+        assert_eq!(plan.tail_start, Some(Line(1)), "新第 5 行起是新内容");
+        // 历史满了(上限 5)、顶部挤掉 2 行:找对齐点,首条逻辑行单独重扫
+        let full = snap(&[1, 2, 3, 4, 5, 6, 7, 8], 5);
+        let plan = plan_rescan(&full, &snap(&[3, 4, 5, 6, 7, 8, 9, 10], 5), 5, no_wrap).unwrap();
+        assert_eq!(plan.shift, 2);
+        assert_eq!(plan.head_end, Some(Line(-5)), "新 topmost 那条逻辑行重扫");
+        assert_eq!(plan.keep_old, (-2, 3), "旧第 -2~2 行(新第 -4~0 行)沿用");
+        assert_eq!(plan.tail_start, Some(Line(1)), "新第 1 行起是新内容");
+        // 挤掉的比整个旧历史还多:找不到对齐点,退回全扫
+        assert!(
+            plan_rescan(
+                &full,
+                &snap(&[20, 21, 22, 23, 24, 25, 26, 27], 5),
+                5,
+                no_wrap
+            )
+            .is_none()
+        );
+        // 折行:不一致那一行所在的整条逻辑行都要重扫
+        let wraps = |i: usize| i == 2;
+        let plan = plan_rescan(&old, &snap(&[1, 2, 3, 8, 9], 2), 100, wraps).unwrap();
+        assert_eq!(
+            plan.tail_start,
+            Some(Line(0)),
+            "第 3 行折到第 4 行,从第 3 行重扫"
+        );
+        // 退回全扫的几种
+        let mut resized = snap(&[1, 2, 3, 4, 5], 2);
+        resized.columns = 11;
+        assert!(
+            plan_rescan(&old, &resized, 100, no_wrap).is_none(),
+            "列数变了"
+        );
+        assert!(
+            plan_rescan(&old, &snap(&[4, 5, 6], 0), 100, no_wrap).is_none(),
+            "历史变少(清历史)"
+        );
+        let mut alt = snap(&[1, 2, 3, 4, 5], 2);
+        alt.alt_screen = true;
+        assert!(
+            plan_rescan(&old, &alt, 100, no_wrap).is_none(),
+            "进出 alt screen"
+        );
+        assert!(
+            plan_rescan(&old, &snap(&[9, 9, 9, 9, 9], 2), 100, no_wrap).is_none(),
+            "从第一行起就对不上:没有可沿用的"
+        );
+    }
+
+    /// 没到去抖点被挡下的那次:兜底重绘只排一发,到点解除后才能再排。
+    #[test]
+    fn 被去抖挡下时排一发兜底重扫() {
+        let e = emulator("cat\n");
+        let mut s = TerminalSearch::new();
+        s.set_query("cat");
+        let t0 = Instant::now();
+        s.sync_at(&e, t0);
+        assert_eq!(s.take_trailing_rescan(t0), None, "刚扫完、没被挡过");
+        e.advance(b"cat\r\n");
+        assert!(!s.sync_at(&e, t0 + Duration::from_millis(50)), "没到去抖点");
+        let delay = s.take_trailing_rescan(t0 + Duration::from_millis(50));
+        assert_eq!(delay, Some(Duration::from_millis(150)), "距去抖点还剩多久");
+        assert_eq!(
+            s.take_trailing_rescan(t0 + Duration::from_millis(60)),
+            None,
+            "已排过"
+        );
+        s.trailing_rescan_fired();
+        // 到点那一帧:扫到新内容,不再欠
+        assert!(s.sync_at(&e, t0 + Duration::from_millis(200)));
+        assert_eq!(s.count(), 2);
+        assert_eq!(
+            s.take_trailing_rescan(t0 + Duration::from_millis(200)),
+            None
+        );
+    }
+
+    /// 宿主帧时序的模拟,照 pane 套了 view 级缓存之后的真实情形:
+    ///
+    /// - 帧只在三种情况下发生:有输出(节拍器 notify pane)、兜底重扫到点、
+    ///   上一帧要求重画(`FrameSync::repaint`)—— 窗口别处的重绘碰不到这个 pane;
+    /// - 一帧之内查找条先 render(读计数),终端元素后 prepaint(`frame_sync`)。
+    ///
+    /// `bursts` 是 (毫秒, 输出);`honor_repaint = false` 模拟不理会重画请求的宿主。
+    /// 返回输出停下、帧排空之后查找条上停住的计数,以及总帧数。
+    fn simulate_host(
+        s: &mut TerminalSearch,
+        e: &TerminalEmulator,
+        base: Instant,
+        bursts: &[(u64, String)],
+        honor_repaint: bool,
+    ) -> (usize, usize) {
+        use std::collections::BTreeMap;
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        // 待画的帧:毫秒 → 这一帧是不是兜底重扫到点(同一毫秒的帧合并成一帧)
+        let mut frames: BTreeMap<u64, bool> = BTreeMap::new();
+        let mut bursts = bursts.iter().peekable();
+        let mut shown = 0;
+        let mut drawn = 0;
+        loop {
+            let next_frame = frames.keys().next().copied();
+            let next_burst = bursts.peek().map(|(ms, _)| *ms);
+            // 同一毫秒先落输出、再画帧
+            let burst_first = match (next_burst, next_frame) {
+                (None, None) => return (shown, drawn),
+                (Some(b), Some(f)) => b <= f,
+                (burst, _) => burst.is_some(),
+            };
+            if burst_first {
+                let (ms, bytes) = bursts.next().unwrap();
+                e.advance(bytes.as_bytes());
+                frames.entry(*ms).or_insert(false);
+                continue;
+            }
+            let ms = next_frame.unwrap();
+            if frames.remove(&ms).unwrap() {
+                s.trailing_rescan_fired();
+            }
+            drawn += 1;
+            assert!(drawn < 500, "帧排不空:重画 / 兜底互相续命了");
+            // render:查找条读计数
+            shown = s.count();
+            // prepaint:终端元素 sync
+            let frame = s.frame_sync(e, at(ms));
+            if frame.repaint && honor_repaint {
+                frames.entry(ms + 16).or_insert(false);
+            }
+            if let Some(delay) = frame.rescan_after {
+                *frames.entry(ms + delay.as_millis() as u64).or_insert(true) = true;
+            }
+        }
+    }
+
+    /// 回归(w5c 引入):回滚区满了之后命中被挤出顶部,输出停在去抖窗口里。兜底
+    /// 重扫在 prepaint 里把命中剔掉了,但查找条那一帧已经 render 过、画的是扫描
+    /// 前的数 —— pane 套着 view 级缓存,再没有帧来更新它,计数一直停在旧值,
+    /// 滚一下滚轮才纠正。结果一变就再要一帧,停住的计数必须与全扫一致。
+    #[test]
+    fn 输出停下后查找条计数与全扫一致() {
+        let setup = || {
+            let e = TerminalEmulator::with_scrollback(TermSize::new(30, 6), 40);
+            // 历史填满,命中散在回看缓冲里
+            for i in 0..80 {
+                let tag = if i % 7 == 0 { "needle" } else { "filler" };
+                e.advance(format!("{tag} {i}\r\n").as_bytes());
+            }
+            e
+        };
+        // 每 30ms 两行不含关键词的输出,把命中一条条挤出顶部;最后一批(570ms)
+        // 落在 400ms 那次扫描之后的去抖窗口里
+        let bursts: Vec<(u64, String)> = (1..=19u64)
+            .map(|k| (k * 30, format!("plain {k}\r\nplain {k}b\r\n")))
+            .collect();
+
+        let e = setup();
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        let base = Instant::now();
+        assert!(s.frame_sync(&e, base).repaint, "首扫(脏)");
+        let before = s.count();
+        let incremental = s.incremental_scans;
+        let (shown, frames) = simulate_host(&mut s, &e, base, &bursts, true);
+        let expected = fresh_matches(&e, "needle", SearchOptions::default());
+        assert_eq!(s.matches(), expected.as_slice(), "引擎结果与全扫一致");
+        assert!(expected.len() < before, "场景里必须真有命中被挤出顶部");
+        assert!(
+            s.incremental_scans > incremental,
+            "历史满了的挤出场景要走增量重扫"
+        );
+        assert_eq!(shown, expected.len(), "查找条停住的计数与全扫一致");
+        assert!(frames < 60, "重画请求不该让帧数失控:{frames}");
+        // 帧排空之后引擎不再欠任何东西:再来一帧既不要重画也不排兜底
+        assert_eq!(
+            s.frame_sync(&e, base + Duration::from_secs(5)),
+            FrameSync::default()
+        );
+
+        // 对照:不理会重画请求的宿主(= 修复前),计数停在兜底重扫之前的值
+        let e = setup();
+        let mut s = TerminalSearch::new();
+        s.set_query("needle");
+        s.frame_sync(&e, base);
+        let (stale, _) = simulate_host(&mut s, &e, base, &bursts, false);
+        assert_eq!(s.count(), expected.len(), "引擎本身早已扫对");
+        assert_ne!(
+            stale,
+            s.count(),
+            "对照组必须复现出陈旧计数,否则本场景没覆盖到回归"
+        );
+    }
+
+    /// 结果变了要的那一帧紧跟在扫描之后(没到去抖点):内容没再动就什么都不欠,
+    /// 不能再排一发兜底重扫 —— 否则每次结果变化都白多一帧。
+    #[test]
+    fn 重画帧内容未动不再排兜底重扫() {
+        let e = emulator("cat\n");
+        let mut s = TerminalSearch::new();
+        s.set_query("cat");
+        let t0 = Instant::now();
+        assert!(s.frame_sync(&e, t0).repaint, "首扫结果变了,要一帧");
+        let redraw = s.frame_sync(&e, t0 + Duration::from_millis(16));
+        assert_eq!(redraw, FrameSync::default(), "内容没动:不重画、不欠重扫");
+        // 滚动回看只动 display_offset,同样什么都不欠
+        e.with_term_mut(|t| t.scroll_display(Scroll::Delta(1)));
+        assert_eq!(
+            s.frame_sync(&e, t0 + Duration::from_millis(40)),
+            FrameSync::default()
+        );
+        // 真有新输出才欠:排到去抖点
+        e.advance(b"cat\r\n");
+        assert_eq!(
+            s.frame_sync(&e, t0 + Duration::from_millis(50)),
+            FrameSync {
+                repaint: false,
+                rescan_after: Some(Duration::from_millis(150)),
+            }
+        );
+    }
+
+    /// 只改关键词时内容没动:逐行快照原样留用,不在每次敲字时重算一遍。
+    #[test]
+    fn 改关键词不重算逐行快照() {
+        let e = emulator("cat dog\ncat\n");
+        let mut s = TerminalSearch::new();
+        s.set_query("cat");
+        s.refresh(&e);
+        let rows_ptr = |s: &TerminalSearch| s.snapshot.as_ref().map(|snap| snap.rows.as_ptr());
+        let generation = |s: &TerminalSearch| s.snapshot.as_ref().map(|snap| snap.generation);
+        let first = rows_ptr(&s);
+        let first_generation = generation(&s);
+        assert!(first.is_some());
+        s.set_query("dog");
+        s.refresh(&e);
+        assert_eq!(rows_ptr(&s), first, "内容没变,快照留用(同一块内存)");
+        assert_eq!(s.count(), 1);
+        e.advance(b"dog\r\n");
+        s.set_query("do");
+        s.refresh(&e);
+        assert_ne!(
+            generation(&s),
+            first_generation,
+            "内容变了,按新内容重抓快照"
+        );
+        assert_eq!(s.count(), 2);
+    }
+
+    #[test]
+    fn 行哈希对字符_位置_折行标志都敏感() {
+        let row = |text: &str| -> Vec<Cell> {
+            text.chars()
+                .map(|c| Cell {
+                    c,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let base = row("abcdefghij");
+        assert_eq!(row_hash(&base), row_hash(&row("abcdefghij")));
+        assert_ne!(row_hash(&base), row_hash(&row("abcdefghik")), "末字不同");
+        assert_ne!(row_hash(&base), row_hash(&row("bacdefghij")), "换位");
+        assert_ne!(row_hash(&base), row_hash(&row("abcdefghi")), "长度不同");
+        let mut wrapped = base.clone();
+        wrapped[9].flags.insert(Flags::WRAPLINE);
+        assert_ne!(row_hash(&base), row_hash(&wrapped), "折行标志进哈希");
+        let mut bold = base.clone();
+        bold[3].flags.insert(Flags::BOLD);
+        assert_eq!(row_hash(&base), row_hash(&bold), "粗体不影响命中,不进哈希");
+    }
+
+    #[test]
+    fn 自适应去抖按上次耗时放大且封顶() {
+        let mut s = TerminalSearch::new();
+        assert_eq!(
+            s.debounce(),
+            Duration::from_millis(200),
+            "便宜的扫描不改变节奏"
+        );
+        s.last_cost = Duration::from_millis(5);
+        assert_eq!(s.debounce(), Duration::from_millis(200));
+        s.last_cost = Duration::from_millis(60);
+        assert_eq!(s.debounce(), Duration::from_millis(480));
+        s.last_cost = Duration::from_secs(1);
+        assert_eq!(s.debounce(), ADAPTIVE_DEBOUNCE_CAP);
     }
 }
