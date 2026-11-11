@@ -21,15 +21,7 @@ fn spawn_shell(size: TermSize) -> (PtySession, Arc<TerminalEmulator>) {
     let spec = shell_spec(size);
     let pty = {
         let emulator = emulator.clone();
-        let started = Instant::now();
-        let mut captured = 0usize;
-        PtySession::spawn(spec, move |bytes| {
-            if captured < 4096 {
-                eprintln!("[pty-start {:?}] raw={:?}", started.elapsed(), String::from_utf8_lossy(bytes));
-                captured += bytes.len();
-            }
-            emulator.advance(bytes);
-        }).expect("PTY 起不来")
+        PtySession::spawn(spec, move |bytes| emulator.advance(bytes)).expect("PTY 起不来")
     };
     (pty, emulator)
 }
@@ -88,7 +80,7 @@ fn pty_回显能从_grid_读回来() {
     let ready = wait_for(&emulator, Duration::from_secs(20), |lines| {
         lines.iter().any(|l| !l.trim().is_empty()).then_some(())
     });
-    assert!(ready.is_some(), "shell 20s 内没有任何输出: exit={:?}, events={:?}", pty.try_wait(), emulator.events().drain());
+    assert!(ready.is_some(), "shell 20s 内没有任何输出");
 
     // 用一个不会出现在提示符里的标记串
     pty.write(b"echo MT_SMOKE_9F3A\r").expect("写 PTY 失败");
@@ -182,7 +174,7 @@ fn osc8_穿过真_pty_认得出网址() {
     let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
         e.visible_lines().iter().any(|l| !l.trim().is_empty())
     });
-    assert!(ready, "shell 20s 内没有任何输出: exit={:?}, events={:?}", pty.try_wait(), emulator.events().drain());
+    assert!(ready, "shell 20s 内没有任何输出");
 
     // 标记串是算出来的,理由同下面那条
     const MARK: &str = "MT_LINK_1234";
@@ -230,7 +222,7 @@ fn 漏发同步结束标记时到期释放() {
     let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
         e.visible_lines().iter().any(|l| !l.trim().is_empty())
     });
-    assert!(ready, "shell 20s 内没有任何输出: exit={:?}, events={:?}", pty.try_wait(), emulator.events().drain());
+    assert!(ready, "shell 20s 内没有任何输出");
 
     // 标记串是算出来的:回显里只有算式,grid 里出现整串只能是命令的输出
     const MARK: &str = "MT_SYNC_1234";
@@ -341,7 +333,7 @@ fn 两个_pane_的_grid_互不串字() {
         let ready = wait_for(term, Duration::from_secs(20), |lines| {
             lines.iter().any(|l| !l.trim().is_empty()).then_some(())
         });
-        assert!(ready.is_some(), "shell 20s 内没有任何输出: a={:?}, b={:?}, events={:?}", pty_a.try_wait(), pty_b.try_wait(), term.events().drain());
+        assert!(ready.is_some(), "shell 20s 内没有任何输出");
     }
 
     pty_a.write(b"echo MT_PANE_AAA1\r").expect("写 PTY A 失败");
