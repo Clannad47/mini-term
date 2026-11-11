@@ -274,10 +274,15 @@ jobs:
         with:
           shared-key: ci
           save-if: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 22
       - name: Exercise real PTY startup
         shell: bash
         run: |
-          for round in 1 2 3 4 5 6; do
+          pkgs="$(node .github/scripts/non_gpui_packages.mjs)"
+          cargo test $pkgs -- --nocapture || exit $?
+          for round in {1..30}; do
             echo "PTY diagnostic round $round"
             cargo test -p mt-terminal --test terminal_smoke -- --nocapture || exit $?
           done
