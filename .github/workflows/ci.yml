@@ -29,6 +29,7 @@ concurrency:
 jobs:
   rust:
     name: Rust workspace
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
 
@@ -174,6 +175,7 @@ jobs:
   # 不拖 gpui 的 crate 的测试 + sidecar 测试;rustfmt / i18n 对账与平台无关,不重复。
   windows:
     name: Windows check
+    if: github.event_name != 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 90
 
@@ -257,3 +259,25 @@ jobs:
       # 命名管道 ACL(仅当前用户可连)等 sidecar 的 Windows 专属用例
       - name: Sidecar test
         run: cargo test --manifest-path sidecars/Cargo.toml
+
+  pty-diagnostic:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Setup Rust
+        run: rustup toolchain install --no-self-update
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: ci
+          save-if: false
+      - name: Exercise real PTY startup
+        shell: bash
+        run: |
+          for round in 1 2 3 4 5 6; do
+            echo "PTY diagnostic round $round"
+            cargo test -p mt-terminal --test terminal_smoke -- --nocapture || exit $?
+          done
