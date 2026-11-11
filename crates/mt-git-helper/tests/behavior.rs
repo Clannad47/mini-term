@@ -1924,6 +1924,29 @@ fn existing_directories_omits_only_missing_and_rejects_files() {
         .decode()
         .unwrap();
     assert_eq!(existing, vec![path(&repo)]);
+    let canonical = repo.canonicalize().unwrap();
+    let aliases: Vec<String> = helper
+        .success(Operation::Query {
+            repo: path(&canonical),
+            query: GitQuery::ExistingDirectories {
+                paths: vec![path(&canonical), path(&canonical.join("missing"))],
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(aliases, vec![path(&canonical)]);
+    let unrelated = Fixture::new("directory-outside-scope");
+    assert!(
+        helper
+            .request(Operation::Query {
+                repo: path(&repo),
+                query: GitQuery::ExistingDirectories {
+                    paths: vec![path(&unrelated.0.join("missing"))],
+                },
+            })
+            .result
+            .is_err()
+    );
     std::fs::write(repo.join("file"), "not directory").unwrap();
     assert!(
         helper
